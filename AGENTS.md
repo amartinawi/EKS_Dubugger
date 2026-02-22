@@ -1,0 +1,467 @@
+# AGENTS.md
+
+Guidelines for AI coding agents working in this EKS Debugger codebase.
+
+## Project Overview
+
+Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
+
+**Version:** 3.0.0  
+**Lines of Code:** ~10,500  
+**Analysis Methods:** 55  
+**Catalog Coverage:** 100% (79 issues across 3 catalogs)
+
+## Quick Commands
+
+```bash
+# Setup
+python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+
+# Run analysis
+python eks_comprehensive_debugger.py --profile <profile> --region <region> --cluster-name <cluster> --days 2 --output-format html --output-file report.html
+
+# With custom kubectl context
+python eks_comprehensive_debugger.py --profile <profile> --region <region> --cluster-name <cluster> --kube-context <context-name> --days 1 --output-format html
+
+# Lint/type check (optional)
+ruff check eks_comprehensive_debugger.py
+mypy eks_comprehensive_debugger.py --ignore-missing-imports
+```
+
+## File Structure
+
+```
+eks_comprehensive_debugger.py  # Main debugger (~10,500 lines, all-in-one)
+requirements.txt               # Python dependencies
+.gitignore                     # Git ignore rules
+README-EKS-DEBUGGER.md         # User documentation
+AGENTS.md                      # This file
+venv/                          # Virtual environment (gitignored)
+```
+
+## Dependencies
+
+Required: `boto3>=1.26.0`, `python-dateutil>=2.8.0`, `pytz>=2023.0`
+Optional: `pyyaml>=6.0` (for YAML output)
+
+## Code Architecture
+
+### Configuration Constants (v3.0.0)
+
+```python
+# Thresholds for alerting
+class Thresholds:
+    MEMORY_WARNING = 85        # %
+    MEMORY_CRITICAL = 95       # %
+    CPU_WARNING = 80           # %
+    CPU_CRITICAL = 90          # %
+    DISK_WARNING = 85          # %
+    DISK_CRITICAL = 95         # %
+    QUOTA_WARNING_RATIO = 0.9
+    RESTART_WARNING = 5        # Container restart count
+    RESTART_CRITICAL = 10
+    PENDING_POD_WARNING = 5
+    PENDING_POD_CRITICAL = 10
+
+# Issue patterns knowledge base with root causes
+EKS_ISSUE_PATTERNS = {
+    "pod_issues": {
+        "CrashLoopBackOff": {"root_causes": [...], "detection": {...}, "aws_doc": "..."},
+        "ImagePullBackOff": {...},
+        "CreateContainerConfigError": {...},
+        "OOMKilled": {...},
+        "Evicted": {...},
+    },
+    "node_issues": {
+        "NotReady": {...},
+        "DiskPressure": {...},
+        "MemoryPressure": {...},
+        "NetworkUnavailable": {...},
+    },
+    "network_issues": {
+        "IPExhaustion": {...},
+        "CNINotReady": {...},
+        "DNSResolutionFailure": {...},
+    },
+    "iam_issues": {
+        "AccessDenied": {...},
+        "UnableToFetchCredentials": {...},
+    },
+    "storage_issues": {
+        "PVCPending": {...},
+        "VolumeAttachmentFailed": {...},
+    },
+    "scheduling_issues": {
+        "InsufficientResources": {...},
+        "AffinityConflict": {...},
+    },
+}
+
+# Control plane log filtering
+CONTROL_PLANE_BENIGN_PATTERNS = [
+    'required revision has been compacted',
+    'falling back to the standard LIST semantics',
+    'watchlist request.*ended with an error',
+    'etcdserver: mvcc',
+    'resourceVersion.*is invalid',
+]
+
+CONTROL_PLANE_ERROR_PATTERNS = [
+    'etcdserver: leader changed',
+    'connection refused',
+    'context deadline exceeded',
+    'internal error',
+    'admission denied',
+    'authentication failed',
+]
+```
+
+### Helper Methods
+
+| Method | Purpose |
+|--------|---------|
+| `_build_kubectl_events_cmd(reason)` | Build kubectl events command with namespace/context |
+| `_get_filtered_events(reason)` | Get and parse events filtered by reason |
+| `_parse_event_common(event)` | Extract common fields from kubectl event |
+| `_add_finding(category, summary, details)` | Append finding to category with validation |
+| `_classify_severity(summary, details)` | Classify finding severity based on content |
+| `_extract_timestamp(details)` | Extract timestamp from finding details |
+| `_get_node_from_pod(pod_details)` | Extract node name from pod details |
+| `_get_bucket_severity(events)` | Determine severity for timeline bucket |
+
+### Smart Correlation (v1.4.0)
+
+The debugger performs intelligent correlation across data sources to identify root causes:
+
+**Correlation Rules:**
+
+| Rule | Trigger | Root Cause Detection |
+|------|---------|---------------------|
+| `node_pressure_cascade` | Node Disk/Memory Pressure + Pod Evictions | Pressure on node caused pod evictions |
+| `cni_cascade` | VPC CNI issues + NetworkNotReady events | CNI problems caused network failures |
+| `oom_pattern` | OOMKilled pods + Memory pressure | Node memory or pod limits causing OOM |
+| `control_plane_impact` | Critical control plane errors + Pod failures | Control plane instability |
+| `image_pull_pattern` | Image pull failures | Registry/auth issues |
+| `scheduling_pattern` | Scheduling failures | Resource constraints or affinity rules |
+| `dns_pattern` | DNS issues + CoreDNS health | CoreDNS configuration problems |
+
+**Output Structure:**
+```python
+{
+    "correlations": [
+        {
+            "correlation_type": "node_pressure_cascade",
+            "severity": "critical",
+            "root_cause": "Node memory pressure detected",
+            "root_cause_time": "2026-02-20 10:30:00+00:00",
+            "impact": "5 pods evicted due to memory pressure on 2 node(s)",
+            "recommendation": "Address memory pressure on affected nodes...",
+            "aws_doc": "https://repost.aws/knowledge-center/..."
+        }
+    ],
+    "timeline": [
+        {
+            "time_bucket": "2026-02-20 10:00",
+            "event_count": 15,
+            "categories": ["oom_killed", "pod_errors"],
+            "severity": "critical"
+        }
+    ],
+    "first_issue": {
+        "timestamp": "2026-02-20 10:00:05+00:00",
+        "category": "node_issues",
+        "summary": "Node ip-10-0-1-50 has MemoryPressure",
+        "potential_root_cause": True
+    }
+}
+```
+
+### Main Classes
+
+| Class | Purpose |
+|-------|---------|
+| `ComprehensiveEKSDebugger` | Main debugger orchestrator |
+| `ProgressTracker` | Console progress reporting |
+| `DateFilterMixin` | Date filtering utilities |
+| `OutputFormatter` | Base class for output formatters |
+| `ConsoleOutputFormatter` | Console output |
+| `JSONOutputFormatter` | JSON output |
+| `MarkdownOutputFormatter` | Markdown output |
+| `YAMLOutputFormatter` | YAML output |
+| `HTMLOutputFormatter` | Interactive HTML dashboard |
+
+### Exception Hierarchy
+
+```
+EKSDebuggerError (base)
+├── AWSAuthenticationError
+├── ClusterNotFoundError
+├── KubectlNotAvailableError
+├── DateValidationError
+└── EKSDebuggerError (general)
+```
+
+---
+
+## Analysis Methods (55 total)
+
+### Pod Lifecycle & Health (9 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `analyze_pod_evictions` | kubectl events | Pod evicted due to resource pressure |
+| `check_oom_events` | kubectl events | Container OOMKilled (exit code 137) |
+| `analyze_pod_health_deep` | kubectl pods | CrashLoopBackOff, init container failures, high restarts |
+| `analyze_probe_failures` | kubectl events | Liveness/readiness probe failures |
+| `analyze_image_pull_failures` | kubectl events | ImagePullBackOff, ErrImagePull, auth failures |
+| `analyze_pods_terminating` | kubectl pods | Stuck in Terminating (finalizers) |
+| `analyze_deployment_rollouts` | kubectl deployments | Rollout stuck, ProgressDeadlineExceeded |
+| `analyze_jobs_cronjobs` | kubectl jobs/cronjobs | BackoffLimitExceeded, missed schedules |
+| `analyze_statefulset_issues` | kubectl statefulsets | StatefulSet PVC issues, ordinal failures |
+
+### Node Health (7 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `analyze_node_conditions` | kubectl nodes | NotReady, DiskPressure, MemoryPressure, PIDPressure |
+| `analyze_eks_nodegroup_health` | EKS API | Managed node group degradation |
+| `analyze_certificate_expiry` | kubectl nodes/events | Kubelet certificate rotation failures |
+| `analyze_windows_nodes` | kubectl nodes | Windows node specific issues |
+| `analyze_pleg_health` | kubectl nodes/events | PLEG not healthy |
+| `analyze_container_runtime` | kubectl events | containerd not responding |
+| `analyze_pause_image_issues` | kubectl events | Pause/sandbox image garbage-collected |
+
+### Scheduling & Resources (6 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `analyze_pod_scheduling_failures` | kubectl events | FailedScheduling, taint/toleration, affinity |
+| `analyze_resource_quotas` | kubectl resourcequotas | Quota exceeded, near-limit warnings |
+| `analyze_cpu_throttling` | CloudWatch Metrics | CPU throttling, high utilization |
+| `analyze_hpa_vpa` | kubectl hpa | HPA unable to scale, metrics unavailable |
+| `analyze_gpu_scheduling` | kubectl nodes/pods | GPU scheduling issues |
+| `analyze_limits_requests` | kubectl pods | Missing limits/requests, QoS analysis |
+
+### Networking (9 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `analyze_network_issues` | kubectl events/pods | General network connectivity |
+| `analyze_vpc_cni_health` | kubectl daemonset/events | IP exhaustion, aws-node health |
+| `analyze_coredns_health` | kubectl deployment/events | DNS resolution failures |
+| `analyze_service_health` | kubectl endpoints/services | No endpoints, connectivity issues |
+| `analyze_subnet_health` | EC2 API | Subnet IP availability |
+| `analyze_security_groups` | EC2 API | Security group rule issues |
+| `analyze_network_policies` | kubectl networkpolicies | NetworkPolicy blocking traffic |
+| `analyze_alb_health` | CloudWatch ALB metrics | ALB 5xx errors, unhealthy targets |
+| `analyze_conntrack_health` | kubectl events/nodes | Conntrack table exhaustion |
+
+### Storage (3 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `analyze_pvc_issues` | kubectl pvc/pv | PVC Pending, PV Released/Failed, ProvisioningFailed |
+| `analyze_ebs_csi_health` | kubectl deployment/events | EBS CSI attachment failures |
+| `analyze_efs_csi_health` | kubectl deployment/events | EFS mount failures |
+
+### IAM & RBAC (4 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `analyze_rbac_issues` | kubectl events | Forbidden, Unauthorized errors |
+| `analyze_iam_pod_identity` | kubectl + CloudTrail | IRSA/Pod Identity failures |
+| `analyze_psa_violations` | kubectl pods/namespaces | Pod Security Admission violations |
+| `analyze_missing_config_resources` | kubectl | Missing ConfigMaps/Secrets |
+
+### Autoscaling (3 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `analyze_cluster_autoscaler` | kubectl deployment/logs | Cluster Autoscaler issues |
+| `analyze_karpenter` | kubectl deployment/nodepools | Karpenter provisioning failures |
+| `analyze_fargate_health` | EKS API | Fargate profile issues |
+
+### AWS Infrastructure (3 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `analyze_service_quotas` | Service Quotas API | Quota limits approaching |
+| `analyze_aws_lb_controller` | kubectl deployment/logs | AWS LB Controller issues |
+| `analyze_custom_controllers` | kubectl deployments/events | Custom operator failures |
+
+### Control Plane (8 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `analyze_control_plane_logs` | CloudWatch Logs | Control plane errors |
+| `analyze_apiserver_latency` | CloudWatch Logs/Metrics | API server high latency |
+| `analyze_apiserver_rate_limiting` | CloudWatch Logs | 429 rate limiting, throttling |
+| `analyze_apiserver_inflight` | CloudWatch Metrics | Inflight request saturation |
+| `analyze_etcd_health` | CloudWatch Logs | etcd quota exceeded, leader changes |
+| `analyze_controller_manager` | CloudWatch Logs | Reconciliation failures |
+| `analyze_scheduler_health` | CloudWatch Logs/Metrics | Scheduler issues |
+| `analyze_admission_webhooks` | kubectl webhooks/events | Webhook timeouts/failures |
+
+### Observability (4 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `check_container_insights_metrics` | CloudWatch Metrics | Node/pod resource metrics |
+| `analyze_cloudwatch_logging_health` | CloudWatch Logs | Logging pipeline health |
+| `check_eks_addons` | EKS API | EKS addon health |
+| `correlate_findings` | Cross-source | Root cause correlation |
+
+---
+
+## Code Style
+
+### Naming
+- Classes: `PascalCase`
+- Functions/Methods: `snake_case`
+- Constants: `UPPER_SNAKE_CASE`
+- Private methods: `_prefix_with_underscore`
+- Exceptions: Suffix with `Error`
+
+### Type Hints
+```python
+def get_kubectl_output(self, cmd: str, timeout: int = DEFAULT_TIMEOUT, required: bool = False) -> str | None:
+def safe_api_call(self, func: Callable, *args, **kwargs) -> tuple[bool, Any]:
+```
+
+### Error Handling
+Use graceful degradation pattern:
+```python
+try:
+    method()
+except Exception as e:
+    self.errors.append({'step': 'method_name', 'message': str(e)})
+    self.progress.warning(f"Analysis failed: {e}")
+```
+
+### kubectl Commands with Context
+```python
+# Context is added automatically if --kube-context is provided
+output = self.safe_kubectl_call(cmd)
+# Internally adds: --context {self.kube_context}
+```
+
+---
+
+## Findings Structure
+
+```python
+self.findings = {
+    'memory_pressure': [],      # Pod evictions due to memory
+    'disk_pressure': [],        # Pod evictions due to disk
+    'pod_errors': [],           # General pod errors
+    'node_issues': [],          # Node conditions
+    'oom_killed': [],           # OOMKilled containers
+    'control_plane_issues': [], # Control plane log errors
+    'scheduling_failures': [],  # FailedScheduling events
+    'network_issues': [],       # CNI/DNS issues
+    'rbac_issues': [],          # Authorization failures
+    'image_pull_failures': [],  # Image pull errors
+    'resource_quota_exceeded': [], # Quota warnings
+    'pvc_issues': [],           # Storage issues
+    'dns_issues': [],           # CoreDNS problems
+    'addon_issues': []          # EKS addon health
+}
+```
+
+---
+
+## Results Output Format
+
+```python
+results = {
+    'metadata': {
+        'cluster': str,
+        'region': str,
+        'analysis_date': str,  # ISO 8601
+        'date_range': {'start': str, 'end': str},
+        'namespace': str | 'all'
+    },
+    'summary': {
+        'total_issues': int,
+        'critical': int,
+        'warning': int,
+        'info': int,
+        'categories': list[str]
+    },
+    'findings': dict[str, list[dict]],
+    'correlations': list[dict],      # Root cause analysis
+    'timeline': list[dict],          # Event timeline by hour
+    'first_issue': dict | None,      # Earliest detected issue
+    'recommendations': list[dict],
+    'errors': list[dict]
+}
+```
+
+---
+
+## Evidence-Based Recommendations (v2.1.0)
+
+Each recommendation includes evidence from actual findings:
+
+```python
+{
+    "title": "Resolve Memory Pressure Issues",
+    "category": "memory_pressure",
+    "priority": "critical",
+    "action": "Increase pod memory limits...",
+    "aws_doc": "https://repost.aws/knowledge-center/...",
+    "evidence": {
+        "total_count": 5,
+        "critical_count": 2,
+        "warning_count": 3,
+        "info_count": 0,
+        "affected_resources": [...],
+        "examples": [...],
+        "first_seen": "2026-02-20T10:00:00Z",
+        "last_seen": "2026-02-20T12:00:00Z"
+    },
+    "diagnostic_steps": [
+        "Run: kubectl describe node <node-name>",
+        "Check: kubectl top pods --all-namespaces",
+        ...
+    ]
+}
+```
+
+---
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success, no issues found |
+| 1 | Success, issues found |
+| 2 | Error during analysis |
+| 130 | Interrupted (Ctrl+C) |
+
+---
+
+## Adding New Analysis
+
+1. Create analysis method in `ComprehensiveEKSDebugger`
+2. Add findings category to `self.findings` dict
+3. Add icon mapping in `HTMLOutputFormatter.category_info`
+4. Add category to sidebar navigation in HTML template
+5. Generate recommendations in `generate_recommendations()`
+6. Update `set_total_steps()` count
+7. Add method to `analysis_methods` list in `run_comprehensive_analysis()`
+
+---
+
+## AWS Documentation References
+
+- [EKS Disk Pressure](https://repost.aws/knowledge-center/eks-resolve-disk-pressure)
+- [EKS Memory Pressure](https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html)
+- [CloudWatch Container Insights](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html)
+- [EKS Observability Best Practices](https://docs.aws.amazon.com/prescriptive-guidance/latest/amazon-eks-observability-best-practices/)
+- [EKS Troubleshooting](https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html)
+- [EKS Control Plane Logging](https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html)
+- [IRSA](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html)
+- [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html)
+- [AWS Load Balancer Controller](https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html)
+- [VPC CNI](https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html)

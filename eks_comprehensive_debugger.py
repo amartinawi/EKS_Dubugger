@@ -1803,7 +1803,7 @@ class HTMLOutputFormatter(OutputFormatter):
                 </div>
                 <div class="summary-card healthy">
                     <div class="summary-icon">✅</div>
-                    <div class="summary-value">{len([c for c, i in findings.items() if not i])}</div>
+                    <div class="summary-value">{summary.get("healthy_checks", 0)}</div>
                     <div class="summary-label">Healthy Checks</div>
                 </div>
             </div>
@@ -9729,14 +9729,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     info += 1
 
         total_issues = critical + warning + info
-        categories = [cat for cat, items in self.findings.items() if items]
+        categories_with_issues = [cat for cat, items in self.findings.items() if items]
+        total_categories = len(self.findings)
+        healthy_checks = total_categories - len(categories_with_issues)
 
         return {
             "total_issues": total_issues,
             "critical": critical,
             "warning": warning,
             "info": info,
-            "categories": categories,
+            "categories": categories_with_issues,
+            "healthy_checks": healthy_checks,
+            "total_categories": total_categories,
         }
 
     def generate_recommendations(self):

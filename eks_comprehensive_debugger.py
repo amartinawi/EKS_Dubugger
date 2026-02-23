@@ -2004,6 +2004,9 @@ class HTMLOutputFormatter(OutputFormatter):
 
         # First Issue Prominent (Phase 1 - #9)
         if first_issue:
+            escaped_timestamp = self._escape_html(first_issue.get("timestamp", "Unknown"))
+            escaped_fi_summary = self._escape_html(first_issue.get("summary", "Unknown"))
+            escaped_category = self._escape_html(first_issue.get("category", "Unknown"))
             html += f"""
                     <!-- First Detected Issue - Prominent -->
                     <div class="first-issue-callout" onclick="this.classList.toggle('expanded')">
@@ -2013,9 +2016,9 @@ class HTMLOutputFormatter(OutputFormatter):
                             <span class="first-issue-toggle">▼</span>
                         </div>
                         <div class="first-issue-content">
-                            <div class="first-issue-time">⏰ {first_issue.get("timestamp", "Unknown")}</div>
-                            <div class="first-issue-summary">{first_issue.get("summary", "Unknown")}</div>
-                            <div class="first-issue-category">Category: {first_issue.get("category", "Unknown")}</div>
+                            <div class="first-issue-time">⏰ {escaped_timestamp}</div>
+                            <div class="first-issue-summary">{escaped_fi_summary}</div>
+                            <div class="first-issue-category">Category: {escaped_category}</div>
                             {"<div class='first-issue-badge'>⚠️ Potential Root Cause</div>" if first_issue.get("is_potential_root_cause") else ""}
                         </div>
                     </div>
@@ -2081,9 +2084,10 @@ class HTMLOutputFormatter(OutputFormatter):
                             <div class="namespace-list">
             """
             for ns in top_namespaces[:5]:
+                escaped_ns_name = self._escape_html(ns.get("name", "unknown"))
                 html += f"""
                                 <div class="namespace-item">
-                                    <span class="namespace-name">{ns.get("name", "unknown")}</span>
+                                    <span class="namespace-name">{escaped_ns_name}</span>
                                     <span class="namespace-count">{ns.get("count", 0)} issues</span>
                                 </div>
                 """
@@ -2117,10 +2121,11 @@ class HTMLOutputFormatter(OutputFormatter):
                 else:
                     severity_color = "#6b7280"  # gray
 
+                escaped_error_type = self._escape_html(error_type)
                 html += f"""
                                 <div class="error-type-item">
                                     <div class="error-type-header">
-                                        <span class="error-type-name" style="border-left: 3px solid {severity_color};">{error_type}</span>
+                                        <span class="error-type-name" style="border-left: 3px solid {severity_color};">{escaped_error_type}</span>
                                         <span class="error-type-count">{err.get("count", 0)}</span>
                                     </div>
                 """
@@ -2130,8 +2135,9 @@ class HTMLOutputFormatter(OutputFormatter):
                     for ex in examples[:2]:
                         example_text = ex.get("pod", "") or ex.get("summary", "")
                         if example_text:
+                            escaped_example = self._escape_html(example_text)
                             html += f"""
-                                    <div class="error-example">• {example_text}</div>
+                                    <div class="error-example">• {escaped_example}</div>
                             """
                 html += """
                                 </div>
@@ -2161,7 +2167,7 @@ class HTMLOutputFormatter(OutputFormatter):
                         </div>
                         <div class="summary-block-content">
                             <div class="impact-alert" style="background: {impact_color}15; border-radius: 8px; padding: 1rem; margin-bottom: 1rem;">
-                                <strong>⚠️ {impact_message}</strong>
+                                <strong>⚠️ {self._escape_html(impact_message)}</strong>
                             </div>
             """
 
@@ -2171,10 +2177,12 @@ class HTMLOutputFormatter(OutputFormatter):
                                 <strong>Offline Services:</strong>
                 """
                 for svc in services_offline[:5]:
+                    escaped_svc = self._escape_html(svc.get("service", "unknown"))
+                    escaped_ns = self._escape_html(svc.get("namespace", ""))
                     html += f"""
                                 <div class="impact-service-item">
-                                    <span class="service-name">{svc.get("service", "unknown")}</span>
-                                    <span class="service-namespace">{svc.get("namespace", "")}</span>
+                                    <span class="service-name">{escaped_svc}</span>
+                                    <span class="service-namespace">{escaped_ns}</span>
                                 </div>
                 """
                 html += """
@@ -2192,10 +2200,12 @@ class HTMLOutputFormatter(OutputFormatter):
             narrative_text = narrative.get("narrative", "")
             short_summary = narrative.get("short_summary", "")
 
-            # Convert markdown-style bold to HTML using regex
+            # First escape HTML, then convert markdown-style bold to HTML
             import re
 
-            narrative_html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", narrative_text)
+            escaped_narrative = self._escape_html(narrative_text)
+            escaped_summary = self._escape_html(short_summary)
+            narrative_html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped_narrative)
 
             html += f"""
                     <!-- What Happened - Narrative (Phase 3 - #5) -->
@@ -2207,7 +2217,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             <span class="block-toggle">▼</span>
                         </div>
                         <div class="summary-block-content">
-                            <div class="narrative-summary">{short_summary}</div>
+                            <div class="narrative-summary">{escaped_summary}</div>
                             <div class="narrative-details">
                                 {narrative_html.replace(chr(10), "<br>")}
                             </div>
@@ -2237,20 +2247,22 @@ class HTMLOutputFormatter(OutputFormatter):
             )
             for qw in quick_wins:
                 time_badge_color = "#22c55e" if "2 min" in qw.get("time", "") else "#3b82f6"
+                escaped_title = self._escape_html(qw.get("title", "Quick Fix"))
+                escaped_solution = self._escape_html(qw.get("solution", ""))
                 html += f"""
                                 <div class="quick-win-item">
                                     <div class="quick-win-header">
-                                        <span class="quick-win-title">{qw.get("title", "Quick Fix")}</span>
+                                        <span class="quick-win-title">{escaped_title}</span>
                                         <span class="quick-win-time" style="background: {time_badge_color};">{qw.get("time", "5 min")}</span>
                                     </div>
-                                    <div class="quick-win-solution">{qw.get("solution", "")}</div>
+                                    <div class="quick-win-solution">{escaped_solution}</div>
                 """
                 if qw.get("affected_pod") or qw.get("affected_namespace"):
                     affected = []
                     if qw.get("affected_namespace"):
-                        affected.append(f"ns: {qw['affected_namespace']}")
+                        affected.append(f"ns: {self._escape_html(qw['affected_namespace'])}")
                     if qw.get("affected_pod"):
-                        affected.append(f"pod: {qw['affected_pod']}")
+                        affected.append(f"pod: {self._escape_html(qw['affected_pod'])}")
                     html += f"""
                                     <div class="quick-win-affected">Affects: {" | ".join(affected)}</div>
                     """
@@ -2278,10 +2290,12 @@ class HTMLOutputFormatter(OutputFormatter):
 
         if root_cause.get("has_root_cause"):
             for rc in root_cause.get("identified_root_causes", [])[:3]:
+                escaped_root_cause = self._escape_html(rc.get("root_cause", "Unknown"))
+                escaped_impact = self._escape_html(rc.get("impact", "N/A"))
                 html += f"""
                             <div class="root-cause-item">
-                                <div class="root-cause-text">{rc.get("root_cause", "Unknown")}</div>
-                                <div class="root-cause-impact">Impact: {rc.get("impact", "N/A")}</div>
+                                <div class="root-cause-text">{escaped_root_cause}</div>
+                                <div class="root-cause-impact">Impact: {escaped_impact}</div>
                             </div>
                 """
         else:
@@ -2308,10 +2322,11 @@ class HTMLOutputFormatter(OutputFormatter):
         if actions:
             for action in actions[:5]:
                 priority = action.get("priority", "medium")
+                escaped_action = self._escape_html(action.get("action", "No action specified"))
                 html += f"""
                             <div class="action-item">
                                 <span class="action-priority {priority}">{priority}</span>
-                                <div class="action-text">{action.get("action", "No action specified")}</div>
+                                <div class="action-text">{escaped_action}</div>
                             </div>
                 """
         else:
@@ -4269,11 +4284,12 @@ class HTMLOutputFormatter(OutputFormatter):
                     )
                     source_badge = self._get_source_icon(item.get("details", {}))
                     finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
+                    escaped_summary2 = self._escape_html(item.get("summary", "N/A"))
 
                     html += f'''
                     <div class="finding-item" data-severity="{item_severity}">
                         <div class="finding-header" onclick="toggleFinding(this.parentElement)">
-                            <div class="finding-summary">{item.get("summary", "N/A")}</div>
+                            <div class="finding-summary">{escaped_summary2}</div>
                             <div class="finding-badges">
                                 <span class="severity-badge {item_severity}">{item_severity}</span>
                                 {finding_type_badge}

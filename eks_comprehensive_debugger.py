@@ -174,8 +174,8 @@ DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
 MAX_API_RETRIES = 3
 RETRY_DELAY_SECONDS = 1
-MAX_LOG_STREAMS = 5
-MAX_EVENTS_PER_STREAM = 50
+MAX_LOG_STREAMS = 50  # Increased from 5, now supports pagination
+MAX_EVENTS_PER_STREAM = 100  # Increased from 50
 MAX_CONSOLE_DISPLAY = 10
 MAX_HTML_DISPLAY = 50
 DATE_RANGE_WARNING_DAYS = 7
@@ -4937,6 +4937,123 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         return False, str(last_error) if last_error else "Max retries exceeded"
 
+    def _get_all_log_streams(self, log_group_name: str, max_streams: int = MAX_LOG_STREAMS) -> list:
+        """
+        Get all log streams with pagination support.
+
+        Args:
+            log_group_name: CloudWatch log group name
+            max_streams: Maximum number of streams to return
+
+        Returns:
+            List of log stream dictionaries
+        """
+        all_streams = []
+        next_token = None
+
+        while len(all_streams) < max_streams:
+            params = {
+                "logGroupName": log_group_name,
+                "orderBy": "LastEventTime",
+                "descending": True,
+                "limit": min(50, max_streams - len(all_streams)),
+            }
+
+            if next_token:
+                params["nextToken"] = next_token
+
+            success, response = self.safe_api_call(self.logs_client.describe_log_streams, **params)
+
+            if not success:
+                self.progress.warning(f"Failed to get log streams: {response}")
+                break
+
+            streams = response.get("logStreams", [])
+            all_streams.extend(streams)
+
+            next_token = response.get("nextToken")
+            if not next_token or not streams:
+                break
+
+        return all_streams[:max_streams]
+
+    def _get_log_events_paginated(
+        self,
+        log_group_name: str,
+        log_stream_name: str,
+        start_time: int,
+        end_time: int,
+        max_events: int = MAX_EVENTS_PER_STREAM,
+    ) -> list:
+        """
+        Get log events with pagination support.
+
+        Args:
+            log_group_name: CloudWatch log group name
+            log_stream_name: Log stream name
+            start_time: Start timestamp in milliseconds
+            end_time: End timestamp in milliseconds
+            max_events: Maximum number of events to return
+
+        Returns:
+            List of log event dictionaries
+        """
+        all_events = []
+        next_token = None
+
+        while len(all_events) < max_events:
+            params = {
+                "logGroupName": log_group_name,
+                "logStreamName": log_stream_name,
+                "startTime": start_time,
+                "endTime": end_time,
+                "limit": min(1000, max_events - len(all_events)),
+            }
+
+            if next_token:
+                params["nextToken"] = next_token
+
+            success, response = self.safe_api_call(self.logs_client.get_log_events, **params)
+
+            if not success:
+                break
+
+            events = response.get("events", [])
+            if not events:
+                break
+
+            all_events.extend(events)
+
+            # Check for more events
+            next_token = response.get("nextForwardToken")
+            if not next_token or next_token == params.get("nextToken"):
+                break
+
+        return all_events[:max_events]
+
+    def _detect_fargate_only_cluster(self) -> bool:
+        """
+        Detect if this is a Fargate-only cluster (no EC2 nodes).
+
+        Returns:
+            True if cluster has no EC2 nodes (Fargate-only), False otherwise
+        """
+        try:
+            output = self.safe_kubectl_call("kubectl get nodes -o json")
+            if not output:
+                return True  # Assume Fargate-only if we can't get nodes
+
+            nodes = json.loads(output)
+            node_count = len(nodes.get("items", []))
+
+            return node_count == 0
+        except Exception:
+            return False  # Default to False if detection fails
+
+    def _should_skip_node_check(self) -> bool:
+        """Check if node-specific checks should be skipped (Fargate-only cluster)"""
+        return getattr(self, "_is_fargate_only", False)
+
     def safe_kubectl_call(self, cmd, required=False):
         """Safely call kubectl with error handling"""
         try:
@@ -5113,6 +5230,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             AWS EKS node health monitoring
             https://docs.aws.amazon.com/eks/latest/userguide/managed-node-groups.html
         """
+        # Skip for Fargate-only clusters
+        if self._should_skip_node_check():
+            self.progress.step("Skipping node conditions (Fargate-only cluster)")
+            return
+
         self.progress.step("Analyzing node health and conditions...")
 
         try:
@@ -7778,6 +7900,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Analyze EKS managed node groups via EKS API
         Detects degraded, unhealthy node groups
         """
+        # Skip for Fargate-only clusters
+        if self._should_skip_node_check():
+            self.progress.step("Skipping node group health (Fargate-only cluster)")
+            return
+
         self.progress.step("Analyzing EKS node group health...")
 
         try:
@@ -8273,6 +8400,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Analyze certificate expiration for kubelet and control plane
         Detects certificates approaching expiration
         """
+        # Skip for Fargate-only clusters
+        if self._should_skip_node_check():
+            self.progress.step("Skipping certificate expiry check (Fargate-only cluster)")
+            return
+
         self.progress.step("Analyzing certificate expiration...")
 
         try:
@@ -8654,6 +8786,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Analyze GPU scheduling issues for ML/AI workloads
         Detects GPU resource constraints
         """
+        # Skip for Fargate-only clusters
+        if self._should_skip_node_check():
+            self.progress.step("Skipping GPU scheduling (Fargate-only cluster)")
+            return
+
         self.progress.step("Analyzing GPU scheduling issues...")
 
         try:
@@ -8760,6 +8897,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Analyze Windows node health and scheduling issues
         Detects Windows-specific problems
         """
+        # Skip for Fargate-only clusters
+        if self._should_skip_node_check():
+            self.progress.step("Skipping Windows node health (Fargate-only cluster)")
+            return
+
         self.progress.step("Analyzing Windows node health...")
 
         try:
@@ -9867,6 +10009,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Analyze PLEG (Pod Lifecycle Event Generator) health
         Detects PLEG not healthy issues
         """
+        # Skip for Fargate-only clusters
+        if self._should_skip_node_check():
+            self.progress.step("Skipping PLEG health (Fargate-only cluster)")
+            return
+
         self.progress.step("Analyzing PLEG health...")
 
         try:
@@ -9943,6 +10090,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Analyze container runtime (containerd) health
         Detects runtime unresponsive issues
         """
+        # Skip for Fargate-only clusters
+        if self._should_skip_node_check():
+            self.progress.step("Skipping container runtime health (Fargate-only cluster)")
+            return
+
         self.progress.step("Analyzing Container Runtime health...")
 
         try:
@@ -10034,11 +10186,16 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         The pause container (sandbox) is required for every pod. If it's garbage-collected
         or unavailable, pods cannot be created on that node.
         """
-        self.progress.step("Analyzing pause image issues...")
+        # Skip for Fargate-only clusters
+        if self._should_skip_node_check():
+            self.progress.step("Skipping pause image issues (Fargate-only cluster)")
+            return
+
+        self.progress.step("Analyzing pause container image issues...")
+
+        pause_image_issues = []
 
         try:
-            pause_image_issues = []
-
             # Check for sandbox/pause image errors in events
             cmd = "kubectl get events --all-namespaces -o json"
             output = self.safe_kubectl_call(cmd)
@@ -12029,6 +12186,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self.progress.error(f"Setup failed: {e}")
             raise
+
+        # Detect Fargate-only cluster (no nodes)
+        self._is_fargate_only = self._detect_fargate_only_cluster()
+        if self._is_fargate_only:
+            self.progress.info("Detected Fargate-only cluster - skipping node-specific checks")
 
         # Step 4-58: Run all analyses (graceful degradation)
         analysis_methods = [

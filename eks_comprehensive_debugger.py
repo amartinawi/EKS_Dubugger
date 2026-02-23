@@ -5402,9 +5402,47 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.findings[category].append({"summary": summary, "details": details})
             return True
 
+    def _add_finding_dict(self, category: str, finding: dict) -> bool:
+        """Add finding from a dict with summary/details structure.
+
+        Convenience wrapper for _add_finding() that accepts findings
+        in the format used by direct appends. Thread-safe.
+
+        Args:
+            category: Finding category (e.g., 'pod_errors', 'node_issues')
+            finding: Dict with 'summary' (str) and optional 'details' (dict)
+
+        Returns:
+            True if finding was added, False if limit was reached.
+        """
+        summary = finding.get("summary", "")
+        details = finding.get("details") or {}
+        finding_type = details.get("finding_type", FindingType.CURRENT_STATE)
+        return self._add_finding(category, summary, details, finding_type)
+
     def _classify_severity(self, summary_text: str, details: Optional[dict]) -> str:
         """Classify finding severity based on content (delegates to module-level function)."""
         return classify_severity(summary_text, details)
+
+    # === Analysis Methods ===
+    #
+    # EXCEPTION HANDLING PHILOSOPHY:
+    # =============================
+    # Each analysis method wraps its logic in try/except Exception for GRACEFUL DEGRADATION.
+    # This is intentional: if one analysis method fails (e.g., API timeout, malformed data),
+    # other methods continue and the tool still produces useful output.
+    #
+    # Known exception sources within methods:
+    #   - json.loads() → json.JSONDecodeError (malformed kubectl/AWS responses)
+    #   - dict access → KeyError (unexpected response structure)
+    #   - boto3 API calls → botocore.exceptions.ClientError (permissions, throttling)
+    #   - subprocess → subprocess.CalledProcessError, TimeoutExpired (kubectl failures)
+    #
+    # These are caught by safe_kubectl_call() and safe_api_call() helpers, but dict access
+    # and JSON parsing may still raise. The outer Exception catch is the safety net.
+    #
+    # Future improvement: Consider narrowing to specific exceptions where the failure
+    # mode is well-understood, but maintain the fallback Exception handler for unknown issues.
 
     # === Existing Analysis Methods (Enhanced with date filtering) ===
 
@@ -5462,11 +5500,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 }
 
                 if "memory" in message.lower():
-                    self.findings["memory_pressure"].append(finding)
+                    self._add_finding_dict("memory_pressure", finding)
                 elif "disk" in message.lower() or "ephemeral" in message.lower():
-                    self.findings["disk_pressure"].append(finding)
+                    self._add_finding_dict("disk_pressure", finding)
                 else:
-                    self.findings["pod_errors"].append(finding)
+                    self._add_finding_dict("pod_errors", finding)
 
             self.progress.info(
                 f"Found {len(events.get('items', []))} eviction events in date range"
@@ -5551,7 +5589,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             finding["details"]["aws_doc"] = (
                                 "https://repost.aws/knowledge-center/eks-resolve-memory-pressure"
                             )
-                            self.findings["memory_pressure"].append(finding)
+                            self._add_finding_dict("memory_pressure", finding)
                         elif ctype == "DiskPressure":
                             finding["details"]["severity"] = "critical"
                             finding["details"]["root_causes"] = [
@@ -5570,7 +5608,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             finding["details"]["aws_doc"] = (
                                 "https://repost.aws/knowledge-center/eks-resolve-disk-pressure"
                             )
-                            self.findings["disk_pressure"].append(finding)
+                            self._add_finding_dict("disk_pressure", finding)
                         elif ctype == "PIDPressure":
                             finding["details"]["severity"] = "critical"
                             finding["details"]["root_causes"] = [
@@ -5593,7 +5631,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             finding["details"]["aws_doc"] = (
                                 "https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/#pid-pressure"
                             )
-                            self.findings["node_issues"].append(finding)
+                            self._add_finding_dict("node_issues", finding)
                         elif ctype == "NetworkUnavailable":
                             finding["details"]["severity"] = "critical"
                             finding["details"]["root_causes"] = [
@@ -5611,10 +5649,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             finding["details"]["aws_doc"] = (
                                 "https://docs.aws.amazon.com/eks/latest/userguide/eks-networking.html"
                             )
-                            self.findings["network_issues"].append(finding)
+                            self._add_finding_dict("network_issues", finding)
 
                     elif ctype == "Ready" and status != "True":
-                        self.findings["node_issues"].append(
+                        self._add_finding_dict(
+                            "node_issues",
                             {
                                 "summary": f"Node {node_name} is not Ready",
                                 "details": {
@@ -5639,7 +5678,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                                     "finding_type": FindingType.CURRENT_STATE,
                                 },
-                            }
+                            },
                         )
 
             # Check for PIDPressure-related events
@@ -5656,7 +5695,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         message = event.get("message", "")
                         timestamp = event.get("lastTimestamp", event.get("eventTime", "Unknown"))
 
-                        self.findings["node_issues"].append(
+                        self._add_finding_dict(
+                            "node_issues",
                             {
                                 "summary": f"PIDPressure event on node {node}",
                                 "details": {
@@ -5672,7 +5712,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ],
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
-                            }
+                            },
                         )
             except Exception:
                 pass
@@ -5716,7 +5756,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 message = event.get("message", "N/A")
                 timestamp = event.get("lastTimestamp", "Unknown")
 
-                self.findings["oom_killed"].append(
+                self._add_finding_dict(
+                    "oom_killed",
                     {
                         "summary": f"Pod {namespace}/{pod} was OOM killed",
                         "details": {
@@ -5726,7 +5767,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "message": message,
                             "finding_type": FindingType.HISTORICAL_EVENT,
                         },
-                    }
+                    },
                 )
 
             self.progress.info(f"Found {len(events.get('items', []))} OOM events in date range")
@@ -5812,7 +5853,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         category = (
                             "memory_pressure" if "memory" in metric["name"] else "disk_pressure"
                         )
-                        self.findings[category].append(
+                        self._add_finding_dict(
+                            category,
                             {
                                 "summary": f"{metric['display']} exceeded critical threshold ({metric['critical']}%)",
                                 "details": {
@@ -5823,7 +5865,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "threshold": f"{metric['critical']}%",
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
-                            }
+                            },
                         )
 
             except Exception as e:
@@ -5874,7 +5916,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             control_plane_enabled = True
 
             if not control_plane_enabled:
-                self.findings["addon_issues"].append(
+                self._add_finding_dict(
+                    "addon_issues",
                     {
                         "summary": "EKS control plane logging not enabled or no recent logs",
                         "details": {
@@ -5888,7 +5931,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             ],
                             "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
                         },
-                    }
+                    },
                 )
 
             # 2. Check Container Insights application logs (use cached data if available)
@@ -5917,7 +5960,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             if desired > 0 and ready == desired:
                                 fluentbit_healthy = True
                             elif desired > 0 and ready < desired:
-                                self.findings["addon_issues"].append(
+                                self._add_finding_dict(
+                                    "addon_issues",
                                     {
                                         "summary": f"Log agent DaemonSet {ds_name} not healthy: {ready}/{desired} ready",
                                         "details": {
@@ -5936,13 +5980,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "Check IAM permissions for logs:PutLogEvents",
                                             ],
                                         },
-                                    }
+                                    },
                                 )
                 except Exception:
                     pass
 
             if not container_logs_enabled:
-                self.findings["addon_issues"].append(
+                self._add_finding_dict(
+                    "addon_issues",
                     {
                         "summary": "Container Insights application logs not configured",
                         "details": {
@@ -5957,7 +6002,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             ],
                             "aws_doc": "https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Container-Insights-setup-logs.html",
                         },
-                    }
+                    },
                 )
 
             # 3. Check Prometheus metrics (Container Insights/Prometheus)
@@ -5997,7 +6042,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             if not prometheus_enabled and not prometheus_agent_found:
-                self.findings["addon_issues"].append(
+                self._add_finding_dict(
+                    "addon_issues",
                     {
                         "summary": "Prometheus metrics scraping not configured for Container Insights",
                         "details": {
@@ -6012,7 +6058,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             ],
                             "aws_doc": "https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights-Prometheus.html",
                         },
-                    }
+                    },
                 )
 
             # 4. Check for metrics in ContainerInsights namespace
@@ -6023,7 +6069,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
             if success and not response.get("Metrics"):
-                self.findings["addon_issues"].append(
+                self._add_finding_dict(
+                    "addon_issues",
                     {
                         "summary": "No Container Insights metrics found for cluster",
                         "details": {
@@ -6038,7 +6085,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             ],
                             "aws_doc": "https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html",
                         },
-                    }
+                    },
                 )
 
             # Summary finding
@@ -6150,7 +6197,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     timestamp = datetime.fromtimestamp(event["timestamp"] / 1000, tz=timezone.utc)
 
-                    self.findings["control_plane_issues"].append(
+                    self._add_finding_dict(
+                        "control_plane_issues",
                         {
                             "summary": f"Control plane error in {stream_name}",
                             "details": {
@@ -6161,7 +6209,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
                                 "finding_type": FindingType.HISTORICAL_EVENT,
                             },
-                        }
+                        },
                     )
 
             self.progress.info("Control plane log analysis completed")
@@ -6222,7 +6270,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 elif "volume" in message.lower():
                     reason_category = "volume zone constraints"
 
-                self.findings["scheduling_failures"].append(
+                self._add_finding_dict(
+                    "scheduling_failures",
                     {
                         "summary": f"Pod {namespace}/{pod} failed to schedule: {reason_category}",
                         "details": {
@@ -6233,7 +6282,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "message": message,
                             "finding_type": FindingType.HISTORICAL_EVENT,
                         },
-                    }
+                    },
                 )
 
             self.progress.info(
@@ -6286,7 +6335,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     message = event.get("message", "N/A")
                     timestamp = event.get("lastTimestamp", event.get("eventTime", "Unknown"))
 
-                    self.findings["network_issues"].append(
+                    self._add_finding_dict(
+                        "network_issues",
                         {
                             "summary": f"Network issue for {namespace}/{obj_name}: {reason}",
                             "details": {
@@ -6297,7 +6347,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "message": message,
                                 "finding_type": FindingType.HISTORICAL_EVENT,
                             },
-                        }
+                        },
                     )
 
             # Check CoreDNS health
@@ -6310,7 +6360,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     phase = pod["status"].get("phase", "Unknown")
 
                     if phase != "Running":
-                        self.findings["dns_issues"].append(
+                        self._add_finding_dict(
+                            "dns_issues",
                             {
                                 "summary": f"CoreDNS pod {pod_name} is not Running (status: {phase})",
                                 "details": {
@@ -6319,7 +6370,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "status": phase,
                                     "finding_type": FindingType.CURRENT_STATE,
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("Network issue analysis completed")
@@ -6365,7 +6416,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         namespace = event["metadata"]["namespace"]
                         timestamp = event.get("lastTimestamp", event.get("eventTime", "Unknown"))
 
-                        self.findings["rbac_issues"].append(
+                        self._add_finding_dict(
+                            "rbac_issues",
                             {
                                 "summary": f"RBAC/Authorization issue for {namespace}/{pod}",
                                 "details": {
@@ -6375,7 +6427,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "message": message,
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("RBAC analysis completed")
@@ -6432,7 +6484,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ]
                             )
 
-                        self.findings["pvc_issues"].append(
+                        self._add_finding_dict(
+                            "pvc_issues",
                             {
                                 "summary": f"PVC {namespace}/{pvc_name} is not Bound (status: {phase})",
                                 "details": {
@@ -6446,7 +6499,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html",
                                     "finding_type": FindingType.CURRENT_STATE,
                                 },
-                            }
+                            },
                         )
 
             try:
@@ -6495,7 +6548,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if released_pvs:
                         for pv_info in released_pvs:
-                            self.findings["pvc_issues"].append(
+                            self._add_finding_dict(
+                                "pvc_issues",
                                 {
                                     "summary": f"PV {pv_info['name']} is in Released state (claim deleted, PV not reclaimed)",
                                     "details": {
@@ -6513,12 +6567,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://kubernetes.io/docs/concepts/storage/persistent-volumes/#release",
                                     },
-                                }
+                                },
                             )
 
                     if failed_pvs:
                         for pv_info in failed_pvs:
-                            self.findings["pvc_issues"].append(
+                            self._add_finding_dict(
+                                "pvc_issues",
                                 {
                                     "summary": f"PV {pv_info['name']} is in Failed state",
                                     "details": {
@@ -6537,11 +6592,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://kubernetes.io/docs/concepts/storage/persistent-volumes/#phase",
                                     },
-                                }
+                                },
                             )
 
                     if len(available_pvs) > 10:
-                        self.findings["pvc_issues"].append(
+                        self._add_finding_dict(
+                            "pvc_issues",
                             {
                                 "summary": f"{len(available_pvs)} PVs in Available state (no bound claim)",
                                 "details": {
@@ -6551,7 +6607,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "impact": "Available PVs are not being used - check if orphaned",
                                     "recommendation": "Review if these PVs are needed or should be cleaned up",
                                 },
-                            }
+                            },
                         )
 
             except Exception:
@@ -6573,7 +6629,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         message = event.get("message", "")
                         timestamp = event.get("lastTimestamp", event.get("eventTime", "Unknown"))
 
-                        self.findings["pvc_issues"].append(
+                        self._add_finding_dict(
+                            "pvc_issues",
                             {
                                 "summary": f"PVC provisioning failed: {namespace}/{pvc_name}",
                                 "details": {
@@ -6585,7 +6642,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "severity": "warning",
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html",
                                 },
-                            }
+                            },
                         )
             except Exception:
                 pass
@@ -6605,7 +6662,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         namespace = event["metadata"]["namespace"]
                         message = event.get("message", "")
 
-                        self.findings["pvc_issues"].append(
+                        self._add_finding_dict(
+                            "pvc_issues",
                             {
                                 "summary": f"PVC resize failed: {namespace}/{pvc_name}",
                                 "details": {
@@ -6617,7 +6675,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "recommendation": "Check if storage class supports volume expansion",
                                     "aws_doc": "https://kubernetes.io/blog/2018/07/12/resizing-persistent-volumes-using-kubernetes/",
                                 },
-                            }
+                            },
                         )
             except Exception:
                 pass
@@ -6691,7 +6749,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         elif "timeout" in message.lower():
                             failure_category = "registry timeout"
 
-                        self.findings["image_pull_failures"].append(
+                        self._add_finding_dict(
+                            "image_pull_failures",
                             {
                                 "summary": f"Image pull failure for {namespace}/{pod}: {failure_category}",
                                 "details": {
@@ -6702,7 +6761,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "message": message,
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("Image pull failure analysis completed")
@@ -6754,7 +6813,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 health_issues = health.get("issues", [])
 
                 if status != "ACTIVE" or health_issues:
-                    self.findings["addon_issues"].append(
+                    self._add_finding_dict(
+                        "addon_issues",
                         {
                             "summary": f"EKS addon {addon_name} is unhealthy (status: {status})",
                             "details": {
@@ -6766,7 +6826,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ],
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
-                        }
+                        },
                     )
 
             self.progress.info(f"Checked {len(addons)} EKS addons")
@@ -6832,7 +6892,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             )
 
                             if used_num >= (hard_num * 0.9):
-                                self.findings["resource_quota_exceeded"].append(
+                                self._add_finding_dict(
+                                    "resource_quota_exceeded",
                                     {
                                         "summary": f"Resource quota near limit in {namespace}: {resource}",
                                         "details": {
@@ -6844,7 +6905,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "utilization": f"{(used_num / hard_num * 100):.1f}%",
                                             "finding_type": FindingType.CURRENT_STATE,
                                         },
-                                    }
+                                    },
                                 )
                     except (ValueError, ZeroDivisionError):
                         # Skip if conversion fails
@@ -6893,7 +6954,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         message = waiting.get("message", "")
 
                         if reason == "CrashLoopBackOff":
-                            self.findings["pod_errors"].append(
+                            self._add_finding_dict(
+                                "pod_errors",
                                 {
                                     "summary": f"Pod {namespace}/{pod_name} container {container_name} in CrashLoopBackOff",
                                     "details": {
@@ -6912,10 +6974,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ]["aws_doc"],
                                         "finding_type": FindingType.CURRENT_STATE,
                                     },
-                                }
+                                },
                             )
                         elif reason in ["ImagePullBackOff", "ErrImagePull"]:
-                            self.findings["image_pull_failures"].append(
+                            self._add_finding_dict(
+                                "image_pull_failures",
                                 {
                                     "summary": f"Pod {namespace}/{pod_name} container {container_name} image pull failed",
                                     "details": {
@@ -6933,10 +6996,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ]["aws_doc"],
                                         "finding_type": FindingType.CURRENT_STATE,
                                     },
-                                }
+                                },
                             )
                         elif reason == "CreateContainerConfigError":
-                            self.findings["pod_errors"].append(
+                            self._add_finding_dict(
+                                "pod_errors",
                                 {
                                     "summary": f"Pod {namespace}/{pod_name} container {container_name} config error",
                                     "details": {
@@ -6954,12 +7018,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ]["aws_doc"],
                                         "finding_type": FindingType.CURRENT_STATE,
                                     },
-                                }
+                                },
                             )
 
                     # Check for high restart count
                     if restart_count >= Thresholds.RESTART_CRITICAL:
-                        self.findings["pod_errors"].append(
+                        self._add_finding_dict(
+                            "pod_errors",
                             {
                                 "summary": f"Pod {namespace}/{pod_name} container {container_name} has high restart count: {restart_count}",
                                 "details": {
@@ -6970,10 +7035,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "severity": "critical",
                                     "finding_type": FindingType.CURRENT_STATE,
                                 },
-                            }
+                            },
                         )
                     elif restart_count >= Thresholds.RESTART_WARNING:
-                        self.findings["pod_errors"].append(
+                        self._add_finding_dict(
+                            "pod_errors",
                             {
                                 "summary": f"Pod {namespace}/{pod_name} container {container_name} restarted {restart_count} times",
                                 "details": {
@@ -6984,7 +7050,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "severity": "warning",
                                     "finding_type": FindingType.CURRENT_STATE,
                                 },
-                            }
+                            },
                         )
 
                 # Check init container statuses (Catalog 3.5: Init Container Failure)
@@ -7035,7 +7101,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "Verify volume mounts exist",
                                     ]
 
-                                self.findings["pod_errors"].append(
+                                self._add_finding_dict(
+                                    "pod_errors",
                                     {
                                         "summary": f"Pod {namespace}/{pod_name} init container {init_name} failed: {reason}",
                                         "details": {
@@ -7052,7 +7119,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "impact": "Pod cannot start until init containers complete successfully",
                                             "aws_doc": "https://kubernetes.io/docs/concepts/workloads/pods/init-containers/",
                                         },
-                                    }
+                                    },
                                 )
 
                         elif terminated:
@@ -7088,7 +7155,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 elif exit_code == 127:
                                     diagnostic_steps.append("Command not found")
 
-                                self.findings["pod_errors"].append(
+                                self._add_finding_dict(
+                                    "pod_errors",
                                     {
                                         "summary": f"Pod {namespace}/{pod_name} init container {init_name} exited with code {exit_code}",
                                         "details": {
@@ -7104,7 +7172,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "diagnostic_steps": diagnostic_steps,
                                             "aws_doc": "https://kubernetes.io/docs/concepts/workloads/pods/init-containers/",
                                         },
-                                    }
+                                    },
                                 )
 
                 # Check for pods stuck in Init state (Init:0/N, Init:Error, etc.)
@@ -7118,7 +7186,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             reason = cond.get("reason", "")
 
                             if "init" in message.lower() or "init" in reason.lower():
-                                self.findings["pod_errors"].append(
+                                self._add_finding_dict(
+                                    "pod_errors",
                                     {
                                         "summary": f"Pod {namespace}/{pod_name} stuck in Init phase",
                                         "details": {
@@ -7136,7 +7205,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             ],
                                             "aws_doc": "https://kubernetes.io/docs/concepts/workloads/pods/init-containers/",
                                         },
-                                    }
+                                    },
                                 )
 
             self.progress.info("Deep pod health analysis completed")
@@ -7164,7 +7233,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 ready = status.get("numberReady", 0)
 
                 if ready < desired:
-                    self.findings["network_issues"].append(
+                    self._add_finding_dict(
+                        "network_issues",
                         {
                             "summary": f"VPC CNI aws-node DaemonSet not healthy: {ready}/{desired} ready",
                             "details": {
@@ -7182,7 +7252,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ],
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
-                        }
+                        },
                     )
 
             # Check for IP allocation errors in events
@@ -7201,7 +7271,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     message = event.get("message", "").lower()
                     if any(pattern in message for pattern in ip_exhaustion_patterns):
                         involved = event.get("involvedObject", {})
-                        self.findings["network_issues"].append(
+                        self._add_finding_dict(
+                            "network_issues",
                             {
                                 "summary": f"IP address exhaustion detected in {involved.get('namespace', 'unknown')}",
                                 "details": {
@@ -7217,7 +7288,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ],
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("VPC CNI health analysis completed")
@@ -7245,7 +7316,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 unavailable = status.get("unavailableReplicas", 0)
 
                 if ready < replicas or unavailable > 0:
-                    self.findings["dns_issues"].append(
+                    self._add_finding_dict(
+                        "dns_issues",
                         {
                             "summary": f"CoreDNS deployment unhealthy: {ready}/{replicas} ready",
                             "details": {
@@ -7257,7 +7329,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "severity": "critical" if ready == 0 else "warning",
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
-                        }
+                        },
                     )
 
             # Check for DNS-related errors in events
@@ -7284,7 +7356,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "DNS_default",
                     ]:
                         involved = event.get("involvedObject", {})
-                        self.findings["dns_issues"].append(
+                        self._add_finding_dict(
+                            "dns_issues",
                             {
                                 "summary": f"DNS issue detected in {involved.get('namespace', 'unknown')}/{involved.get('name', 'unknown')}",
                                 "details": {
@@ -7301,7 +7374,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ]["aws_doc"],
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("CoreDNS health analysis completed")
@@ -7332,7 +7405,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 ready = status.get("readyReplicas", 0)
 
                 if ready < replicas:
-                    self.findings["rbac_issues"].append(
+                    self._add_finding_dict(
+                        "rbac_issues",
                         {
                             "summary": "EKS Pod Identity Agent not fully healthy",
                             "details": {
@@ -7343,7 +7417,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "severity": "warning",
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
-                        }
+                        },
                     )
 
             # Check for AccessDenied errors in events
@@ -7361,7 +7435,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     reason = event.get("reason", "").lower()
                     if any(pattern in message or pattern in reason for pattern in access_patterns):
                         involved = event.get("involvedObject", {})
-                        self.findings["rbac_issues"].append(
+                        self._add_finding_dict(
+                            "rbac_issues",
                             {
                                 "summary": f"IAM/RBAC access denied in {involved.get('namespace', 'unknown')}/{involved.get('name', 'unknown')}",
                                 "details": {
@@ -7378,7 +7453,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ],
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
-                            }
+                            },
                         )
 
             # CloudTrail correlation for IRSA/Pod Identity failures
@@ -7418,7 +7493,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         if res.get("ResourceType") == "AWS::IAM::Role":
                                             role_arn = res.get("ResourceName", "")
 
-                                    self.findings["rbac_issues"].append(
+                                    self._add_finding_dict(
+                                        "rbac_issues",
                                         {
                                             "summary": f"CloudTrail: AssumeRole failed for {role_arn or 'unknown role'}",
                                             "details": {
@@ -7441,7 +7517,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 ],
                                                 "finding_type": FindingType.HISTORICAL_EVENT,
                                             },
-                                        }
+                                        },
                                     )
                             except (json.JSONDecodeError, TypeError):
                                 pass
@@ -7478,7 +7554,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                             if error_code:
                                 username = event.get("Username", "")
-                                self.findings["rbac_issues"].append(
+                                self._add_finding_dict(
+                                    "rbac_issues",
                                     {
                                         "summary": f"CloudTrail: AssumeRoleForPodIdentity failed for {username}",
                                         "details": {
@@ -7497,7 +7574,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             ],
                                             "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html",
                                         },
-                                    }
+                                    },
                                 )
                         except (json.JSONDecodeError, TypeError):
                             pass
@@ -7964,7 +8041,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         max_cpu = max(values)
                         # If CPU usage consistently hits high levels, flag it
                         if max_cpu >= Thresholds.CPU_CRITICAL:
-                            self.findings["pod_errors"].append(
+                            self._add_finding_dict(
+                                "pod_errors",
                                 {
                                     "summary": f"High CPU usage detected: {max_cpu:.1f}% - potential throttling",
                                     "details": {
@@ -7978,7 +8056,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "Unexpected traffic spike",
                                         ],
                                     },
-                                }
+                                },
                             )
 
             self.progress.info("CPU throttling analysis completed")
@@ -8017,7 +8095,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 # Check if service has no endpoints
                 if not subsets:
-                    self.findings["network_issues"].append(
+                    self._add_finding_dict(
+                        "network_issues",
                         {
                             "summary": f"Service {ep_namespace}/{ep_name} has no endpoints (pods not ready)",
                             "details": {
@@ -8038,7 +8117,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ],
                                 "aws_doc": "https://kubernetes.io/docs/tasks/debug/debug-application/debug-service/",
                             },
-                        }
+                        },
                     )
 
             # Check for LoadBalancer services with pending IPs
@@ -8059,7 +8138,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     if svc_type == "LoadBalancer":
                         lb_ingress = status.get("loadBalancer", {}).get("ingress", [])
                         if not lb_ingress:
-                            self.findings["network_issues"].append(
+                            self._add_finding_dict(
+                                "network_issues",
                                 {
                                     "summary": f"LoadBalancer service {svc_namespace}/{svc_name} has no external IP",
                                     "details": {
@@ -8076,7 +8156,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html",
                                     },
-                                }
+                                },
                             )
 
             # Check for connectivity-related events (passive connectivity check)
@@ -8120,7 +8200,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     for pattern_info in connectivity_event_patterns:
                         if pattern_info["pattern"] in message:
-                            self.findings["network_issues"].append(
+                            self._add_finding_dict(
+                                "network_issues",
                                 {
                                     "summary": f"Connectivity issue: {pattern_info['issue']} in {namespace}/{involved.get('name', 'unknown')}",
                                     "details": {
@@ -8141,7 +8222,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://kubernetes.io/docs/tasks/debug/debug-application/debug-service/",
                                     },
-                                }
+                                },
                             )
                             break
 
@@ -8192,7 +8273,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 if status != "ACTIVE" or issues:
                     issue_messages = [issue.get("message", "Unknown") for issue in issues]
 
-                    self.findings["node_issues"].append(
+                    self._add_finding_dict(
+                        "node_issues",
                         {
                             "summary": f"EKS node group {ng_name} is unhealthy (status: {status})",
                             "details": {
@@ -8207,7 +8289,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "aws_doc": "https://repost.aws/knowledge-center/eks-node-group-degraded",
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
-                        }
+                        },
                     )
 
             self.progress.info(f"Checked {len(nodegroups)} EKS node groups")
@@ -8247,7 +8329,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 elif "readiness" in message:
                     probe_type = "readiness"
 
-                self.findings["pod_errors"].append(
+                self._add_finding_dict(
+                    "pod_errors",
                     {
                         "summary": f"Pod {involved.get('namespace', 'unknown')}/{involved.get('name', 'unknown')} failing {probe_type} probe",
                         "details": {
@@ -8267,7 +8350,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "aws_doc": "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
                             "finding_type": FindingType.HISTORICAL_EVENT,
                         },
-                    }
+                    },
                 )
 
             self.progress.info(f"Found {len(events.get('items', []))} probe failure events")
@@ -8296,7 +8379,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 unavailable = status.get("unavailableReplicas", 0)
 
                 if ready < replicas or unavailable > 0:
-                    self.findings["pvc_issues"].append(
+                    self._add_finding_dict(
+                        "pvc_issues",
                         {
                             "summary": f"EBS CSI controller unhealthy: {ready}/{replicas} ready",
                             "details": {
@@ -8314,7 +8398,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html",
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
-                        }
+                        },
                     )
 
             # Check for volume attachment events
@@ -8327,7 +8411,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 for event in events.get("items", [])[:10]:
                     involved = event.get("involvedObject", {})
-                    self.findings["pvc_issues"].append(
+                    self._add_finding_dict(
+                        "pvc_issues",
                         {
                             "summary": f"Volume attachment failed for {involved.get('namespace', 'unknown')}/{involved.get('name', 'unknown')}",
                             "details": {
@@ -8344,7 +8429,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ]["aws_doc"],
                                 "finding_type": FindingType.HISTORICAL_EVENT,
                             },
-                        }
+                        },
                     )
 
             self.progress.info("EBS CSI driver analysis completed")
@@ -8482,7 +8567,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 ready = status.get("readyReplicas", 0)
 
                 if ready < replicas:
-                    self.findings["addon_issues"].append(
+                    self._add_finding_dict(
+                        "addon_issues",
                         {
                             "summary": "Cluster Autoscaler deployment not fully healthy",
                             "details": {
@@ -8500,7 +8586,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ],
                                 "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/autoscaling.html",
                             },
-                        }
+                        },
                     )
 
             cmd = "kubectl logs -l app=cluster-autoscaler -n kube-system --tail=100 2>/dev/null || echo 'not found'"
@@ -8538,7 +8624,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 for error_check in cas_error_patterns:
                     if re.search(error_check["pattern"], output, re.IGNORECASE):
                         if error_check["severity"] != "info":
-                            self.findings["addon_issues"].append(
+                            self._add_finding_dict(
+                                "addon_issues",
                                 {
                                     "summary": f"Cluster Autoscaler issue: {error_check['root_cause']}",
                                     "details": {
@@ -8548,7 +8635,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "finding_type": FindingType.HISTORICAL_EVENT,
                                         "aws_doc": "https://repost.aws/knowledge-center/eks-pod-scheduling-cluster-autoscaler",
                                     },
-                                }
+                                },
                             )
 
             self.progress.info("Cluster Autoscaler analysis completed")
@@ -8582,7 +8669,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             condition.get("type") == "AbleToScale"
                             and condition.get("status") != "True"
                         ):
-                            self.findings["pod_errors"].append(
+                            self._add_finding_dict(
+                                "pod_errors",
                                 {
                                     "summary": f"HPA {namespace}/{hpa_name} cannot scale",
                                     "details": {
@@ -8599,14 +8687,15 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/",
                                     },
-                                }
+                                },
                             )
 
                         if (
                             condition.get("type") == "ScalingActive"
                             and condition.get("status") != "True"
                         ):
-                            self.findings["pod_errors"].append(
+                            self._add_finding_dict(
+                                "pod_errors",
                                 {
                                     "summary": f"HPA {namespace}/{hpa_name} scaling not active",
                                     "details": {
@@ -8622,7 +8711,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "Invalid metric configuration",
                                         ],
                                     },
-                                }
+                                },
                             )
 
                     current_replicas = status.get("currentReplicas", 0)
@@ -8630,7 +8719,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     max_replicas = hpa.get("spec", {}).get("maxReplicas", 0)
 
                     if current_replicas >= max_replicas and current_replicas > 0:
-                        self.findings["pod_errors"].append(
+                        self._add_finding_dict(
+                            "pod_errors",
                             {
                                 "summary": f"HPA {namespace}/{hpa_name} at max replicas ({max_replicas})",
                                 "details": {
@@ -8642,7 +8732,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "finding_type": FindingType.CURRENT_STATE,
                                     "recommendation": "Consider increasing maxReplicas if workload needs more scaling",
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("HPA/VPA analysis completed")
@@ -8678,7 +8768,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     for condition in conditions:
                         if condition.get("type") == "Ready":
                             if "certificate" in condition.get("message", "").lower():
-                                self.findings["node_issues"].append(
+                                self._add_finding_dict(
+                                    "node_issues",
                                     {
                                         "summary": f"Node {node_name} may have certificate issues",
                                         "details": {
@@ -8693,7 +8784,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             ],
                                             "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/certificate-rotation.html",
                                         },
-                                    }
+                                    },
                                 )
 
             cmd = "kubectl get events --all-namespaces --field-selector reason=TLSHealthCheckSucceeded -o json 2>/dev/null || echo 'not found'"
@@ -8707,7 +8798,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     message = event.get("message", "").lower()
                     if "cert" in message and ("expir" in message or "invalid" in message):
                         involved = event.get("involvedObject", {})
-                        self.findings["control_plane_issues"].append(
+                        self._add_finding_dict(
+                            "control_plane_issues",
                             {
                                 "summary": f"Certificate issue detected in {involved.get('namespace', 'unknown')}",
                                 "details": {
@@ -8717,7 +8809,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "severity": "critical",
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("Certificate expiration analysis completed")
@@ -8744,7 +8836,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 ready = status.get("readyReplicas", 0)
 
                 if ready < replicas:
-                    self.findings["network_issues"].append(
+                    self._add_finding_dict(
+                        "network_issues",
                         {
                             "summary": "AWS Load Balancer Controller not fully healthy",
                             "details": {
@@ -8761,7 +8854,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ],
                                 "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html",
                             },
-                        }
+                        },
                     )
 
             cmd = "kubectl logs -l app.kubernetes.io/name=aws-load-balancer-controller -n kube-system --tail=100 2>/dev/null || echo 'not found'"
@@ -8793,7 +8886,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 for error_check in lb_error_patterns:
                     if re.search(error_check["pattern"], output, re.IGNORECASE):
-                        self.findings["network_issues"].append(
+                        self._add_finding_dict(
+                            "network_issues",
                             {
                                 "summary": f"AWS LB Controller issue: {error_check['root_cause']}",
                                 "details": {
@@ -8802,7 +8896,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "severity": error_check["severity"],
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html",
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("AWS Load Balancer Controller analysis completed")
@@ -8860,7 +8954,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         total_ips = 2 ** (32 - int(cidr.split("/")[1])) - 5
 
                         if available_ips < 5:
-                            self.findings["network_issues"].append(
+                            self._add_finding_dict(
+                                "network_issues",
                                 {
                                     "summary": f"Subnet {subnet_id} has very few IPs available ({available_ips})",
                                     "details": {
@@ -8881,10 +8976,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "recommendation": "Consider adding a secondary CIDR block or expanding subnet",
                                         "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-cluster-ip-address-issues",
                                     },
-                                }
+                                },
                             )
                         elif available_ips < 16:
-                            self.findings["network_issues"].append(
+                            self._add_finding_dict(
+                                "network_issues",
                                 {
                                     "summary": f"Subnet {subnet_id} running low on IPs ({available_ips} available)",
                                     "details": {
@@ -8896,7 +8992,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "severity": "warning",
                                         "finding_type": FindingType.CURRENT_STATE,
                                     },
-                                }
+                                },
                             )
 
             self.progress.info("Subnet health analysis completed")
@@ -8923,7 +9019,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 ready = status.get("readyReplicas", 0)
 
                 if ready < replicas:
-                    self.findings["addon_issues"].append(
+                    self._add_finding_dict(
+                        "addon_issues",
                         {
                             "summary": "Karpenter deployment not fully healthy",
                             "details": {
@@ -8940,7 +9037,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ],
                                 "aws_doc": "https://karpenter.sh/docs/getting-started/getting-started-with-karpenter/",
                             },
-                        }
+                        },
                     )
 
             cmd = "kubectl get nodepools -o json 2>/dev/null || echo 'not found'"
@@ -8959,7 +9056,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 condition.get("type") == "Ready"
                                 and condition.get("status") != "True"
                             ):
-                                self.findings["addon_issues"].append(
+                                self._add_finding_dict(
+                                    "addon_issues",
                                     {
                                         "summary": f"Karpenter NodePool {np_name} not ready",
                                         "details": {
@@ -8969,7 +9067,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "severity": "warning",
                                             "finding_type": FindingType.CURRENT_STATE,
                                         },
-                                    }
+                                    },
                                 )
 
             self.progress.info("Karpenter health analysis completed")
@@ -8996,7 +9094,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 ready = status.get("readyReplicas", 0)
 
                 if ready < replicas:
-                    self.findings["pvc_issues"].append(
+                    self._add_finding_dict(
+                        "pvc_issues",
                         {
                             "summary": "EFS CSI controller unhealthy",
                             "details": {
@@ -9013,14 +9112,15 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ],
                                 "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/efs-csi.html",
                             },
-                        }
+                        },
                     )
 
             cmd = "kubectl get events --all-namespaces --field-selector reason=Warning -o json 2>/dev/null | grep -i efs || echo ''"
             output = self.safe_kubectl_call(cmd)
 
             if output and output.strip():
-                self.findings["pvc_issues"].append(
+                self._add_finding_dict(
+                    "pvc_issues",
                     {
                         "summary": "EFS-related warnings detected",
                         "details": {
@@ -9028,7 +9128,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "finding_type": FindingType.HISTORICAL_EVENT,
                             "recommendation": "Review events for EFS mount issues",
                         },
-                    }
+                    },
                 )
 
             self.progress.info("EFS CSI driver analysis completed")
@@ -9096,7 +9196,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 phase = pod.get("status", {}).get("phase", "Unknown")
 
                                 if phase == "Pending":
-                                    self.findings["scheduling_failures"].append(
+                                    self._add_finding_dict(
+                                        "scheduling_failures",
                                         {
                                             "summary": f"GPU pod {namespace}/{pod_name} pending but no GPU nodes available",
                                             "details": {
@@ -9111,7 +9212,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 ],
                                                 "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/gpu-ami.html",
                                             },
-                                        }
+                                        },
                                     )
             else:
                 cmd = "kubectl get events --all-namespaces --field-selector reason=FailedScheduling -o json 2>/dev/null || echo 'not found'"
@@ -9127,7 +9228,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         message = event.get("message", "").lower()
                         if "gpu" in message:
                             involved = event.get("involvedObject", {})
-                            self.findings["scheduling_failures"].append(
+                            self._add_finding_dict(
+                                "scheduling_failures",
                                 {
                                     "summary": f"GPU scheduling failure for {involved.get('namespace', 'unknown')}/{involved.get('name', 'unknown')}",
                                     "details": {
@@ -9139,7 +9241,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "gpu_nodes_count": len(gpu_nodes),
                                         "total_gpus": total_gpus,
                                     },
-                                }
+                                },
                             )
 
             self.progress.info("GPU scheduling analysis completed")
@@ -9191,7 +9293,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     )
 
                     if ready_condition and ready_condition.get("status") != "True":
-                        self.findings["node_issues"].append(
+                        self._add_finding_dict(
+                            "node_issues",
                             {
                                 "summary": f"Windows node {node_name} not ready",
                                 "details": {
@@ -9208,7 +9311,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ],
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/windows-support.html",
                                 },
-                            }
+                            },
                         )
 
             if windows_nodes:
@@ -9225,7 +9328,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         message = event.get("message", "").lower()
                         if "windows" in message:
                             involved = event.get("involvedObject", {})
-                            self.findings["scheduling_failures"].append(
+                            self._add_finding_dict(
+                                "scheduling_failures",
                                 {
                                     "summary": f"Windows scheduling issue for {involved.get('name', 'unknown')}",
                                     "details": {
@@ -9236,7 +9340,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "finding_type": FindingType.HISTORICAL_EVENT,
                                         "windows_nodes_count": len(windows_nodes),
                                     },
-                                }
+                                },
                             )
 
             self.progress.info("Windows node analysis completed")
@@ -9319,7 +9423,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 )
 
             for issue in sg_issues:
-                self.findings["network_issues"].append(
+                self._add_finding_dict(
+                    "network_issues",
                     {
                         "summary": f"Security group issue: {issue['issue']}",
                         "details": {
@@ -9329,7 +9434,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "finding_type": FindingType.CURRENT_STATE,
                             "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/sec-group-reqs.html",
                         },
-                    }
+                    },
                 )
 
             self.progress.info("Security group analysis completed")
@@ -9368,7 +9473,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     status = profile.get("status", "Unknown")
 
                     if status != "ACTIVE":
-                        self.findings["addon_issues"].append(
+                        self._add_finding_dict(
+                            "addon_issues",
                             {
                                 "summary": f"Fargate profile {profile_name} is not active (status: {status})",
                                 "details": {
@@ -9385,7 +9491,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ],
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/fargate-profile.html",
                                 },
-                            }
+                            },
                         )
 
             cmd = "kubectl get pods --all-namespaces -o json 2>/dev/null || echo 'not found'"
@@ -9402,7 +9508,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             pod_name = pod["metadata"]["name"]
                             namespace = pod["metadata"]["namespace"]
 
-                            self.findings["scheduling_failures"].append(
+                            self._add_finding_dict(
+                                "scheduling_failures",
                                 {
                                     "summary": f"Fargate pod {namespace}/{pod_name} stuck in Pending",
                                     "details": {
@@ -9417,7 +9524,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "Subnet/IP exhaustion in Fargate subnet",
                                         ],
                                     },
-                                }
+                                },
                             )
 
             self.progress.info(f"Fargate profile analysis completed ({len(profiles)} profiles)")
@@ -9509,7 +9616,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 event["timestamp"] / 1000, tz=timezone.utc
                             )
 
-                            self.findings["control_plane_issues"].append(
+                            self._add_finding_dict(
+                                "control_plane_issues",
                                 {
                                     "summary": f"API Server issue: {pattern_info['issue']}",
                                     "details": {
@@ -9523,7 +9631,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "finding_type": FindingType.HISTORICAL_EVENT,
                                         "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
                                     },
-                                }
+                                },
                             )
                             break
 
@@ -9554,7 +9662,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 for dp in data["Datapoints"]:
                                     max_latency = dp.get("Maximum", 0)
                                     if max_latency > 1.0:  # > 1 second
-                                        self.findings["control_plane_issues"].append(
+                                        self._add_finding_dict(
+                                            "control_plane_issues",
                                             {
                                                 "summary": f"API Server high latency detected: {max_latency:.2f}s",
                                                 "details": {
@@ -9569,7 +9678,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     else "warning",
                                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                                 },
-                                            }
+                                            },
                                         )
             except Exception:
                 pass
@@ -9708,7 +9817,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             break
 
             for finding in rate_limit_findings:
-                self.findings["control_plane_issues"].append(finding)
+                self._add_finding_dict("control_plane_issues", finding)
 
             if throttled_agents:
                 top_throttled = sorted(throttled_agents.items(), key=lambda x: x[1], reverse=True)[
@@ -9717,7 +9826,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 summary_agents = ", ".join([f"{agent}: {count}" for agent, count in top_throttled])
 
-                self.findings["control_plane_issues"].append(
+                self._add_finding_dict(
+                    "control_plane_issues",
                     {
                         "summary": f"API Server rate limiting summary: {len(rate_limit_findings)} events from {len(throttled_agents)} clients",
                         "details": {
@@ -9728,7 +9838,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "finding_type": FindingType.HISTORICAL_EVENT,
                             "aws_doc": "https://kubernetes.io/docs/concepts/cluster-administration/flow-control/",
                         },
-                    }
+                    },
                 )
 
             try:
@@ -9742,7 +9852,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         matching_cond = fs.get("status", {}).get("conditions", [])
                         for cond in matching_cond:
                             if cond.get("type") == "Dangling" and cond.get("status") == "True":
-                                self.findings["control_plane_issues"].append(
+                                self._add_finding_dict(
+                                    "control_plane_issues",
                                     {
                                         "summary": f"APF FlowSchema '{name}' is dangling (no matching PriorityLevelConfiguration)",
                                         "details": {
@@ -9753,7 +9864,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "finding_type": FindingType.CURRENT_STATE,
                                             "aws_doc": "https://kubernetes.io/docs/concepts/cluster-administration/flow-control/",
                                         },
-                                    }
+                                    },
                                 )
             except Exception:
                 pass
@@ -9934,11 +10045,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "Open AWS Support ticket for EKS-managed etcd defragmentation"
                                 )
 
-                            self.findings["control_plane_issues"].append(
+                            self._add_finding_dict(
+                                "control_plane_issues",
                                 {
                                     "summary": f"etcd issue: {pattern_info['issue']}",
                                     "details": finding_details,
-                                }
+                                },
                             )
                             break
 
@@ -9961,7 +10073,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                             etcd_quota_exceeded = True
 
-                            self.findings["control_plane_issues"].append(
+                            self._add_finding_dict(
+                                "control_plane_issues",
                                 {
                                     "summary": f"etcd quota exceeded: Failed to create {obj_kind}/{obj_name} in {namespace}",
                                     "details": {
@@ -9982,7 +10095,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                                     },
-                                }
+                                },
                             )
             except Exception:
                 pass
@@ -10003,7 +10116,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                             if "space" in message or "database" in message:
                                 etcd_quota_exceeded = True
-                                self.findings["control_plane_issues"].append(
+                                self._add_finding_dict(
+                                    "control_plane_issues",
                                     {
                                         "summary": f"etcd quota exceeded event: {obj_kind}/{obj_name} in {namespace}",
                                         "details": {
@@ -10013,13 +10127,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "severity": "critical",
                                             "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                                         },
-                                    }
+                                    },
                                 )
             except Exception:
                 pass
 
             if etcd_quota_exceeded:
-                self.findings["control_plane_issues"].append(
+                self._add_finding_dict(
+                    "control_plane_issues",
                     {
                         "summary": "CRITICAL: etcd storage quota exceeded detected - cluster may be read-only",
                         "details": {
@@ -10033,7 +10148,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             ],
                             "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                         },
-                    }
+                    },
                 )
 
             self.progress.info("etcd health analysis completed")
@@ -10139,7 +10254,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 event["timestamp"] / 1000, tz=timezone.utc
                             )
 
-                            self.findings["control_plane_issues"].append(
+                            self._add_finding_dict(
+                                "control_plane_issues",
                                 {
                                     "summary": f"Controller Manager: {pattern_info['issue']}",
                                     "details": {
@@ -10156,7 +10272,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
                                     },
-                                }
+                                },
                             )
                             break
 
@@ -10192,7 +10308,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                         # Check for potentially problematic configurations
                         if failure_policy == "Fail" and timeout_seconds < 10:
-                            self.findings["control_plane_issues"].append(
+                            self._add_finding_dict(
+                                "control_plane_issues",
                                 {
                                     "summary": f"Admission webhook {webhook_name}/{wh_name} has aggressive timeout ({timeout_seconds}s)",
                                     "details": {
@@ -10204,7 +10321,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "finding_type": FindingType.CURRENT_STATE,
                                         "recommendation": "Consider increasing timeout or changing failurePolicy to Ignore",
                                     },
-                                }
+                                },
                             )
 
             # Check for webhook-related events
@@ -10232,7 +10349,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         or "webhook" in reason.lower()
                     ):
                         involved = event.get("involvedObject", {})
-                        self.findings["control_plane_issues"].append(
+                        self._add_finding_dict(
+                            "control_plane_issues",
                             {
                                 "summary": f"Admission webhook error: {involved.get('namespace', 'unknown')}/{involved.get('name', 'unknown')}",
                                 "details": {
@@ -10251,7 +10369,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ],
                                     "aws_doc": "https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/",
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("Admission webhook analysis completed")
@@ -10290,7 +10408,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             reason = condition.get("reason", "").lower()
 
                             if "pleg" in message or "pleg" in reason:
-                                self.findings["node_issues"].append(
+                                self._add_finding_dict(
+                                    "node_issues",
                                     {
                                         "summary": f"Node {node_name} has PLEG health issues",
                                         "details": {
@@ -10307,7 +10426,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             ],
                                             "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                                         },
-                                    }
+                                    },
                                 )
 
             # Check events for PLEG issues
@@ -10322,7 +10441,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     message = event.get("message", "").lower()
                     if "pleg" in message and "not healthy" in message:
                         involved = event.get("involvedObject", {})
-                        self.findings["node_issues"].append(
+                        self._add_finding_dict(
+                            "node_issues",
                             {
                                 "summary": f"PLEG not healthy on {involved.get('name', 'unknown')}",
                                 "details": {
@@ -10332,7 +10452,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "severity": "critical",
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("PLEG health analysis completed")
@@ -10375,7 +10495,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if any(p in message for p in runtime_error_patterns):
                         involved = event.get("involvedObject", {})
-                        self.findings["node_issues"].append(
+                        self._add_finding_dict(
+                            "node_issues",
                             {
                                 "summary": f"Container runtime issue on {involved.get('name', 'unknown')}",
                                 "details": {
@@ -10393,7 +10514,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ],
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                                 },
-                            }
+                            },
                         )
 
             # Check node conditions for runtime issues
@@ -10411,7 +10532,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         if condition.get("type") == "Ready" and condition.get("status") != "True":
                             message = condition.get("message", "").lower()
                             if "runtime" in message or "container" in message:
-                                self.findings["node_issues"].append(
+                                self._add_finding_dict(
+                                    "node_issues",
                                     {
                                         "summary": f"Node {node_name} has container runtime issues",
                                         "details": {
@@ -10420,7 +10542,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "severity": "critical",
                                             "finding_type": FindingType.CURRENT_STATE,
                                         },
-                                    }
+                                    },
                                 )
 
             self.progress.info("Container Runtime analysis completed")
@@ -10574,7 +10696,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             # Add findings
             for issue in pause_image_issues:
-                self.findings["node_issues"].append(issue)
+                self._add_finding_dict("node_issues", issue)
 
             # Summary if multiple nodes affected
             if len(pause_image_issues) > 3:
@@ -10583,7 +10705,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     if "pod" in issue.get("details", {}):
                         affected_pods.add(issue["details"]["pod"])
 
-                self.findings["node_issues"].append(
+                self._add_finding_dict(
+                    "node_issues",
                     {
                         "summary": f"Multiple pause/sandbox image issues detected: {len(affected_pods)} pods affected",
                         "details": {
@@ -10593,7 +10716,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "recommendation": "Check for disk pressure on nodes triggering aggressive garbage collection. Consider increasing kubelet --image-gc-high-threshold.",
                             "aws_doc": "https://kubernetes.io/docs/concepts/workloads/pods/pause-container/",
                         },
-                    }
+                    },
                 )
 
             self.progress.info(
@@ -10630,7 +10753,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 if deletion_ts:
                     # Pod is being deleted but still exists
-                    self.findings["pod_errors"].append(
+                    self._add_finding_dict(
+                        "pod_errors",
                         {
                             "summary": f"Pod {namespace}/{pod_name} stuck in Terminating",
                             "details": {
@@ -10648,7 +10772,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ],
                                 "aws_doc": "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination",
                             },
-                        }
+                        },
                     )
 
             # Check for volume detach events
@@ -10663,7 +10787,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     message = event.get("message", "").lower()
                     if "detach" in message or "unmount" in message:
                         involved = event.get("involvedObject", {})
-                        self.findings["pvc_issues"].append(
+                        self._add_finding_dict(
+                            "pvc_issues",
                             {
                                 "summary": f"Volume detach/unmount issue for {involved.get('namespace', 'unknown')}/{involved.get('name', 'unknown')}",
                                 "details": {
@@ -10674,7 +10799,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "severity": "warning",
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
-                            }
+                            },
                         )
 
             self.progress.info("Stuck Terminating pods analysis completed")
@@ -10723,7 +10848,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if cond_status != "True":
                         if cond_type == "Progressing":
-                            self.findings["pod_errors"].append(
+                            self._add_finding_dict(
+                                "pod_errors",
                                 {
                                     "summary": f"Deployment {namespace}/{deploy_name} rollout not progressing",
                                     "details": {
@@ -10749,10 +10875,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://kubernetes.io/docs/concepts/workloads/controllers/deployment/",
                                     },
-                                }
+                                },
                             )
                         elif cond_type == "Available":
-                            self.findings["pod_errors"].append(
+                            self._add_finding_dict(
+                                "pod_errors",
                                 {
                                     "summary": f"Deployment {namespace}/{deploy_name} not available",
                                     "details": {
@@ -10764,12 +10891,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "severity": "warning",
                                         "finding_type": FindingType.CURRENT_STATE,
                                     },
-                                }
+                                },
                             )
 
                 # Check for replica mismatch
                 if unavailable_replicas > 0 or (replicas > 0 and ready_replicas < replicas):
-                    self.findings["pod_errors"].append(
+                    self._add_finding_dict(
+                        "pod_errors",
                         {
                             "summary": f"Deployment {namespace}/{deploy_name} has unavailable replicas ({unavailable_replicas})",
                             "details": {
@@ -10782,7 +10910,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "severity": "warning" if ready_replicas > 0 else "critical",
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
-                        }
+                        },
                     )
 
             self.progress.info("Deployment rollout analysis completed")
@@ -10826,7 +10954,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         cond_reason = condition.get("reason", "")
 
                         if cond_type == "Failed":
-                            self.findings["pod_errors"].append(
+                            self._add_finding_dict(
+                                "pod_errors",
                                 {
                                     "summary": f"Job {namespace}/{job_name} failed: {cond_reason}",
                                     "details": {
@@ -10849,11 +10978,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://kubernetes.io/docs/concepts/workloads/controllers/job/",
                                     },
-                                }
+                                },
                             )
 
                     if failed > 0 and failed >= backoff_limit:
-                        self.findings["pod_errors"].append(
+                        self._add_finding_dict(
+                            "pod_errors",
                             {
                                 "summary": f"Job {namespace}/{job_name} exceeded backoff limit ({backoff_limit})",
                                 "details": {
@@ -10864,7 +10994,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "severity": "critical",
                                     "finding_type": FindingType.CURRENT_STATE,
                                 },
-                            }
+                            },
                         )
 
             # Check CronJobs
@@ -10896,7 +11026,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             # If last schedule was more than 2x the expected interval, flag it
                             # This is a heuristic - could be improved with cron parsing
                             if time_since_schedule.total_seconds() > 3600:  # > 1 hour
-                                self.findings["pod_errors"].append(
+                                self._add_finding_dict(
+                                    "pod_errors",
                                     {
                                         "summary": f"CronJob {namespace}/{cj_name} may have missed schedules",
                                         "details": {
@@ -10915,7 +11046,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "startingDeadlineSeconds exceeded",
                                             ],
                                         },
-                                    }
+                                    },
                                 )
                         except Exception:
                             pass
@@ -10989,7 +11120,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             )
 
                 if is_restrictive or issues:
-                    self.findings["network_issues"].append(
+                    self._add_finding_dict(
+                        "network_issues",
                         {
                             "summary": f"NetworkPolicy {namespace}/{np_name} may be blocking traffic",
                             "details": {
@@ -11009,7 +11141,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ],
                                 "aws_doc": "https://kubernetes.io/docs/concepts/services-networking/network-policies/",
                             },
-                        }
+                        },
                     )
 
             self.progress.info(
@@ -11039,7 +11171,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 ready = status.get("readyReplicas", 0)
 
                 if ready < replicas:
-                    self.findings["network_issues"].append(
+                    self._add_finding_dict(
+                        "network_issues",
                         {
                             "summary": "AWS Load Balancer Controller not healthy",
                             "details": {
@@ -11050,7 +11183,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "severity": "critical",
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
-                        }
+                        },
                     )
 
             # Check Ingress resources for issues
@@ -11072,7 +11205,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         # Ingress has no LB assigned
                         annotations = ing["metadata"].get("annotations", {})
                         if "alb.ingress.kubernetes.io" in str(annotations):
-                            self.findings["network_issues"].append(
+                            self._add_finding_dict(
+                                "network_issues",
                                 {
                                     "summary": f"ALB Ingress {namespace}/{ing_name} has no load balancer",
                                     "details": {
@@ -11088,7 +11222,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html",
                                     },
-                                }
+                                },
                             )
 
             # Check CloudWatch for ALB metrics
@@ -11122,7 +11256,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 for dp in data["Datapoints"]:
                                     value = dp.get("Sum", dp.get("Maximum", 0))
                                     if value > 0:
-                                        self.findings["network_issues"].append(
+                                        self._add_finding_dict(
+                                            "network_issues",
                                             {
                                                 "summary": f"ALB metric {metric_name} indicates issues",
                                                 "details": {
@@ -11150,7 +11285,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     ],
                                                     "aws_doc": "https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html",
                                                 },
-                                            }
+                                            },
                                         )
             except Exception:
                 pass
@@ -11192,7 +11327,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 # Check for replica mismatch
                 if ready_replicas < replicas:
-                    self.findings["pod_errors"].append(
+                    self._add_finding_dict(
+                        "pod_errors",
                         {
                             "summary": f"StatefulSet {namespace}/{sts_name} has insufficient ready replicas ({ready_replicas}/{replicas})",
                             "details": {
@@ -11213,7 +11349,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 ],
                                 "aws_doc": "https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/",
                             },
-                        }
+                        },
                     )
 
                 # Check for volume claim templates
@@ -11233,7 +11369,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 phase = pvc.get("status", {}).get("phase", "Unknown")
 
                                 if phase == "Pending":
-                                    self.findings["pvc_issues"].append(
+                                    self._add_finding_dict(
+                                        "pvc_issues",
                                         {
                                             "summary": f"StatefulSet PVC {namespace}/{pvc_name} stuck in Pending",
                                             "details": {
@@ -11250,7 +11387,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     "Quota exceeded",
                                                 ],
                                             },
-                                        }
+                                        },
                                     )
 
             self.progress.info("StatefulSet analysis completed")
@@ -11290,7 +11427,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if any(p in message or p in reason for p in conntrack_patterns):
                         involved = event.get("involvedObject", {})
-                        self.findings["network_issues"].append(
+                        self._add_finding_dict(
+                            "network_issues",
                             {
                                 "summary": f"Conntrack issue detected on {involved.get('name', 'unknown')}",
                                 "details": {
@@ -11314,7 +11452,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ],
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                                 },
-                            }
+                            },
                         )
 
             # Check kube-proxy logs for conntrack issues
@@ -11326,7 +11464,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 if "conntrack" in output_lower and (
                     "error" in output_lower or "fail" in output_lower
                 ):
-                    self.findings["network_issues"].append(
+                    self._add_finding_dict(
+                        "network_issues",
                         {
                             "summary": "kube-proxy reporting conntrack errors",
                             "details": {
@@ -11340,7 +11479,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "High connection churn rate",
                                 ],
                             },
-                        }
+                        },
                     )
 
             # Check CloudWatch for related metrics
@@ -11373,7 +11512,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     max_rx = dp.get("Maximum", 0)
                                     # If > 100 MB/s, could indicate conntrack pressure
                                     if max_rx > 100 * 1024 * 1024:
-                                        self.findings["network_issues"].append(
+                                        self._add_finding_dict(
+                                            "network_issues",
                                             {
                                                 "summary": f"High network traffic detected: {max_rx / (1024 * 1024):.1f} MB/s - may cause conntrack pressure",
                                                 "details": {
@@ -11386,7 +11526,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                                     "recommendation": "Monitor conntrack table usage on nodes",
                                                 },
-                                            }
+                                            },
                                         )
                                         break
             except Exception:
@@ -11434,7 +11574,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         state = cs.get("state", {})
 
                         if restart_count >= Thresholds.RESTART_WARNING:
-                            self.findings["addon_issues"].append(
+                            self._add_finding_dict(
+                                "addon_issues",
                                 {
                                     "summary": f"Custom controller {namespace}/{pod_name} has high restart count: {restart_count}",
                                     "details": {
@@ -11454,7 +11595,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "Resource quota exceeded",
                                         ],
                                     },
-                                }
+                                },
                             )
 
                         waiting = state.get("waiting", {})
@@ -11465,7 +11606,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "ImagePullBackOff",
                                 "ErrImagePull",
                             ]:
-                                self.findings["addon_issues"].append(
+                                self._add_finding_dict(
+                                    "addon_issues",
                                     {
                                         "summary": f"Custom controller {namespace}/{pod_name} container issue: {reason}",
                                         "details": {
@@ -11476,7 +11618,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "message": waiting.get("message", "N/A")[:200],
                                             "severity": "critical",
                                         },
-                                    }
+                                    },
                                 )
 
             # Check for controller-related events
@@ -11512,7 +11654,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         count = event.get("count", 1)
                         severity = "critical" if count > 5 else "warning"
 
-                        self.findings["addon_issues"].append(
+                        self._add_finding_dict(
+                            "addon_issues",
                             {
                                 "summary": f"Controller reconciliation issue in {involved.get('namespace', 'unknown')}/{involved.get('name', 'unknown')}",
                                 "details": {
@@ -11533,7 +11676,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ],
                                     "aws_doc": "https://kubernetes.io/docs/concepts/extend-kubernetes/operator/",
                                 },
-                            }
+                            },
                         )
 
             # Check CRD health
@@ -11555,7 +11698,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             condition.get("type") == "Established"
                             and condition.get("status") != "True"
                         ):
-                            self.findings["addon_issues"].append(
+                            self._add_finding_dict(
+                                "addon_issues",
                                 {
                                     "summary": f"CRD {crd_name} not established",
                                     "details": {
@@ -11564,7 +11708,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "message": condition.get("message", "N/A")[:200],
                                         "severity": "warning",
                                     },
-                                }
+                                },
                             )
 
             self.progress.info("Custom controller analysis completed")
@@ -11689,7 +11833,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         )
 
                                 if violations:
-                                    self.findings["rbac_issues"].append(
+                                    self._add_finding_dict(
+                                        "rbac_issues",
                                         {
                                             "summary": f"Pod {ns_name}/{pod_name} may violate PSA policy ({enforce})",
                                             "details": {
@@ -11709,7 +11854,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 ],
                                                 "aws_doc": "https://kubernetes.io/docs/concepts/security/pod-security-admission/",
                                             },
-                                        }
+                                        },
                                     )
 
             # Check for PSA-related events (rejections)
@@ -11733,7 +11878,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if any(p in message or p in reason for p in psa_patterns):
                         involved = event.get("involvedObject", {})
-                        self.findings["rbac_issues"].append(
+                        self._add_finding_dict(
+                            "rbac_issues",
                             {
                                 "summary": f"PSA violation: {involved.get('namespace', 'unknown')}/{involved.get('name', 'unknown')}",
                                 "details": {
@@ -11752,7 +11898,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     ],
                                     "aws_doc": "https://kubernetes.io/docs/concepts/security/pod-security-admission/",
                                 },
-                            }
+                            },
                         )
 
             self.progress.info(
@@ -11900,7 +12046,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     for c in missing_configmaps
                                 )
                                 if not already_reported:
-                                    self.findings["pod_errors"].append(
+                                    self._add_finding_dict(
+                                        "pod_errors",
                                         {
                                             "summary": f"Pod {ns}/{pod_name} references non-existent ConfigMap: {cm_name}",
                                             "details": {
@@ -11916,7 +12063,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     f"Create the ConfigMap or fix the pod spec",
                                                 ],
                                             },
-                                        }
+                                        },
                                     )
 
                         if "secret" in volume:
@@ -11929,7 +12076,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     for s in missing_secrets
                                 )
                                 if not already_reported:
-                                    self.findings["pod_errors"].append(
+                                    self._add_finding_dict(
+                                        "pod_errors",
                                         {
                                             "summary": f"Pod {ns}/{pod_name} references non-existent Secret: {secret_name}",
                                             "details": {
@@ -11945,7 +12093,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     "Create the Secret or fix the pod spec",
                                                 ],
                                             },
-                                        }
+                                        },
                                     )
 
                     # Check environment variables from ConfigMaps/Secrets
@@ -11954,7 +12102,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             if "configMapRef" in env_from:
                                 cm_name = env_from["configMapRef"].get("name", "")
                                 if cm_name and f"{ns}/{cm_name}" not in existing_configmaps:
-                                    self.findings["pod_errors"].append(
+                                    self._add_finding_dict(
+                                        "pod_errors",
                                         {
                                             "summary": f"Pod {ns}/{pod_name} envFrom references non-existent ConfigMap: {cm_name}",
                                             "details": {
@@ -11966,12 +12115,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "severity": "warning",
                                                 "finding_type": FindingType.CURRENT_STATE,
                                             },
-                                        }
+                                        },
                                     )
                             if "secretRef" in env_from:
                                 secret_name = env_from["secretRef"].get("name", "")
                                 if secret_name and f"{ns}/{secret_name}" not in existing_secrets:
-                                    self.findings["pod_errors"].append(
+                                    self._add_finding_dict(
+                                        "pod_errors",
                                         {
                                             "summary": f"Pod {ns}/{pod_name} envFrom references non-existent Secret: {secret_name}",
                                             "details": {
@@ -11983,17 +12133,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "severity": "warning",
                                                 "finding_type": FindingType.CURRENT_STATE,
                                             },
-                                        }
+                                        },
                                     )
 
             # Add config errors to findings
             for error in config_errors:
-                self.findings["pod_errors"].append(error)
+                self._add_finding_dict("pod_errors", error)
 
             # Summary if many missing resources
             if len(missing_configmaps) > 3:
                 unique_cms = set(f"{c['namespace']}/{c['name']}" for c in missing_configmaps)
-                self.findings["pod_errors"].append(
+                self._add_finding_dict(
+                    "pod_errors",
                     {
                         "summary": f"Multiple missing ConfigMaps detected: {len(unique_cms)} unique",
                         "details": {
@@ -12002,12 +12153,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "severity": "warning",
                             "recommendation": "Review ConfigMap creation process and ensure all required ConfigMaps exist before deploying pods",
                         },
-                    }
+                    },
                 )
 
             if len(missing_secrets) > 3:
                 unique_secrets = set(f"{s['namespace']}/{s['name']}" for s in missing_secrets)
-                self.findings["pod_errors"].append(
+                self._add_finding_dict(
+                    "pod_errors",
                     {
                         "summary": f"Multiple missing Secrets detected: {len(unique_secrets)} unique",
                         "details": {
@@ -12017,7 +12169,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "recommendation": "Review Secret creation process and ensure all required Secrets exist before deploying pods",
                             "note": "Secret names are listed without namespace for security",
                         },
-                    }
+                    },
                 )
 
             self.progress.info(
@@ -12075,7 +12227,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             threshold = 300 if "mutating" in metric_name.lower() else 400
 
                             if max_val > threshold:
-                                self.findings["control_plane_issues"].append(
+                                self._add_finding_dict(
+                                    "control_plane_issues",
                                     {
                                         "summary": f"High API Server inflight requests: {metric_name} = {max_val:.0f}",
                                         "details": {
@@ -12096,7 +12249,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             ],
                                             "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
                                         },
-                                    }
+                                    },
                                 )
                                 break
 
@@ -12194,7 +12347,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 event["timestamp"] / 1000, tz=timezone.utc
                             )
 
-                            self.findings["scheduling_failures"].append(
+                            self._add_finding_dict(
+                                "scheduling_failures",
                                 {
                                     "summary": f"Scheduler: {pattern_info['issue']}",
                                     "details": {
@@ -12211,7 +12365,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ],
                                         "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                                     },
-                                }
+                                },
                             )
                             break
 
@@ -12245,7 +12399,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     if result in ["error", "unschedulable"]:
                                         value = dp.get("Sum", 0)
                                         if value > 0:
-                                            self.findings["scheduling_failures"].append(
+                                            self._add_finding_dict(
+                                                "scheduling_failures",
                                                 {
                                                     "summary": f"Scheduler {result} attempts: {value:.0f}",
                                                     "details": {
@@ -12257,7 +12412,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                         "severity": "warning",
                                                         "finding_type": FindingType.HISTORICAL_EVENT,
                                                     },
-                                                }
+                                                },
                                             )
             except Exception:
                 pass
@@ -12352,7 +12507,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             # Report findings
             if len(pods_without_limits) > 0:
-                self.findings["resource_quota_exceeded"].append(
+                self._add_finding_dict(
+                    "resource_quota_exceeded",
                     {
                         "summary": f"{len(pods_without_limits)} pods without resource limits",
                         "details": {
@@ -12364,11 +12520,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "recommendation": "Add resource limits to all pods",
                             "aws_doc": "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
                         },
-                    }
+                    },
                 )
 
             if len(pods_without_requests) > 0:
-                self.findings["resource_quota_exceeded"].append(
+                self._add_finding_dict(
+                    "resource_quota_exceeded",
                     {
                         "summary": f"{len(pods_without_requests)} pods without resource requests",
                         "details": {
@@ -12380,12 +12537,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "recommendation": "Add resource requests to all pods",
                             "aws_doc": "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
                         },
-                    }
+                    },
                 )
 
             # Report QoS breakdown if there are BestEffort pods
             if qos_breakdown["BestEffort"] > 0:
-                self.findings["resource_quota_exceeded"].append(
+                self._add_finding_dict(
+                    "resource_quota_exceeded",
                     {
                         "summary": f"{qos_breakdown['BestEffort']} BestEffort pods (lowest QoS)",
                         "details": {
@@ -12394,7 +12552,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "finding_type": FindingType.CURRENT_STATE,
                             "recommendation": "Consider setting limits and requests for Guaranteed QoS on critical workloads",
                         },
-                    }
+                    },
                 )
 
             self.progress.info(

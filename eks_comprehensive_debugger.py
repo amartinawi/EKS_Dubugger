@@ -987,6 +987,13 @@ class ExecutiveSummaryGenerator:
         # External service impact
         external_impact = self._get_external_service_impact(findings)
 
+        # Phase 3 enhancements
+        # Correlation-based narrative
+        narrative = self._generate_correlation_narrative(correlations, first_issue, findings)
+
+        # Quick wins classification
+        quick_wins = self._classify_quick_wins(findings, recommendations)
+
         return {
             "health_status": health_status,
             "first_issue": first_issue_prominent,
@@ -1001,6 +1008,9 @@ class ExecutiveSummaryGenerator:
             "trend": timeline_insights.get("trend"),
             "common_errors": common_errors,
             "external_impact": external_impact,
+            # Phase 3 additions
+            "narrative": narrative,
+            "quick_wins": quick_wins,
         }
 
     def _determine_health_status(self, summary: dict) -> dict:
@@ -1397,6 +1407,287 @@ class ExecutiveSummaryGenerator:
         actions.sort(key=lambda x: priority_order.get(x["priority"], 2))
 
         return actions[:10]  # Top 10 actions
+
+    def _generate_correlation_narrative(
+        self, correlations: list, first_issue: dict | None, findings: dict
+    ) -> dict:
+        """
+        Generate a human-readable narrative from correlations (Phase 3 - #5).
+
+        Creates a story like:
+        "Memory pressure on node X caused eviction of 5 pods, leading to
+        cascading failures in dependent services."
+        """
+        if not correlations and not first_issue:
+            return {
+                "has_narrative": False,
+                "narrative": "",
+                "short_summary": "",
+            }
+
+        narrative_parts = []
+        short_summary = ""
+
+        # Process correlations to build narrative
+        for corr in correlations:
+            corr_type = corr.get("correlation_type", "")
+            root_cause = corr.get("root_cause", "")
+            impact = corr.get("impact", "")
+            severity = corr.get("severity", "warning")
+
+            if corr_type == "node_pressure_cascade":
+                # Extract node and pod count from impact
+                node_match = ""
+                pod_count = 0
+                if "node" in impact.lower():
+                    # Try to extract details
+                    narrative_parts.append(
+                        f"📊 **Memory/Disk Pressure Cascade**: {root_cause}. "
+                        f"This triggered a cascade where {impact}."
+                    )
+                    short_summary = f"Node pressure caused cascading failures"
+
+            elif corr_type == "cni_cascade":
+                narrative_parts.append(
+                    f"🔌 **CNI Cascade**: {root_cause}. "
+                    f"Network connectivity issues followed: {impact}."
+                )
+                short_summary = "VPC CNI issues caused network failures"
+
+            elif corr_type == "oom_pattern":
+                narrative_parts.append(
+                    f"💾 **OOM Pattern**: {root_cause}. Memory exhaustion led to: {impact}."
+                )
+                short_summary = "OOM kills indicate memory issues"
+
+            elif corr_type == "control_plane_impact":
+                narrative_parts.append(
+                    f"⚙️ **Control Plane Impact**: {root_cause}. "
+                    f"Control plane instability affected: {impact}."
+                )
+                short_summary = "Control plane issues impacting workloads"
+
+            elif corr_type == "image_pull_pattern":
+                narrative_parts.append(
+                    f"📦 **Image Pull Issues**: {root_cause}. Container startup failures: {impact}."
+                )
+                short_summary = "Image pull failures detected"
+
+            elif corr_type == "scheduling_pattern":
+                narrative_parts.append(
+                    f"📋 **Scheduling Issues**: {root_cause}. "
+                    f"Pods could not be scheduled: {impact}."
+                )
+                short_summary = "Scheduling failures detected"
+
+            elif corr_type == "dns_pattern":
+                narrative_parts.append(
+                    f"🔍 **DNS Issues**: {root_cause}. Service discovery problems: {impact}."
+                )
+                short_summary = "DNS resolution issues detected"
+
+            else:
+                # Generic correlation
+                if root_cause and impact:
+                    narrative_parts.append(
+                        f"🔗 **{corr_type.replace('_', ' ').title()}**: {root_cause}. Impact: {impact}"
+                    )
+
+        # Add first issue context if available
+        if first_issue and first_issue.get("potential_root_cause"):
+            first_timestamp = first_issue.get("timestamp", "Unknown time")
+            first_summary = first_issue.get("summary", "Unknown issue")
+            narrative_parts.insert(
+                0,
+                f"🎯 **First Detected Issue** (at {first_timestamp}): {first_summary}. "
+                f"This appears to be the initial trigger for subsequent failures.",
+            )
+
+        # Generate overall narrative
+        if narrative_parts:
+            full_narrative = "\n\n".join(narrative_parts)
+
+            # Add a summary sentence
+            if len(narrative_parts) > 1:
+                overall_summary = (
+                    f"Analysis identified {len(narrative_parts)} correlated event chains. "
+                    f"The issues appear interconnected, suggesting a common root cause."
+                )
+            else:
+                overall_summary = (
+                    short_summary if short_summary else "A single correlation pattern was detected."
+                )
+
+            return {
+                "has_narrative": True,
+                "narrative": full_narrative,
+                "short_summary": overall_summary,
+                "correlation_count": len(correlations),
+                "has_first_issue": first_issue is not None,
+            }
+
+        return {
+            "has_narrative": False,
+            "narrative": "",
+            "short_summary": "No clear correlation patterns detected.",
+        }
+
+    def _classify_quick_wins(self, findings: dict, recommendations: list) -> list:
+        """
+        Identify quick wins - simple fixes that can be done in < 15 minutes (Phase 3 - #2).
+
+        Quick win categories:
+        - Missing ConfigMaps/Secrets
+        - Resource limit adjustments
+        - Image tag fixes
+        - Label/annotation updates
+        - Simple restart operations
+        """
+        quick_wins = []
+
+        # Define quick win patterns with estimated time
+        quick_win_patterns = {
+            "missing_configmap": {
+                "keywords": [
+                    "missing configmap",
+                    "configmap not found",
+                    'configmap "',
+                    "could not find configmap",
+                ],
+                "title": "Fix Missing ConfigMap",
+                "solution": "Create the missing ConfigMap",
+                "time": "2 min",
+                "category": "configuration",
+            },
+            "missing_secret": {
+                "keywords": [
+                    "missing secret",
+                    "secret not found",
+                    'secret "',
+                    "could not find secret",
+                ],
+                "title": "Fix Missing Secret",
+                "solution": "Create the missing Secret",
+                "time": "2 min",
+                "category": "configuration",
+            },
+            "resource_limit": {
+                "keywords": [
+                    "insufficient cpu",
+                    "insufficient memory",
+                    "resource quota",
+                    "exceeded quota",
+                ],
+                "title": "Adjust Resource Limits",
+                "solution": "Update pod resource requests/limits",
+                "time": "5 min",
+                "category": "resources",
+            },
+            "image_tag": {
+                "keywords": [
+                    "imagepullbackoff",
+                    "errimagepull",
+                    "image not found",
+                    "manifest unknown",
+                ],
+                "title": "Fix Image Reference",
+                "solution": "Verify image exists and update tag",
+                "time": "5 min",
+                "category": "images",
+            },
+            "image_pull_secret": {
+                "keywords": ["failed to pull image", "authentication required", "unauthorized"],
+                "title": "Add Image Pull Secret",
+                "solution": "Configure imagePullSecrets for private registry",
+                "time": "5 min",
+                "category": "images",
+            },
+            "pending_pvc": {
+                "keywords": ["pvc pending", "waiting for volume", "storageclass not found"],
+                "title": "Fix PVC Configuration",
+                "solution": "Verify StorageClass exists or update PVC",
+                "time": "10 min",
+                "category": "storage",
+            },
+            "node_taint": {
+                "keywords": ["node affinity", "taint", "toleration", "no nodes available"],
+                "title": "Adjust Node Affinity/Taints",
+                "solution": "Add tolerations or update node affinity",
+                "time": "5 min",
+                "category": "scheduling",
+            },
+            "probe_failure": {
+                "keywords": ["liveness probe", "readiness probe", "probe failed"],
+                "title": "Adjust Probe Configuration",
+                "solution": "Increase probe timeout or adjust thresholds",
+                "time": "5 min",
+                "category": "health",
+            },
+            "restart_policy": {
+                "keywords": ["crashloopbackoff", "back-off restarting", "restarted"],
+                "title": "Investigate Restarting Pod",
+                "solution": "Check logs and fix application error",
+                "time": "10 min",
+                "category": "troubleshooting",
+            },
+        }
+
+        # Scan findings for quick win opportunities
+        detected_issues = set()
+
+        for category, items in findings.items():
+            for item in items:
+                summary = item.get("summary", "").lower()
+                details = item.get("details", {})
+
+                for pattern_key, pattern_info in quick_win_patterns.items():
+                    for keyword in pattern_info["keywords"]:
+                        if keyword in summary and pattern_key not in detected_issues:
+                            detected_issues.add(pattern_key)
+
+                            # Extract affected resources
+                            affected_pod = details.get("pod", "")
+                            affected_namespace = details.get("namespace", "")
+
+                            quick_wins.append(
+                                {
+                                    "title": pattern_info["title"],
+                                    "solution": pattern_info["solution"],
+                                    "time": pattern_info["time"],
+                                    "category": pattern_info["category"],
+                                    "affected_pod": affected_pod,
+                                    "affected_namespace": affected_namespace,
+                                    "evidence": item.get("summary", ""),
+                                }
+                            )
+                            break
+
+        # Also check recommendations for quick wins
+        for rec in recommendations:
+            category = rec.get("category", "")
+            action = rec.get("action", "").lower()
+
+            # Resource quota quick wins
+            if "quota" in category or "limit" in action or "request" in action:
+                if "quota" not in detected_issues and "resource" not in detected_issues:
+                    quick_wins.append(
+                        {
+                            "title": "Adjust Resource Quotas",
+                            "solution": rec.get("action", "Update resource quotas"),
+                            "time": "5 min",
+                            "category": "resources",
+                            "affected_pod": "",
+                            "affected_namespace": "",
+                            "evidence": "Resource quota recommendation",
+                        }
+                    )
+                    detected_issues.add("quota")
+
+        # Sort by time (quickest first)
+        time_order = {"2 min": 0, "5 min": 1, "10 min": 2, "15 min": 3}
+        quick_wins.sort(key=lambda x: time_order.get(x.get("time", "15 min"), 3))
+
+        return quick_wins[:6]  # Return top 6 quick wins
 
     def _summarize_affected_resources(self, findings: dict) -> dict:
         """Summarize affected resources including namespace breakdown"""
@@ -1884,6 +2175,88 @@ class HTMLOutputFormatter(OutputFormatter):
                 """
 
             html += """
+                        </div>
+                    </div>
+            """
+
+        # Phase 3: Correlation-Based Narrative
+        narrative = exec_summary.get("narrative", {})
+        if narrative.get("has_narrative"):
+            narrative_text = narrative.get("narrative", "")
+            short_summary = narrative.get("short_summary", "")
+
+            # Convert markdown-style bold to HTML
+            narrative_html = narrative_text.replace("**", "<strong>").replace(
+                "</strong><strong>", ""
+            )
+            narrative_html = (
+                narrative_html.replace("<strong>", "</strong>", 1)
+                if "</strong>" in narrative_html
+                else narrative_html
+            )
+
+            html += f"""
+                    <!-- What Happened - Narrative (Phase 3 - #5) -->
+                    <div class="summary-block narrative-block">
+                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
+                            <div class="summary-block-title">
+                                <span>📖</span> What Happened
+                            </div>
+                            <span class="block-toggle">▼</span>
+                        </div>
+                        <div class="summary-block-content">
+                            <div class="narrative-summary">{short_summary}</div>
+                            <div class="narrative-details">
+                                {narrative_html.replace(chr(10), "<br>")}
+                            </div>
+                        </div>
+                    </div>
+            """
+
+        # Phase 3: Quick Wins
+        quick_wins = exec_summary.get("quick_wins", [])
+        if quick_wins:
+            html += (
+                """
+                    <!-- Quick Wins (Phase 3 - #2) -->
+                    <div class="summary-block quick-wins-block">
+                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
+                            <div class="summary-block-title">
+                                <span>🚀</span> Quick Wins
+                            </div>
+                            <span class="quick-wins-count">"""
+                + str(len(quick_wins))
+                + """ fixes < 15 min</span>
+                            <span class="block-toggle">▼</span>
+                        </div>
+                        <div class="summary-block-content">
+                            <div class="quick-wins-grid">
+            """
+            )
+            for qw in quick_wins:
+                time_badge_color = "#22c55e" if "2 min" in qw.get("time", "") else "#3b82f6"
+                html += f"""
+                                <div class="quick-win-item">
+                                    <div class="quick-win-header">
+                                        <span class="quick-win-title">{qw.get("title", "Quick Fix")}</span>
+                                        <span class="quick-win-time" style="background: {time_badge_color};">{qw.get("time", "5 min")}</span>
+                                    </div>
+                                    <div class="quick-win-solution">{qw.get("solution", "")}</div>
+                """
+                if qw.get("affected_pod") or qw.get("affected_namespace"):
+                    affected = []
+                    if qw.get("affected_namespace"):
+                        affected.append(f"ns: {qw['affected_namespace']}")
+                    if qw.get("affected_pod"):
+                        affected.append(f"pod: {qw['affected_pod']}")
+                    html += f"""
+                                    <div class="quick-win-affected">Affects: {" | ".join(affected)}</div>
+                    """
+                html += """
+                                </div>
+                """
+            html += """
+                            </div>
                         </div>
                     </div>
             """
@@ -3003,6 +3376,93 @@ class HTMLOutputFormatter(OutputFormatter):
         .service-namespace {{
             font-size: 0.8rem;
             color: var(--text-secondary);
+        }}
+        
+        /* Narrative Block (Phase 3) */
+        .narrative-block {{
+            background: linear-gradient(135deg, #faf5ff 0%, #f3e8ff 100%) !important;
+            border: 1px solid #c084fc;
+        }}
+        
+        .narrative-summary {{
+            font-weight: 600;
+            font-size: 1rem;
+            color: #6b21a8;
+            margin-bottom: 1rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid rgba(192, 132, 252, 0.3);
+        }}
+        
+        .narrative-details {{
+            font-size: 0.9rem;
+            line-height: 1.6;
+            color: var(--text);
+        }}
+        
+        .narrative-details strong {{
+            color: #7c3aed;
+        }}
+        
+        /* Quick Wins (Phase 3) */
+        .quick-wins-block {{
+            background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%) !important;
+            border: 1px solid #34d399;
+        }}
+        
+        .quick-wins-count {{
+            background: #059669;
+            color: white;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-right: 0.5rem;
+        }}
+        
+        .quick-wins-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+        }}
+        
+        .quick-win-item {{
+            background: white;
+            border-radius: 10px;
+            padding: 1rem;
+            border-left: 3px solid #22c55e;
+        }}
+        
+        .quick-win-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }}
+        
+        .quick-win-title {{
+            font-weight: 600;
+            color: var(--text);
+        }}
+        
+        .quick-win-time {{
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            color: white;
+        }}
+        
+        .quick-win-solution {{
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }}
+        
+        .quick-win-affected {{
+            font-size: 0.75rem;
+            color: #6b7280;
+            padding-top: 0.5rem;
+            border-top: 1px solid #e5e7eb;
         }}
         
         /* Findings Section */

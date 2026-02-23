@@ -168,7 +168,7 @@ from datetime import datetime, timedelta, timezone
 from dateutil import parser as date_parser
 import pytz
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
 MAX_API_RETRIES = 3
@@ -1827,6 +1827,7 @@ class ExecutiveSummaryGenerator:
             "error",
             "failed",
         ]
+        info_keywords = ["info", "notice", "fallback"]
 
         for kw in critical_keywords:
             if kw in summary_lower:
@@ -1834,6 +1835,10 @@ class ExecutiveSummaryGenerator:
         for kw in warning_keywords:
             if kw in summary_lower:
                 return "warning"
+        for kw in info_keywords:
+            if kw in summary_lower:
+                return "info"
+
         return "info"
 
 
@@ -1879,13 +1884,6 @@ class HTMLOutputFormatter(OutputFormatter):
         for kw in info_keywords:
             if kw in summary_lower:
                 return "info"
-
-        if details:
-            msg = str(details.get("message", "")).lower()
-            if msg.startswith("e"):
-                return "critical"
-            elif msg.startswith("w"):
-                return "warning"
 
         return "info"
 
@@ -12707,6 +12705,52 @@ def parse_flexible_date(date_str, tz_name="UTC"):
         )
 
 
+def validate_aws_profile(profile: str, progress) -> None:
+    """
+    Validate AWS profile exists and has valid credentials.
+
+    Raises AWSAuthenticationError if profile is invalid or credentials are missing.
+    """
+    import botocore.exceptions
+
+    try:
+        session = boto3.Session(profile_name=profile)
+        credentials = session.get_credentials()
+
+        if credentials is None:
+            raise AWSAuthenticationError(
+                f"AWS profile '{profile}' has no credentials. "
+                f"Run 'aws configure --profile {profile}' or set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY environment variables."
+            )
+
+        # Quick validation by getting caller identity
+        sts = session.client("sts")
+        sts.get_caller_identity()
+
+    except botocore.exceptions.ProfileNotFound:
+        raise AWSAuthenticationError(
+            f"AWS profile '{profile}' not found. "
+            f"Available profiles can be listed with 'aws configure list-profiles'. "
+            f"Run 'aws configure --profile {profile}' to create it."
+        )
+    except botocore.exceptions.PartialCredentialsError:
+        raise AWSAuthenticationError(
+            f"AWS profile '{profile}' has incomplete credentials. "
+            f"Run 'aws configure --profile {profile}' to provide both access key and secret key."
+        )
+    except botocore.exceptions.NoRegionError:
+        # Region is specified separately, this is OK
+        pass
+    except AWSAuthenticationError:
+        raise
+    except Exception as e:
+        # Check if it's a credential loading issue
+        if "could not be found" in str(e).lower():
+            raise AWSAuthenticationError(f"AWS profile '{profile}' could not be loaded: {e}")
+        # For other errors, let the normal flow handle it
+        progress.warning(f"Could not pre-validate AWS profile: {e}")
+
+
 def validate_and_parse_dates(args):
     """
     Validate and parse date arguments
@@ -12833,6 +12877,9 @@ def main():
     progress = ProgressTracker(verbose=args.verbose, quiet=args.quiet)
 
     try:
+        # Validate AWS profile exists and has credentials
+        validate_aws_profile(args.profile, progress)
+
         # Validate and parse dates
         start_date, end_date = validate_and_parse_dates(args)
 

@@ -163,6 +163,7 @@ import re
 import subprocess
 import sys
 import time
+import html
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as date_parser
@@ -1845,6 +1846,13 @@ class ExecutiveSummaryGenerator:
 class HTMLOutputFormatter(OutputFormatter):
     """Modern HTML output with interactive features"""
 
+    @staticmethod
+    def _escape_html(text: str | None) -> str:
+        """Escape HTML special characters to prevent XSS attacks"""
+        if text is None:
+            return ""
+        return html.escape(str(text))
+
     def _classify_severity(self, summary_text, details):
         """Classify finding severity based on content"""
         if details and isinstance(details, dict):
@@ -2043,10 +2051,12 @@ class HTMLOutputFormatter(OutputFormatter):
                     if meta_parts
                     else finding.get("category", "").replace("_", " ").title()
                 )
+                escaped_summary = self._escape_html(finding.get("summary", "Unknown"))
+                escaped_meta = self._escape_html(meta_str)
                 html += f"""
                             <div class="key-finding-item {severity_class}">
-                                <div class="key-finding-summary">{finding.get("summary", "Unknown")}</div>
-                                <div class="key-finding-meta">{meta_str}</div>
+                                <div class="key-finding-summary">{escaped_summary}</div>
+                                <div class="key-finding-meta">{escaped_meta}</div>
                             </div>
                 """
 
@@ -2182,15 +2192,10 @@ class HTMLOutputFormatter(OutputFormatter):
             narrative_text = narrative.get("narrative", "")
             short_summary = narrative.get("short_summary", "")
 
-            # Convert markdown-style bold to HTML
-            narrative_html = narrative_text.replace("**", "<strong>").replace(
-                "</strong><strong>", ""
-            )
-            narrative_html = (
-                narrative_html.replace("<strong>", "</strong>", 1)
-                if "</strong>" in narrative_html
-                else narrative_html
-            )
+            # Convert markdown-style bold to HTML using regex
+            import re
+
+            narrative_html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", narrative_text)
 
             html += f"""
                     <!-- What Happened - Narrative (Phase 3 - #5) -->
@@ -4191,10 +4196,11 @@ class HTMLOutputFormatter(OutputFormatter):
                             }
                         )
 
+                        escaped_summary = self._escape_html(item.get("summary", "N/A"))
                         html += f'''
                     <div class="finding-item" data-severity="{item_severity}" data-category="{cat}">
                         <div class="finding-header" onclick="toggleFinding(this.parentElement)">
-                            <div class="finding-summary">{item.get("summary", "N/A")}</div>
+                            <div class="finding-summary">{escaped_summary}</div>
                             <div class="finding-badges">
                                 <span class="severity-badge {item_severity}">{item_severity}</span>
                                 {finding_type_badge}
@@ -4893,19 +4899,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         """
         max_retries = 3
         retry_delay = 1
+        last_error = None
 
         for attempt in range(max_retries):
             try:
                 result = func(*args, **kwargs)
                 return True, result
             except Exception as e:
+                last_error = e
                 if attempt < max_retries - 1:
                     self.progress.info(f"Retry {attempt + 1}/{max_retries} after error: {e}")
-                    time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
-                else:
-                    return False, str(e)
+                    time.sleep(retry_delay * (attempt + 1))
 
-        return False, "Max retries exceeded"
+        return False, str(last_error) if last_error else "Max retries exceeded"
 
     def safe_kubectl_call(self, cmd, required=False):
         """Safely call kubectl with error handling"""
@@ -5463,8 +5469,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 if success and streams.get("logStreams"):
                     last_event = streams["logStreams"][0].get("lastEventTimestamp")
                     if last_event:
-                        from datetime import timezone
-
                         last_event_dt = datetime.fromtimestamp(last_event / 1000, tz=timezone.utc)
                         now = datetime.now(timezone.utc)
                         hours_since_log = (now - last_event_dt).total_seconds() / 3600
@@ -10035,8 +10039,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 pause_error_patterns = [
                     "failed to get sandbox image",
                     "sandbox image",
-                    "pause" in "".join([]).lower() and "not found",
-                    "image .*pause.* not found",
+                    "pause.*not found",
+                    "image.*pause.*not found",
                     "failed to create pod sandbox",
                     "PodSandbox",
                 ]

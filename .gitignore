@@ -38,13 +38,16 @@ env/
 .AppleDouble
 .LSOverride
 
-# Generated Reports (sample outputs)
+# Generated Reports
 eks-report.html
 eks-report.json
 report*.html
 report*.json
 report*.yaml
 report*.md
+*-eks-report-*.html
+*-eks-findings-*.json
+findings-llm.json
 
 # Cache
 .ruff_cache/

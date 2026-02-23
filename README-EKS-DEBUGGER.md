@@ -5,9 +5,9 @@
 [![AWS EKS](https://img.shields.io/badge/AWS-EKS-orange.svg)](https://aws.amazon.com/eks/)
 [![Catalog Coverage](https://img.shields.io/badge/catalog%20coverage-100%25-green.svg)](#catalog-coverage)
 
-A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
+A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 3.0.0 | **Analysis Methods:** 56 | **Catalog Coverage:** 100%
+**Version:** 3.1.0 | **Analysis Methods:** 56 | **Catalog Coverage:** 100%
 
 ---
 
@@ -81,15 +81,10 @@ A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting
 - **Container Insights** - Metrics availability
 - **EKS Addons** - VPC-CNI, CoreDNS, kube-proxy
 
-### Interactive HTML Reports
-- Modern dashboard with sidebar navigation
-- Real-time search and filtering
-- Expandable findings with full details
-- Severity classification (Critical/Warning/Info)
-- Data source badges (CloudWatch Logs, kubectl, EKS API)
-- Evidence-based recommendations
-- Diagnostic step code blocks
-- Print-friendly layout
+### Finding Type Classification
+Each finding is classified as either:
+- **📅 Historical Event** - Occurred within the specified date range (filtered by time)
+- **🔄 Current State** - Current cluster state (not filtered by date)
 
 ### Smart Correlation
 - Root cause identification across data sources
@@ -97,11 +92,9 @@ A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting
 - First issue detection (potential root cause)
 - Cascading failure analysis
 
-### Flexible Configuration
-- Custom kubectl contexts (SSM tunnels, VPN)
-- Date range filtering (hours, days, specific dates)
-- Namespace filtering
-- Multiple output formats (HTML, JSON, Markdown, YAML, Console)
+### Automatic Report Generation
+- **HTML Report** - Interactive dashboard with sidebar navigation, search, and filtering
+- **LLM-Ready JSON** - Structured output optimized for AI/LLM analysis
 
 ---
 
@@ -138,17 +131,15 @@ pip install -r requirements.txt
 ## Quick Start
 
 ```bash
-# Basic usage with interactive cluster selection
+# Basic usage - generates both HTML and JSON reports
 python eks_comprehensive_debugger.py --profile prod --region eu-west-1
 
-# Specific cluster with HTML output
+# Specific cluster with time range
 python eks_comprehensive_debugger.py \
   --profile prod \
   --region eu-west-1 \
   --cluster-name my-cluster \
-  --days 2 \
-  --output-format html \
-  --output-file report.html
+  --days 2
 
 # Using custom kubectl context (SSM tunnel, VPN)
 python eks_comprehensive_debugger.py \
@@ -156,9 +147,16 @@ python eks_comprehensive_debugger.py \
   --region eu-west-1 \
   --cluster-name my-cluster \
   --kube-context my-cluster-ssm-tunnel \
-  --days 1 \
-  --output-format html \
-  --output-file report.html
+  --days 1
+
+# Historical analysis with timezone
+python eks_comprehensive_debugger.py \
+  --profile prod \
+  --region eu-west-1 \
+  --cluster-name my-cluster \
+  --start-date "2026-01-26T08:00:00" \
+  --end-date "2026-01-27T18:00:00" \
+  --timezone "Asia/Dubai"
 ```
 
 ---
@@ -173,52 +171,66 @@ python eks_comprehensive_debugger.py \
 | `--kube-context` | No | Kubernetes context name (skips kubeconfig update) |
 | `--hours` | No | Look back N hours from now |
 | `--days` | No | Look back N days from now |
-| `--start-date` | No | Start date (ISO 8601 or YYYY-MM-DD) |
-| `--end-date` | No | End date (ISO 8601 or YYYY-MM-DD) |
+| `--start-date` | No | Start date (ISO 8601 or YYYY-MM-DD, supports time: 2026-01-26T08:00:00) |
+| `--end-date` | No | End date (ISO 8601 or YYYY-MM-DD, supports time: 2026-01-27T18:00:00) |
+| `--timezone` | No | Timezone for date parsing (default: UTC, e.g., "Asia/Dubai") |
 | `--namespace` | No | Focus on specific namespace |
-| `--output-format` | No | Format: console, json, markdown, yaml, html |
-| `--output-file` | No | Write to file instead of stdout |
 | `--verbose` | No | Enable verbose output |
 | `--quiet` | No | Suppress progress messages |
 
 ---
 
-## Output Formats
+## Output Files
 
-### HTML (Recommended)
-Interactive dashboard with navigation, search, and filtering.
+The tool **always generates two files** automatically:
 
-```bash
-python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
-  --cluster-name my-cluster \
-  --output-format html --output-file report.html
-```
+### 1. HTML Report
+`{cluster}-eks-report-{timestamp}.html`
 
-### JSON
-Structured output for automation and CI/CD integration.
+Interactive dashboard with:
+- Summary cards showing critical/warning/info counts
+- Finding type breakdown (Historical Events vs Current State)
+- Expandable findings with full details
+- Severity classification
+- Data source badges
+- Evidence-based recommendations
+- Print-friendly layout
 
-```bash
-python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
-  --cluster-name my-cluster \
-  --output-format json --output-file report.json
-```
+### 2. LLM-Ready JSON
+`{cluster}-eks-findings-{timestamp}.json`
 
-### Markdown
-Documentation-friendly format for Git-based runbooks.
+Structured JSON optimized for AI analysis:
 
-```bash
-python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
-  --cluster-name my-cluster \
-  --output-format markdown --output-file report.md
-```
-
-### YAML
-Human-readable structured output.
-
-```bash
-python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
-  --cluster-name my-cluster \
-  --output-format yaml --output-file report.yaml
+```json
+{
+  "analysis_context": {
+    "cluster": "my-cluster",
+    "region": "eu-west-1",
+    "date_range": {"start": "2026-01-26T08:00:00Z", "end": "2026-01-27T18:00:00Z"},
+    "timezone": "Asia/Dubai"
+  },
+  "summary": {
+    "total_issues": 15,
+    "critical": 3,
+    "warning": 5,
+    "info": 7,
+    "historical_events": 8,
+    "current_state_issues": 7
+  },
+  "findings": [
+    {
+      "id": "abc123",
+      "category": "oom_killed",
+      "severity": "critical",
+      "finding_type": "historical_event",
+      "summary": "Pod default/my-app was OOM killed",
+      "timestamp": "2026-01-26T10:30:00Z"
+    }
+  ],
+  "correlations": [...],
+  "potential_root_causes": [...],
+  "recommendations": [...]
+}
 ```
 
 ---
@@ -229,17 +241,17 @@ python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
 ```bash
 # Last 1 hour analysis
 python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
-  --cluster-name production --hours 1 --output-format html
+  --cluster-name production --hours 1
 ```
 
 ### Post-Mortem Analysis
 ```bash
-# Specific incident timeframe
+# Specific incident timeframe with local timezone
 python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
   --cluster-name production \
-  --start-date "2026-02-15T00:00:00Z" \
-  --end-date "2026-02-16T00:00:00Z" \
-  --output-format markdown
+  --start-date "2026-02-15T08:00:00" \
+  --end-date "2026-02-16T18:00:00" \
+  --timezone "America/New_York"
 ```
 
 ### Private Cluster Access
@@ -248,14 +260,7 @@ python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
 python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
   --cluster-name production \
   --kube-context production-ssm-tunnel \
-  --days 2 --output-format html
-```
-
-### Weekly Health Check
-```bash
-python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
-  --cluster-name production \
-  --days 7 --output-format json --output-file weekly-$(date +%Y%m%d).json
+  --days 2
 ```
 
 ### Namespace-Specific Debugging
@@ -263,7 +268,7 @@ python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
 python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
   --cluster-name production \
   --namespace my-app \
-  --days 1 --output-format html
+  --days 1
 ```
 
 ---
@@ -294,28 +299,11 @@ aws eks update-cluster-config --name my-cluster --region eu-west-1 \
   --logging '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}'
 ```
 
-### Control Plane Logs Not Available
-Enable control plane logging in EKS console or via CLI:
-```bash
-aws eks update-cluster-config --name my-cluster --region eu-west-1 \
-  --logging '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}'
-```
-
 ### Private Cluster Access
 For private endpoints, connect via:
 - AWS VPN
 - SSM Session Manager port forwarding
 - Direct VPC access
-
-### CloudTrail Permission Denied
-If you see CloudTrail access errors, ensure your IAM role has:
-```json
-{
-  "Effect": "Allow",
-  "Action": "cloudtrail:LookupEvents",
-  "Resource": "*"
-}
-```
 
 ---
 

@@ -45,17 +45,15 @@ OUTPUT FORMATS
 USAGE
 ================================================================================
 
-Basic usage:
+Basic usage (generates HTML + LLM-JSON reports):
     python eks_comprehensive_debugger.py --profile prod --region eu-west-1
 
-With specific cluster and HTML output:
+With specific cluster and time range:
     python eks_comprehensive_debugger.py \\
         --profile prod \\
         --region eu-west-1 \\
         --cluster-name my-cluster \\
-        --days 2 \\
-        --output-format html \\
-        --output-file report.html
+        --days 2
 
 With custom kubectl context (SSM tunnel/VPN):
     python eks_comprehensive_debugger.py \\
@@ -65,13 +63,14 @@ With custom kubectl context (SSM tunnel/VPN):
         --kube-context my-cluster-ssm-tunnel \\
         --days 1
 
-Historical analysis:
+Historical analysis with specific timezone:
     python eks_comprehensive_debugger.py \\
         --profile prod \\
         --region eu-west-1 \\
         --cluster-name my-cluster \\
-        --start-date "2026-02-15T00:00:00Z" \\
-        --end-date "2026-02-16T00:00:00Z"
+        --start-date "2026-02-15T08:00:00" \\
+        --end-date "2026-02-16T18:00:00" \\
+        --timezone "Asia/Dubai"
 
 ================================================================================
 CLI ARGUMENTS
@@ -86,13 +85,17 @@ Optional:
     --kube-context  Kubernetes context (skips kubeconfig update)
     --hours         Look back N hours from now
     --days          Look back N days from now (default: 1)
-    --start-date    Start date (ISO 8601 or YYYY-MM-DD)
-    --end-date      End date (ISO 8601 or YYYY-MM-DD)
+    --start-date    Start date (ISO 8601 or YYYY-MM-DD, supports time)
+    --end-date      End date (ISO 8601 or YYYY-MM-DD, supports time)
+    --timezone      Timezone for date parsing (default: UTC, e.g., "Asia/Dubai")
     --namespace     Focus on specific namespace
-    --output-format Output format: html, json, markdown, yaml, console
-    --output-file   Write to file instead of stdout
     --verbose       Enable verbose output
     --quiet         Suppress progress messages
+
+Output:
+    Always generates two files:
+    - {cluster}-eks-report-{timestamp}.html      - Interactive HTML dashboard
+    - {cluster}-eks-findings-{timestamp}.json    - LLM-ready JSON for AI analysis
 
 ================================================================================
 EXIT CODES
@@ -191,6 +194,29 @@ class Thresholds:
     RESTART_CRITICAL = 10
     PENDING_POD_WARNING = 5
     PENDING_POD_CRITICAL = 10
+
+
+class FindingType:
+    """Classification of finding data source and time sensitivity"""
+
+    CURRENT_STATE = "current_state"
+    HISTORICAL_EVENT = "historical_event"
+
+    @classmethod
+    def get_label(cls, finding_type: str) -> str:
+        labels = {
+            cls.CURRENT_STATE: "Current State",
+            cls.HISTORICAL_EVENT: "Historical Event",
+        }
+        return labels.get(finding_type, "Unknown")
+
+    @classmethod
+    def get_description(cls, finding_type: str) -> str:
+        descriptions = {
+            cls.CURRENT_STATE: "Reflects current cluster state (not filtered by date range)",
+            cls.HISTORICAL_EVENT: "Event occurred within the specified date range",
+        }
+        return descriptions.get(finding_type, "")
 
 
 EKS_ISSUE_PATTERNS = {
@@ -784,6 +810,119 @@ class YAMLOutputFormatter(OutputFormatter):
         return "\n".join(output)
 
 
+class LLMJSONOutputFormatter(OutputFormatter):
+    """LLM-optimized JSON output for AI analysis"""
+
+    def format(self, results):
+        """Format results as LLM-ready JSON with finding type classification"""
+        import uuid
+
+        metadata = results["metadata"]
+        summary = results["summary"]
+        findings = results.get("findings", {})
+        correlations = results.get("correlations", [])
+        timeline = results.get("timeline", [])
+        recommendations = results.get("recommendations", [])
+        first_issue = results.get("first_issue")
+
+        historical_count = 0
+        current_state_count = 0
+
+        llm_findings = []
+        for category, items in findings.items():
+            for item in items:
+                details = item.get("details", {})
+                finding_type = details.get("finding_type", FindingType.CURRENT_STATE)
+                if finding_type == FindingType.HISTORICAL_EVENT:
+                    historical_count += 1
+                else:
+                    current_state_count += 1
+
+                severity = details.get("severity", "info")
+                if severity not in ("critical", "warning", "info"):
+                    if "critical" in item.get("summary", "").lower():
+                        severity = "critical"
+                    elif "warning" in item.get("summary", "").lower():
+                        severity = "warning"
+                    else:
+                        severity = "info"
+
+                llm_finding = {
+                    "id": str(uuid.uuid4())[:8],
+                    "category": category,
+                    "severity": severity,
+                    "finding_type": finding_type,
+                    "summary": item.get("summary", ""),
+                    "details": {k: v for k, v in details.items() if k != "finding_type"},
+                }
+
+                timestamp = details.get("timestamp") or details.get("event_time")
+                if timestamp:
+                    llm_finding["timestamp"] = str(timestamp)
+
+                llm_findings.append(llm_finding)
+
+        potential_root_causes = []
+        if first_issue:
+            potential_root_causes.append(
+                {
+                    "timestamp": first_issue.get("timestamp"),
+                    "category": first_issue.get("category"),
+                    "summary": first_issue.get("summary"),
+                    "is_potential_root_cause": first_issue.get("potential_root_cause", False),
+                }
+            )
+
+        for corr in correlations:
+            if corr.get("root_cause"):
+                potential_root_causes.append(
+                    {
+                        "correlation_type": corr.get("correlation_type"),
+                        "severity": corr.get("severity"),
+                        "root_cause": corr.get("root_cause"),
+                        "impact": corr.get("impact"),
+                        "recommendation": corr.get("recommendation"),
+                        "aws_doc": corr.get("aws_doc"),
+                    }
+                )
+
+        llm_output = {
+            "analysis_context": {
+                "cluster": metadata.get("cluster"),
+                "region": metadata.get("region"),
+                "analysis_date": metadata.get("analysis_date"),
+                "date_range": metadata.get("date_range"),
+                "timezone": metadata.get("timezone", "UTC"),
+                "namespace": metadata.get("namespace"),
+            },
+            "summary": {
+                "total_issues": summary.get("total_issues", 0),
+                "critical": summary.get("critical", 0),
+                "warning": summary.get("warning", 0),
+                "info": summary.get("info", 0),
+                "historical_events": historical_count,
+                "current_state_issues": current_state_count,
+                "categories": summary.get("categories", []),
+            },
+            "findings": llm_findings,
+            "correlations": correlations,
+            "timeline": timeline,
+            "potential_root_causes": potential_root_causes,
+            "recommendations": [
+                {
+                    "title": rec.get("title"),
+                    "category": rec.get("category"),
+                    "priority": rec.get("priority"),
+                    "action": rec.get("action"),
+                    "aws_doc": rec.get("aws_doc"),
+                }
+                for rec in recommendations
+            ],
+        }
+
+        return json.dumps(llm_output, indent=2, default=str)
+
+
 class HTMLOutputFormatter(OutputFormatter):
     """Modern HTML output with interactive features"""
 
@@ -847,6 +986,14 @@ class HTMLOutputFormatter(OutputFormatter):
         elif "addon" in details:
             return '<span class="source-badge eks" title="EKS API">🔵 EKS API</span>'
         return '<span class="source-badge auto" title="Auto-detected">🔍 Auto</span>'
+
+    def _get_finding_type_badge(self, details):
+        """Get finding type badge (current state vs historical event)"""
+        finding_type = details.get("finding_type", FindingType.CURRENT_STATE)
+        if finding_type == FindingType.HISTORICAL_EVENT:
+            return '<span class="finding-type-badge historical" title="Event occurred within date range">📅 Historical</span>'
+        else:
+            return '<span class="finding-type-badge current" title="Current cluster state (not filtered by date)">🔄 Current</span>'
 
     def format(self, results):
         """Format results as interactive HTML"""
@@ -1190,6 +1337,79 @@ class HTMLOutputFormatter(OutputFormatter):
         .summary-icon {{ font-size: 2rem; margin-bottom: 0.5rem; }}
         .summary-value {{ font-size: 2rem; font-weight: 700; line-height: 1; }}
         .summary-label {{ font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.25rem; }}
+        
+        /* Finding Type Breakdown */
+        .finding-type-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }}
+        
+        .finding-type-card {{
+            background: white;
+            border-radius: 12px;
+            padding: 1.25rem;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+            border: 1px solid var(--border);
+        }}
+        
+        .finding-type-card.historical {{ border-left: 4px solid #8b5cf6; }}
+        .finding-type-card.current {{ border-left: 4px solid #f59e0b; }}
+        
+        .finding-type-header {{
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.75rem;
+        }}
+        
+        .finding-type-icon {{ font-size: 1.25rem; }}
+        .finding-type-title {{ font-weight: 600; font-size: 0.95rem; color: var(--text); }}
+        
+        .finding-type-count {{
+            font-size: 2rem;
+            font-weight: 700;
+            line-height: 1;
+            margin-bottom: 0.5rem;
+        }}
+        
+        .finding-type-card.historical .finding-type-count {{ color: #8b5cf6; }}
+        .finding-type-card.current .finding-type-count {{ color: #f59e0b; }}
+        
+        .finding-type-desc {{
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }}
+        
+        .finding-type-critical {{
+            font-size: 0.8rem;
+            color: var(--critical);
+            font-weight: 500;
+        }}
+        
+        /* Finding Type Badge in Findings */
+        .finding-type-badge {{
+            display: inline-block;
+            font-size: 0.65rem;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-left: 0.5rem;
+        }}
+        
+        .finding-type-badge.historical {{
+            background: #ede9fe;
+            color: #7c3aed;
+        }}
+        
+        .finding-type-badge.current {{
+            background: #fef3c7;
+            color: #d97706;
+        }}
         
         /* Findings Section */
         .section {{
@@ -1808,6 +2028,28 @@ class HTMLOutputFormatter(OutputFormatter):
                 </div>
             </div>
 
+            <!-- Finding Type Breakdown -->
+            <div class="finding-type-grid">
+                <div class="finding-type-card historical">
+                    <div class="finding-type-header">
+                        <span class="finding-type-icon">📅</span>
+                        <span class="finding-type-title">Historical Events</span>
+                    </div>
+                    <div class="finding-type-count">{summary.get("historical_event_count", 0)}</div>
+                    <div class="finding-type-desc">Within date range ({metadata["date_range"]["start"].split("T")[0]} to {metadata["date_range"]["end"].split("T")[0]})</div>
+                    <div class="finding-type-critical">🔴 {summary.get("historical_event_critical", 0)} critical</div>
+                </div>
+                <div class="finding-type-card current">
+                    <div class="finding-type-header">
+                        <span class="finding-type-icon">🔄</span>
+                        <span class="finding-type-title">Current State</span>
+                    </div>
+                    <div class="finding-type-count">{summary.get("current_state_count", 0)}</div>
+                    <div class="finding-type-desc">Current cluster state (not filtered by date)</div>
+                    <div class="finding-type-critical">🔴 {summary.get("current_state_critical", 0)} critical</div>
+                </div>
+            </div>
+
             <!-- Data Sources Summary -->
             <div id="sources" class="sources-grid">
                 <div class="source-card">
@@ -1876,6 +2118,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             item.get("summary", ""), item.get("details", {})
                         )
                         source_badge = self._get_source_icon(item.get("details", {}))
+                        finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
                         finding_id = f"{cat}-{idx}"
 
                         all_findings_json.append(
@@ -1894,6 +2137,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             <div class="finding-summary">{item.get("summary", "N/A")}</div>
                             <div class="finding-badges">
                                 <span class="severity-badge {item_severity}">{item_severity}</span>
+                                {finding_type_badge}
                                 {source_badge}
                                 <span class="finding-expand">▼</span>
                             </div>
@@ -1958,6 +2202,7 @@ class HTMLOutputFormatter(OutputFormatter):
                         item.get("summary", ""), item.get("details", {})
                     )
                     source_badge = self._get_source_icon(item.get("details", {}))
+                    finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
 
                     html += f'''
                     <div class="finding-item" data-severity="{item_severity}">
@@ -1965,6 +2210,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             <div class="finding-summary">{item.get("summary", "N/A")}</div>
                             <div class="finding-badges">
                                 <span class="severity-badge {item_severity}">{item_severity}</span>
+                                {finding_type_badge}
                                 {source_badge}
                                 <span class="finding-expand">▼</span>
                             </div>
@@ -2629,12 +2875,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "message": event.get("message", "N/A"),
         }
 
-    def _add_finding(self, category: str, summary: str, details: dict | None = None) -> None:
-        """Add finding to appropriate category."""
-        if details:
-            self.findings[category].append({"summary": summary, "details": details})
-        else:
-            self.findings[category].append({"summary": summary})
+    def _add_finding(
+        self,
+        category: str,
+        summary: str,
+        details: dict | None = None,
+        finding_type: str = FindingType.CURRENT_STATE,
+    ) -> None:
+        """Add finding to appropriate category with finding type classification."""
+        if details is None:
+            details = {}
+        details["finding_type"] = finding_type
+        self.findings[category].append({"summary": summary, "details": details})
 
     def _classify_severity(self, summary_text: str, details: dict | None) -> str:
         """Classify finding severity based on content."""
@@ -2725,7 +2977,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 message = event.get("message", "Unknown")
                 eviction_reasons[message] += 1
 
-                # Categorize findings
                 pod_name = event["involvedObject"].get("name", "Unknown")
                 namespace = event["metadata"]["namespace"]
                 timestamp = event.get("lastTimestamp", event.get("eventTime", "Unknown"))
@@ -2737,6 +2988,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "namespace": namespace,
                         "timestamp": timestamp,
                         "reason": message,
+                        "finding_type": FindingType.HISTORICAL_EVENT,
                     },
                 }
 
@@ -2804,6 +3056,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "condition": ctype,
                                 "status": status,
                                 "message": message,
+                                "finding_type": FindingType.CURRENT_STATE,
                             },
                         }
 
@@ -2910,6 +3163,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "Check EC2 instance status in AWS Console",
                                     ],
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
+                                    "finding_type": FindingType.CURRENT_STATE,
                                 },
                             }
                         )
@@ -2942,6 +3196,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "ps aux | wc -l to count running processes",
                                         "Identify process-heavy pods and restart if needed",
                                     ],
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             }
                         )
@@ -2995,6 +3250,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "namespace": namespace,
                             "timestamp": timestamp,
                             "message": message,
+                            "finding_type": FindingType.HISTORICAL_EVENT,
                         },
                     }
                 )
@@ -3091,6 +3347,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "average": f"{avg:.1f}%",
                                     "maximum": f"{max_val:.1f}%",
                                     "threshold": f"{metric['critical']}%",
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             }
                         )
@@ -3154,6 +3411,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "details": {
                             "log_group": control_plane_log_group,
                             "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
                             "impact": "Cannot diagnose control plane issues without logs",
                             "diagnostic_steps": [
                                 'Enable control plane logging: aws eks update-cluster-config --name <cluster> --logging \'{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}\'',
@@ -3203,6 +3461,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "desired": desired,
                                             "ready": ready,
                                             "severity": "warning",
+                                            "finding_type": FindingType.CURRENT_STATE,
                                             "impact": "Container logs may not be flowing to CloudWatch",
                                             "diagnostic_steps": [
                                                 f"kubectl describe ds {ds_name} -n amazon-cloudwatch",
@@ -3222,6 +3481,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "details": {
                             "expected_log_group": app_log_group,
                             "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
                             "impact": "Cannot view container logs in CloudWatch",
                             "diagnostic_steps": [
                                 "Install CloudWatch agent or Fluent Bit",
@@ -3276,6 +3536,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "details": {
                             "expected_log_group": prometheus_log_group,
                             "severity": "info",
+                            "finding_type": FindingType.CURRENT_STATE,
                             "impact": "Custom Prometheus metrics not available in CloudWatch",
                             "diagnostic_steps": [
                                 "Deploy CloudWatch agent with Prometheus config",
@@ -3301,6 +3562,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "details": {
                             "cluster": self.cluster_name,
                             "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
                             "impact": "Cannot monitor cluster performance via CloudWatch",
                             "diagnostic_steps": [
                                 "Enable Container Insights: aws eks update-addon --cluster-name <cluster> --addon-name amazon-cloudwatch-observability",
@@ -3428,8 +3690,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "details": {
                                 "log_stream": stream_name,
                                 "timestamp": str(timestamp),
-                                "message": message[:200],
+                                "message": message[:300],
                                 "severity": severity,
+                                "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
+                                "finding_type": FindingType.HISTORICAL_EVENT,
                             },
                         }
                     )
@@ -3501,6 +3765,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "timestamp": timestamp,
                             "reason_category": reason_category,
                             "message": message,
+                            "finding_type": FindingType.HISTORICAL_EVENT,
                         },
                     }
                 )
@@ -3564,6 +3829,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "timestamp": timestamp,
                                 "reason": reason,
                                 "message": message,
+                                "finding_type": FindingType.HISTORICAL_EVENT,
                             },
                         }
                     )
@@ -3585,6 +3851,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "pod": pod_name,
                                     "namespace": "kube-system",
                                     "status": phase,
+                                    "finding_type": FindingType.CURRENT_STATE,
                                 },
                             }
                         )
@@ -3640,6 +3907,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "namespace": namespace,
                                     "timestamp": timestamp,
                                     "message": message,
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             }
                         )
@@ -3710,6 +3978,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "severity": "warning" if phase == "Pending" else "critical",
                                     "diagnostic_steps": diagnostic_steps,
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html",
+                                    "finding_type": FindingType.CURRENT_STATE,
                                 },
                             }
                         )
@@ -3965,6 +4234,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "timestamp": timestamp,
                                     "category": failure_category,
                                     "message": message,
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             }
                         )
@@ -4028,6 +4298,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "health_issues": [
                                     issue.get("message", "N/A") for issue in health_issues
                                 ],
+                                "finding_type": FindingType.CURRENT_STATE,
                             },
                         }
                     )
@@ -4094,7 +4365,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 .replace("m", "")
                             )
 
-                            # Alert if usage is at 90% or more of quota
                             if used_num >= (hard_num * 0.9):
                                 self.findings["resource_quota_exceeded"].append(
                                     {
@@ -4106,6 +4376,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "used": used_amount,
                                             "hard_limit": hard_limit,
                                             "utilization": f"{(used_num / hard_num * 100):.1f}%",
+                                            "finding_type": FindingType.CURRENT_STATE,
                                         },
                                     }
                                 )
@@ -4173,6 +4444,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "aws_doc": EKS_ISSUE_PATTERNS["pod_issues"][
                                             "CrashLoopBackOff"
                                         ]["aws_doc"],
+                                        "finding_type": FindingType.CURRENT_STATE,
                                     },
                                 }
                             )
@@ -4193,6 +4465,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "aws_doc": EKS_ISSUE_PATTERNS["pod_issues"][
                                             "ImagePullBackOff"
                                         ]["aws_doc"],
+                                        "finding_type": FindingType.CURRENT_STATE,
                                     },
                                 }
                             )
@@ -4213,6 +4486,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "aws_doc": EKS_ISSUE_PATTERNS["pod_issues"][
                                             "CreateContainerConfigError"
                                         ]["aws_doc"],
+                                        "finding_type": FindingType.CURRENT_STATE,
                                     },
                                 }
                             )
@@ -4228,6 +4502,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "container": container_name,
                                     "restart_count": restart_count,
                                     "severity": "critical",
+                                    "finding_type": FindingType.CURRENT_STATE,
                                 },
                             }
                         )
@@ -4241,6 +4516,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "container": container_name,
                                     "restart_count": restart_count,
                                     "severity": "warning",
+                                    "finding_type": FindingType.CURRENT_STATE,
                                 },
                             }
                         )
@@ -4438,6 +4714,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "aws_doc": EKS_ISSUE_PATTERNS["network_issues"]["CNINotReady"][
                                     "aws_doc"
                                 ],
+                                "finding_type": FindingType.CURRENT_STATE,
                             },
                         }
                     )
@@ -4472,6 +4749,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "aws_doc": EKS_ISSUE_PATTERNS["network_issues"]["IPExhaustion"][
                                         "aws_doc"
                                     ],
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             }
                         )
@@ -4511,6 +4789,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "ready": ready,
                                 "unavailable": unavailable,
                                 "severity": "critical" if ready == 0 else "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
                             },
                         }
                     )
@@ -4554,6 +4833,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "aws_doc": EKS_ISSUE_PATTERNS["network_issues"][
                                         "DNSResolutionFailure"
                                     ]["aws_doc"],
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             }
                         )
@@ -4595,6 +4875,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "replicas": replicas,
                                 "ready": ready,
                                 "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
                             },
                         }
                     )
@@ -4629,6 +4910,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "aws_doc": EKS_ISSUE_PATTERNS["iam_issues"]["AccessDenied"][
                                         "aws_doc"
                                     ],
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             }
                         )
@@ -4691,13 +4973,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     "Pod Identity agent not configured correctly",
                                                     "Node IAM role missing AssumeRoleForPodIdentity permission",
                                                 ],
-                                                "diagnostic_steps": [
-                                                    f"Check IAM role trust policy for {role_arn}",
-                                                    "Verify OIDC provider is configured for cluster",
-                                                    "Check service account annotation",
-                                                    "aws iam get-role --role-name <role-name>",
-                                                ],
-                                                "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html",
+                                                "finding_type": FindingType.HISTORICAL_EVENT,
                                             },
                                         }
                                     )
@@ -5229,6 +5505,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "metric_id": result.get("Id", "Unknown"),
                                         "max_cpu": f"{max_cpu:.1f}%",
                                         "severity": "warning",
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                         "root_causes": [
                                             "CPU limits too low for workload",
                                             "Application inefficiency",
@@ -5281,6 +5558,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "service": ep_name,
                                 "namespace": ep_namespace,
                                 "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
                                 "root_causes": [
                                     "Pod selector does not match any pods",
                                     "Pods exist but not passing readiness probes",
@@ -5323,6 +5601,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "namespace": svc_namespace,
                                         "type": svc_type,
                                         "severity": "warning",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                         "root_causes": [
                                             "AWS Load Balancer Controller not running",
                                             "IAM permissions missing",
@@ -5386,6 +5665,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "message": event.get("message", "")[:200],
                                         "timestamp": str(timestamp),
                                         "severity": "warning",
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                         "diagnostic_steps": [
                                             f"kubectl describe {involved.get('kind', 'pod').lower()} {involved.get('name', '')} -n {namespace}",
                                             "Check if target service/pod is running",
@@ -5454,6 +5734,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 if status in ["DEGRADED", "UNHEALTHY"]
                                 else "warning",
                                 "aws_doc": "https://repost.aws/knowledge-center/eks-node-group-degraded",
+                                "finding_type": FindingType.CURRENT_STATE,
                             },
                         }
                     )
@@ -5513,6 +5794,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "Probe timeout too short",
                             ],
                             "aws_doc": "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
+                            "finding_type": FindingType.HISTORICAL_EVENT,
                         },
                     }
                 )
@@ -5559,6 +5841,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "Resource limits too low",
                                 ],
                                 "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html",
+                                "finding_type": FindingType.CURRENT_STATE,
                             },
                         }
                     )
@@ -5588,6 +5871,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "aws_doc": EKS_ISSUE_PATTERNS["storage_issues"][
                                     "VolumeAttachmentFailed"
                                 ]["aws_doc"],
+                                "finding_type": FindingType.HISTORICAL_EVENT,
                             },
                         }
                     )
@@ -5693,6 +5977,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "limit": quota_value,
                                         "description": quota_check["description"],
                                         "severity": "info",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                     },
                                 }
                             )
@@ -5735,6 +6020,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "replicas": replicas,
                                 "ready": ready,
                                 "severity": "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
                                 "root_causes": [
                                     "Insufficient permissions to access AWS APIs",
                                     "Missing or incorrect --node-group-auto-discovery flag",
@@ -5790,6 +6076,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "component": "cluster-autoscaler",
                                         "issue": error_check["root_cause"],
                                         "severity": error_check["severity"],
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                         "aws_doc": "https://repost.aws/knowledge-center/eks-pod-scheduling-cluster-autoscaler",
                                     },
                                 }
@@ -5835,6 +6122,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "reason": condition.get("reason", "Unknown"),
                                         "message": condition.get("message", "N/A")[:200],
                                         "severity": "warning",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                         "root_causes": [
                                             "Metrics server not available",
                                             "Resource limits already at maximum",
@@ -5858,6 +6146,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "reason": condition.get("reason", "Unknown"),
                                         "message": condition.get("message", "N/A")[:200],
                                         "severity": "warning",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                         "root_causes": [
                                             "Missing metrics",
                                             "Target resource not found",
@@ -5881,6 +6170,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "current_replicas": current_replicas,
                                     "max_replicas": max_replicas,
                                     "severity": "warning",
+                                    "finding_type": FindingType.CURRENT_STATE,
                                     "recommendation": "Consider increasing maxReplicas if workload needs more scaling",
                                 },
                             }
@@ -5921,6 +6211,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "node": node_name,
                                             "message": condition.get("message", "N/A")[:200],
                                             "severity": "critical",
+                                            "finding_type": FindingType.CURRENT_STATE,
                                             "root_causes": [
                                                 "Kubelet certificate expired",
                                                 "CA certificate rotation pending",
@@ -5950,6 +6241,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "namespace": involved.get("namespace", "Unknown"),
                                     "message": event.get("message", "N/A")[:200],
                                     "severity": "critical",
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             }
                         )
@@ -5987,6 +6279,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "replicas": replicas,
                                 "ready": ready,
                                 "severity": "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
                                 "root_causes": [
                                     "IAM role missing permissions for ELB/ACM",
                                     "Service account not configured correctly",
@@ -6109,6 +6402,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "total_ips": total_ips,
                                         "cidr": cidr,
                                         "severity": "critical",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                         "root_causes": [
                                             "Subnet CIDR too small",
                                             "Too many pods/nodes in subnet",
@@ -6130,6 +6424,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ),
                                         "available_ips": available_ips,
                                         "severity": "warning",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                     },
                                 }
                             )
@@ -6167,6 +6462,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "replicas": replicas,
                                 "ready": ready,
                                 "severity": "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
                                 "root_causes": [
                                     "IAM role missing permissions",
                                     "Karpenter NodePool/EC2NodeClass misconfigured",
@@ -6201,6 +6497,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "reason": condition.get("reason", "Unknown"),
                                             "message": condition.get("message", "N/A")[:200],
                                             "severity": "warning",
+                                            "finding_type": FindingType.CURRENT_STATE,
                                         },
                                     }
                                 )
@@ -6238,6 +6535,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "replicas": replicas,
                                 "ready": ready,
                                 "severity": "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
                                 "root_causes": [
                                     "IAM role missing EFS permissions",
                                     "Service account not configured for IRSA",
@@ -6257,6 +6555,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "summary": "EFS-related warnings detected",
                         "details": {
                             "severity": "warning",
+                            "finding_type": FindingType.HISTORICAL_EVENT,
                             "recommendation": "Review events for EFS mount issues",
                         },
                     }
@@ -6329,6 +6628,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "pod": pod_name,
                                                 "namespace": namespace,
                                                 "severity": "critical",
+                                                "finding_type": FindingType.CURRENT_STATE,
                                                 "root_causes": [
                                                     "No GPU nodes in cluster",
                                                     "GPU node selector mismatch",
@@ -6360,6 +6660,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "namespace": involved.get("namespace", "Unknown"),
                                         "message": event.get("message", "N/A")[:200],
                                         "severity": "warning",
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                         "gpu_nodes_count": len(gpu_nodes),
                                         "total_gpus": total_gpus,
                                     },
@@ -6419,6 +6720,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "reason": ready_condition.get("reason", "Unknown"),
                                     "message": ready_condition.get("message", "N/A")[:200],
                                     "severity": "critical",
+                                    "finding_type": FindingType.CURRENT_STATE,
                                     "root_causes": [
                                         "Container runtime issue",
                                         "Network plugin not compatible with Windows",
@@ -6451,6 +6753,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "namespace": involved.get("namespace", "Unknown"),
                                         "message": event.get("message", "N/A")[:200],
                                         "severity": "warning",
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                         "windows_nodes_count": len(windows_nodes),
                                     },
                                 }
@@ -6543,6 +6846,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "sg_id": issue.get("sg_id", "N/A"),
                             "sg_name": issue.get("sg_name", "N/A"),
                             "severity": issue["severity"],
+                            "finding_type": FindingType.CURRENT_STATE,
                             "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/sec-group-reqs.html",
                         },
                     }
@@ -6593,6 +6897,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "pod_execution_role": profile.get("podExecutionRoleArn", "N/A"),
                                     "selectors": profile.get("selectors", []),
                                     "severity": "critical" if status == "FAILED" else "warning",
+                                    "finding_type": FindingType.CURRENT_STATE,
                                     "root_causes": [
                                         "IAM role permissions missing",
                                         "Subnet not available",
@@ -6625,6 +6930,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "namespace": namespace,
                                         "compute_type": "fargate",
                                         "severity": "warning",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                         "root_causes": [
                                             "No matching Fargate profile selector",
                                             "Profile not in ACTIVE status",
@@ -6734,6 +7040,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         if is_rate_limit
                                         else "latency",
                                         "severity": "critical" if is_rate_limit else "warning",
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                         "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
                                     },
                                 }
@@ -6780,6 +7087,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     "severity": "critical"
                                                     if max_latency > 5.0
                                                     else "warning",
+                                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                                 },
                                             }
                                         )
@@ -6912,6 +7220,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "user_agent": user_agent,
                                         "message": message[:400],
                                         "severity": pattern_info["severity"],
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                         "aws_doc": "https://kubernetes.io/docs/concepts/cluster-administration/flow-control/",
                                     },
                                 }
@@ -6936,6 +7245,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "throttled_clients": dict(top_throttled),
                             "recommendation": "Review client --kube-api-qps and --kube-api-burst settings, check APF flow schemas",
                             "severity": "warning" if len(rate_limit_findings) < 10 else "critical",
+                            "finding_type": FindingType.HISTORICAL_EVENT,
                             "aws_doc": "https://kubernetes.io/docs/concepts/cluster-administration/flow-control/",
                         },
                     }
@@ -6960,6 +7270,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "condition": "Dangling",
                                             "recommendation": f"kubectl delete flowschema {name} or create matching PriorityLevelConfiguration",
                                             "severity": "warning",
+                                            "finding_type": FindingType.CURRENT_STATE,
                                             "aws_doc": "https://kubernetes.io/docs/concepts/cluster-administration/flow-control/",
                                         },
                                     }
@@ -7120,6 +7431,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "timestamp": str(timestamp),
                                 "message": message[:300],
                                 "severity": pattern_info["severity"],
+                                "finding_type": FindingType.HISTORICAL_EVENT,
                                 "root_causes": [
                                     "High object count in cluster",
                                     "Disk I/O saturation",
@@ -7179,6 +7491,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "message": evt.get("message", "")[:200],
                                         "timestamp": str(timestamp),
                                         "severity": "critical",
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                         "impact": "Cluster is in READ-ONLY mode",
                                         "diagnostic_steps": [
                                             "URGENT: Open AWS Support ticket for EKS etcd defragmentation",
@@ -7354,6 +7667,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "timestamp": str(timestamp),
                                         "message": message[:300],
                                         "severity": pattern_info["severity"],
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                         "root_causes": [
                                             "RBAC permission issues",
                                             "Resource quota exceeded",
@@ -7407,6 +7721,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "failure_policy": failure_policy,
                                         "timeout_seconds": timeout_seconds,
                                         "severity": "warning",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                         "recommendation": "Consider increasing timeout or changing failurePolicy to Ignore",
                                     },
                                 }
@@ -7447,6 +7762,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "message": event.get("message", "N/A")[:300],
                                     "timestamp": event.get("lastTimestamp", "Unknown"),
                                     "severity": "critical",
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                     "root_causes": [
                                         "Webhook service unavailable",
                                         "Webhook TLS certificate expired",
@@ -7497,6 +7813,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "reason": condition.get("reason", "Unknown"),
                                             "message": condition.get("message", "N/A")[:300],
                                             "severity": "critical",
+                                            "finding_type": FindingType.CURRENT_STATE,
                                             "root_causes": [
                                                 "Container runtime unresponsive",
                                                 "Zombie containers blocking PLEG",
@@ -7528,6 +7845,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "message": event.get("message", "N/A")[:200],
                                     "timestamp": event.get("lastTimestamp", "Unknown"),
                                     "severity": "critical",
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             }
                         )
@@ -7576,6 +7894,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "message": event.get("message", "N/A")[:200],
                                     "timestamp": event.get("lastTimestamp", "Unknown"),
                                     "severity": "critical",
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                     "root_causes": [
                                         "Containerd process crashed",
                                         "Containerd OOMKilled",
@@ -7609,6 +7928,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "node": node_name,
                                             "message": condition.get("message", "N/A"),
                                             "severity": "critical",
+                                            "finding_type": FindingType.CURRENT_STATE,
                                         },
                                     }
                                 )
@@ -7690,6 +8010,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "message": event.get("message", "")[:300],
                                     "timestamp": str(timestamp),
                                     "severity": "critical",
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                     "root_causes": [
                                         "Pause container image garbage-collected by kubelet",
                                         "Container image cache cleared",
@@ -7823,6 +8144,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "deletion_timestamp": deletion_ts,
                                 "finalizers": finalizers,
                                 "severity": "warning" if not finalizers else "info",
+                                "finding_type": FindingType.CURRENT_STATE,
                                 "root_causes": [
                                     "Finalizer blocking deletion",
                                     "PreStop hook stuck",
@@ -7855,6 +8177,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "message": event.get("message", "N/A")[:200],
                                     "timestamp": event.get("lastTimestamp", "Unknown"),
                                     "severity": "warning",
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             }
                         )
@@ -7921,6 +8244,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "severity": "critical"
                                         if "Deadline" in cond_reason
                                         else "warning",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                         "root_causes": [
                                             "New pods failing to start",
                                             "Image pull failures",
@@ -7943,6 +8267,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "reason": cond_reason,
                                         "message": cond_message[:200],
                                         "severity": "warning",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                     },
                                 }
                             )
@@ -7960,6 +8285,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "available": available_replicas,
                                 "unavailable": unavailable_replicas,
                                 "severity": "warning" if ready_replicas > 0 else "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
                             },
                         }
                     )
@@ -8018,6 +8344,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "succeeded": succeeded,
                                         "backoff_limit": backoff_limit,
                                         "severity": "critical",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                         "root_causes": [
                                             "Application error in job pod",
                                             "OOMKilled",
@@ -8040,6 +8367,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "failed": failed,
                                     "backoff_limit": backoff_limit,
                                     "severity": "critical",
+                                    "finding_type": FindingType.CURRENT_STATE,
                                 },
                             }
                         )
@@ -8084,6 +8412,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "last_successful": last_successful,
                                             "suspended": suspended,
                                             "severity": "warning",
+                                            "finding_type": FindingType.CURRENT_STATE,
                                             "root_causes": [
                                                 "CronJob controller issues",
                                                 "Previous job still running",
@@ -8176,6 +8505,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "egress_rules_count": len(egress_rules),
                                 "issues": issues,
                                 "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
                                 "root_causes": [
                                     "Missing DNS egress rule",
                                     "Blocking health check probes",
@@ -8223,6 +8553,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "replicas": replicas,
                                 "ready": ready,
                                 "severity": "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
                             },
                         }
                     )
@@ -8253,6 +8584,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "ingress": ing_name,
                                         "namespace": namespace,
                                         "severity": "warning",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                         "root_causes": [
                                             "AWS LB Controller not running",
                                             "Subnet not tagged for ELB",
@@ -8313,6 +8645,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     "severity": "critical"
                                                     if "5XX" in metric_name
                                                     else "warning",
+                                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                                     "root_causes": [
                                                         "Backend pods unhealthy",
                                                         "Backend pods not ready",
@@ -8375,6 +8708,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "current": current_replicas,
                                 "updated": updated_replicas,
                                 "severity": "warning" if ready_replicas > 0 else "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
                                 "root_causes": [
                                     "Pod stuck in Pending",
                                     "PVC provision failure",
@@ -8413,6 +8747,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "namespace": namespace,
                                                 "phase": phase,
                                                 "severity": "critical",
+                                                "finding_type": FindingType.CURRENT_STATE,
                                                 "root_causes": [
                                                     "StorageClass not found",
                                                     "EBS CSI driver issue",
@@ -8469,6 +8804,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "message": event.get("message", "N/A")[:300],
                                     "timestamp": event.get("lastTimestamp", "Unknown"),
                                     "severity": "critical",
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                     "root_causes": [
                                         "High pod-to-pod traffic",
                                         "NodePort services with externalTrafficPolicy: Cluster",
@@ -8552,6 +8888,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                         dp.get("Timestamp", "Unknown")
                                                     ),
                                                     "severity": "warning",
+                                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                                     "recommendation": "Monitor conntrack table usage on nodes",
                                                 },
                                             }
@@ -8613,6 +8950,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "severity": "critical"
                                         if restart_count >= Thresholds.RESTART_CRITICAL
                                         else "warning",
+                                        "finding_type": FindingType.CURRENT_STATE,
                                         "root_causes": [
                                             "Controller panic or crash",
                                             "RBAC permission issues",
@@ -8867,6 +9205,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "severity": "warning"
                                                 if enforce == "warn"
                                                 else "info",
+                                                "finding_type": FindingType.CURRENT_STATE,
                                                 "root_causes": [
                                                     "Missing security context configuration",
                                                     "Privileged container requirements",
@@ -8910,6 +9249,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "message": event.get("message", "N/A")[:300],
                                     "timestamp": event.get("lastTimestamp", "Unknown"),
                                     "severity": "critical",
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
                                     "root_causes": [
                                         "Pod spec does not meet PSA requirements",
                                         "Namespace has restrictive PSA policy",
@@ -9031,6 +9371,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "timestamp": str(timestamp),
                                     "message": event.get("message", "")[:200],
                                     "severity": "critical",
+                                    "finding_type": FindingType.CURRENT_STATE,
                                     "diagnostic_steps": [
                                         f"kubectl describe pod {pod} -n {namespace}",
                                         f"Create missing {resource_type}: kubectl create {resource_type.lower()} {missing_resource} -n {namespace} --from-literal=key=value",
@@ -9078,6 +9419,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "resource_name": cm_name,
                                                 "volume": volume.get("name", "unknown"),
                                                 "severity": "warning",
+                                                "finding_type": FindingType.CURRENT_STATE,
                                                 "diagnostic_steps": [
                                                     f"kubectl get configmap {cm_name} -n {ns}",
                                                     f"Create the ConfigMap or fix the pod spec",
@@ -9106,6 +9448,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "resource_name": secret_name,
                                                 "volume": volume.get("name", "unknown"),
                                                 "severity": "warning",
+                                                "finding_type": FindingType.CURRENT_STATE,
                                                 "diagnostic_steps": [
                                                     f"kubectl get secret {secret_name} -n {ns}",
                                                     "Create the Secret or fix the pod spec",
@@ -9130,6 +9473,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "resource_type": "ConfigMap",
                                                 "resource_name": cm_name,
                                                 "severity": "warning",
+                                                "finding_type": FindingType.CURRENT_STATE,
                                             },
                                         }
                                     )
@@ -9146,6 +9490,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "resource_type": "Secret",
                                                 "resource_name": secret_name,
                                                 "severity": "warning",
+                                                "finding_type": FindingType.CURRENT_STATE,
                                             },
                                         }
                                     )
@@ -9251,6 +9596,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "severity": "critical"
                                             if max_val > threshold * 1.5
                                             else "warning",
+                                            "finding_type": FindingType.HISTORICAL_EVENT,
                                             "root_causes": [
                                                 "Too many concurrent API requests",
                                                 "Controller/operator spamming API",
@@ -9365,6 +9711,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "timestamp": str(timestamp),
                                         "message": message[:300],
                                         "severity": pattern_info["severity"],
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                         "root_causes": [
                                             "No nodes match pod requirements",
                                             "Resource constraints on all nodes",
@@ -9417,6 +9764,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                             dp.get("Timestamp", "Unknown")
                                                         ),
                                                         "severity": "warning",
+                                                        "finding_type": FindingType.HISTORICAL_EVENT,
                                                     },
                                                 }
                                             )
@@ -9520,6 +9868,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "count": len(pods_without_limits),
                             "examples": pods_without_limits[:10],
                             "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
                             "impact": "Pods without limits can consume unbounded resources",
                             "recommendation": "Add resource limits to all pods",
                             "aws_doc": "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
@@ -9535,6 +9884,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "count": len(pods_without_requests),
                             "examples": pods_without_requests[:10],
                             "severity": "info",
+                            "finding_type": FindingType.CURRENT_STATE,
                             "impact": "Pods without requests may be scheduled on overloaded nodes",
                             "recommendation": "Add resource requests to all pods",
                             "aws_doc": "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
@@ -9550,6 +9900,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "details": {
                             "qos_breakdown": qos_breakdown,
                             "severity": "info",
+                            "finding_type": FindingType.CURRENT_STATE,
                             "recommendation": "Consider setting limits and requests for Guaranteed QoS on critical workloads",
                         },
                     }
@@ -9717,16 +10068,33 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         critical = 0
         warning = 0
         info = 0
+        current_state_count = 0
+        historical_event_count = 0
+        current_state_critical = 0
+        historical_event_critical = 0
 
         for cat, items in self.findings.items():
             for item in items:
                 severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
+                finding_type = item.get("details", {}).get(
+                    "finding_type", FindingType.CURRENT_STATE
+                )
+
                 if severity == "critical":
                     critical += 1
+                    if finding_type == FindingType.HISTORICAL_EVENT:
+                        historical_event_critical += 1
+                    else:
+                        current_state_critical += 1
                 elif severity == "warning":
                     warning += 1
                 else:
                     info += 1
+
+                if finding_type == FindingType.HISTORICAL_EVENT:
+                    historical_event_count += 1
+                else:
+                    current_state_count += 1
 
         total_issues = critical + warning + info
         categories_with_issues = [cat for cat, items in self.findings.items() if items]
@@ -9741,6 +10109,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "categories": categories_with_issues,
             "healthy_checks": healthy_checks,
             "total_categories": total_categories,
+            "current_state_count": current_state_count,
+            "historical_event_count": historical_event_count,
+            "current_state_critical": current_state_critical,
+            "historical_event_critical": historical_event_critical,
         }
 
     def generate_recommendations(self):
@@ -10142,20 +10514,20 @@ Examples:
   python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \\
     --cluster-name my-cluster --kube-context my-cluster-ssm-tunnel --days 2
 
-  # Historical analysis with specific date range
+  # Historical analysis with specific date range and timezone
   python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \\
-    --start-date "2026-02-15T00:00:00Z" --end-date "2026-02-16T00:00:00Z"
-
-  # JSON output to file
-  python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \\
-    --output-format json --output-file report.json
-
-  # Beautiful HTML report (modern design)
-  python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \\
-    --output-format html --output-file report.html
+    --cluster-name my-cluster \\
+    --start-date "2026-02-15T08:00:00" --end-date "2026-02-16T18:00:00" \\
+    --timezone "Asia/Dubai"
 
   # Focus on specific namespace
-  python eks_comprehensive_debugger.py --profile prod --region eu-west-1 --namespace production
+  python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \\
+    --cluster-name my-cluster --namespace production
+
+Output:
+  Always generates two files:
+    - {cluster}-eks-report-{timestamp}.html      - Interactive HTML dashboard
+    - {cluster}-eks-findings-{timestamp}.json    - LLM-ready JSON for AI analysis
         """,
     )
 
@@ -10192,15 +10564,6 @@ Examples:
         default="UTC",
         help="Timezone for date interpretation (default: UTC)",
     )
-
-    # Output options
-    parser.add_argument(
-        "--output-format",
-        choices=["console", "json", "markdown", "yaml", "html"],
-        default="console",
-        help="Output format (default: console)",
-    )
-    parser.add_argument("--output-file", help="Write output to file instead of stdout")
 
     # Filtering options
     parser.add_argument("--namespace", help="Focus on specific Kubernetes namespace")
@@ -10317,32 +10680,59 @@ def validate_and_parse_dates(args):
 # === SECTION 7: OUTPUT HANDLING ===
 
 
-def output_results(results, output_format, output_file=None):
-    """Output results in specified format"""
+def output_results(results, cluster_name: str, timezone_name: str = "UTC"):
+    """
+    Output results as both HTML and LLM-JSON files.
 
-    # Select formatter
-    formatters = {
-        "console": ConsoleOutputFormatter(),
-        "json": JSONOutputFormatter(),
-        "markdown": MarkdownOutputFormatter(),
-        "yaml": YAMLOutputFormatter(),
-        "html": HTMLOutputFormatter(),
-    }
+    Generates two files:
+    - {cluster_name}-eks-report-{timestamp}.html
+    - {cluster_name}-eks-findings-{timestamp}.json
+    """
 
-    formatter = formatters.get(output_format, ConsoleOutputFormatter())
-    output = formatter.format(results)
+    html_formatter = HTMLOutputFormatter()
+    llm_formatter = LLMJSONOutputFormatter()
 
-    # Write to file or stdout
-    if output_file:
-        try:
-            with open(output_file, "w") as f:
-                f.write(output)
-            print(f"✓ Report written to {output_file}")
-        except Exception as e:
-            print(f"✗ Failed to write to {output_file}: {e}", file=sys.stderr)
-            sys.exit(2)
-    else:
-        print(output)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_cluster_name = cluster_name.replace("_", "-").replace(".", "-").lower()
+
+    html_file = f"{safe_cluster_name}-eks-report-{timestamp}.html"
+    json_file = f"{safe_cluster_name}-eks-findings-{timestamp}.json"
+
+    # Add timezone to metadata
+    results["metadata"]["timezone"] = timezone_name
+
+    success = True
+
+    print()
+    print("=" * 70)
+    print("GENERATING REPORTS")
+    print("=" * 70)
+
+    try:
+        html_output = html_formatter.format(results)
+        with open(html_file, "w") as f:
+            f.write(html_output)
+        print(f"✓ HTML Report:     {html_file}")
+    except Exception as e:
+        print(f"✗ Failed to write HTML report: {e}", file=sys.stderr)
+        success = False
+
+    try:
+        json_output = llm_formatter.format(results)
+        with open(json_file, "w") as f:
+            f.write(json_output)
+        print(f"✓ LLM JSON Report: {json_file}")
+    except Exception as e:
+        print(f"✗ Failed to write JSON report: {e}", file=sys.stderr)
+        success = False
+
+    print("=" * 70)
+    print()
+
+    if not success:
+        sys.exit(2)
+
+    return html_file, json_file
 
 
 def get_exit_code(results):
@@ -10383,8 +10773,9 @@ def main():
             print("=" * 70)
             print(f"Profile:     {args.profile}")
             print(f"Region:      {args.region}")
+            print(f"Timezone:    {args.timezone}")
             print(
-                f"Date Range:  {start_date.strftime('%Y-%m-%d %H:%M:%S UTC')} to {end_date.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+                f"Date Range:  {start_date.strftime('%Y-%m-%d %H:%M:%S')} to {end_date.strftime('%Y-%m-%d %H:%M:%S')} (UTC)"
             )
             if args.namespace:
                 print(f"Namespace:   {args.namespace}")
@@ -10408,8 +10799,8 @@ def main():
         # Run analysis
         results = debugger.run_comprehensive_analysis()
 
-        # Output results
-        output_results(results, args.output_format, args.output_file)
+        # Output results (always generates HTML + LLM-JSON)
+        output_results(results, args.cluster_name, args.timezone)
 
         # Exit with appropriate code
         sys.exit(get_exit_code(results))

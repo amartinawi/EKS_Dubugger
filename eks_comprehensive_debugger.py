@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive EKS Debugging Tool v3.0.0
+Comprehensive EKS Debugging Tool v3.1.0
 
 A production-grade diagnostic tool for Amazon EKS cluster troubleshooting that provides
 systematic analysis of cluster health, workload issues, networking, storage, and control plane.
@@ -2201,8 +2201,6 @@ class HTMLOutputFormatter(OutputFormatter):
             short_summary = narrative.get("short_summary", "")
 
             # First escape HTML, then convert markdown-style bold to HTML
-            import re
-
             escaped_narrative = self._escape_html(narrative_text)
             escaped_summary = self._escape_html(short_summary)
             narrative_html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped_narrative)
@@ -4228,10 +4226,14 @@ class HTMLOutputFormatter(OutputFormatter):
 '''
                         if item.get("details"):
                             for key, value in item["details"].items():
+                                escaped_key = self._escape_html(key)
+                                escaped_value = self._escape_html(
+                                    str(value) if value is not None else ""
+                                )
                                 html += f"""
                                 <div class="detail-item">
-                                    <div class="detail-label">{key}</div>
-                                    <div class="detail-value">{value}</div>
+                                    <div class="detail-label">{escaped_key}</div>
+                                    <div class="detail-value">{escaped_value}</div>
                                 </div>
 """
                         html += """
@@ -4302,10 +4304,14 @@ class HTMLOutputFormatter(OutputFormatter):
 '''
                     if item.get("details"):
                         for key, value in item["details"].items():
+                            escaped_key2 = self._escape_html(key)
+                            escaped_value2 = self._escape_html(
+                                str(value) if value is not None else ""
+                            )
                             html += f"""
                                 <div class="detail-item">
-                                    <div class="detail-label">{key}</div>
-                                    <div class="detail-value">{value}</div>
+                                    <div class="detail-label">{escaped_key2}</div>
+                                    <div class="detail-value">{escaped_value2}</div>
                                 </div>
 """
                     html += """
@@ -4418,14 +4424,16 @@ class HTMLOutputFormatter(OutputFormatter):
             for rec in recommendations:
                 is_correlation = rec.get("is_correlation", False)
                 card_class = "correlation-card" if is_correlation else "recommendation-card"
+                escaped_rec_title = self._escape_html(rec.get("title", ""))
+                escaped_rec_action = self._escape_html(rec.get("action", ""))
 
                 html += f"""
                     <div class="{card_class} {rec.get("priority", "medium")}">
                         <div class="rec-header">
-                            <div class="rec-title">{"🔗 " if is_correlation else ""}{rec["title"]}</div>
+                            <div class="rec-title">{"🔗 " if is_correlation else ""}{escaped_rec_title}</div>
                             <span class="priority-badge {rec.get("priority", "medium")}">{rec.get("priority", "medium")}</span>
                         </div>
-                        <div class="rec-action">{rec["action"]}</div>
+                        <div class="rec-action">{escaped_rec_action}</div>
 """
 
                 # Add evidence section
@@ -5016,13 +5024,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         for kw in info_keywords:
             if kw in summary_lower:
                 return "info"
-
-        if details:
-            msg = str(details.get("message", "")).lower()
-            if msg.startswith("e"):
-                return "critical"
-            elif msg.startswith("w"):
-                return "warning"
 
         return "info"
 
@@ -8151,8 +8152,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     },
                 ]
 
-                import re
-
                 for error_check in cas_error_patterns:
                     if re.search(error_check["pattern"], output, re.IGNORECASE):
                         if error_check["severity"] != "info":
@@ -8381,8 +8380,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
-                import re
-
                 lb_error_patterns = [
                     {
                         "pattern": "AccessDenied|UnauthorizedAccess",
@@ -8442,8 +8439,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             if not output or "not found" in output.lower():
                 self.progress.info("Could not get node subnet info")
                 return
-
-            import re
 
             subnet_ids = set()
             instance_ids = []
@@ -11418,8 +11413,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     resource_type = None
 
                     if "configmap" in message and "not found" in message:
-                        import re
-
                         match = re.search(r'configmap\s+"([^"]+)"', message)
                         if match:
                             missing_resource = match.group(1)
@@ -11432,8 +11425,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 }
                             )
                     elif "secret" in message and "not found" in message:
-                        import re
-
                         match = re.search(r'secret\s+"([^"]+)"', message)
                         if match:
                             missing_resource = match.group(1)

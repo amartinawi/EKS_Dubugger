@@ -967,14 +967,29 @@ class ExecutiveSummaryGenerator:
         # Category breakdown
         category_breakdown = self._category_breakdown(findings)
 
+        # Healthy components for balanced view
+        healthy_components = self._get_healthy_components(findings, summary)
+
+        # First issue for prominent display
+        first_issue_prominent = None
+        if first_issue:
+            first_issue_prominent = {
+                "timestamp": first_issue.get("timestamp"),
+                "category": first_issue.get("category", "").replace("_", " ").title(),
+                "summary": first_issue.get("summary"),
+                "is_potential_root_cause": first_issue.get("potential_root_cause", False),
+            }
+
         return {
             "health_status": health_status,
+            "first_issue": first_issue_prominent,
             "key_findings": key_findings,
             "root_cause_analysis": root_cause_analysis,
             "timeline_insights": timeline_insights,
             "priority_actions": priority_actions,
             "affected_resources": affected_resources,
             "category_breakdown": category_breakdown,
+            "healthy_components": healthy_components,
         }
 
     def _determine_health_status(self, summary: dict) -> dict:
@@ -1168,10 +1183,11 @@ class ExecutiveSummaryGenerator:
         return actions[:10]  # Top 10 actions
 
     def _summarize_affected_resources(self, findings: dict) -> dict:
-        """Summarize affected resources"""
+        """Summarize affected resources including namespace breakdown"""
         pods = set()
         nodes = set()
-        namespaces = set()
+        namespace_counts: dict[str, int] = {}
+        services_offline = 0
 
         for category, items in findings.items():
             for item in items:
@@ -1181,16 +1197,64 @@ class ExecutiveSummaryGenerator:
                 if details.get("node"):
                     nodes.add(details["node"])
                 if details.get("namespace"):
-                    namespaces.add(details["namespace"])
+                    ns = details["namespace"]
+                    namespace_counts[ns] = namespace_counts.get(ns, 0) + 1
+
+        # Count services with no endpoints (offline services)
+        for item in findings.get("network_issues", []):
+            details = item.get("details", {})
+            if "no endpoints" in item.get("summary", "").lower():
+                services_offline += 1
+
+        # Sort namespaces by issue count
+        top_namespaces = sorted(namespace_counts.items(), key=lambda x: x[1], reverse=True)[:5]
 
         return {
             "pods_affected": len(pods),
             "nodes_affected": len(nodes),
-            "namespaces_affected": len(namespaces),
+            "namespaces_affected": len(namespace_counts),
+            "services_offline": services_offline,
             "pod_list": sorted(list(pods))[:10],
             "node_list": sorted(list(nodes))[:10],
-            "namespace_list": sorted(list(namespaces)),
+            "namespace_list": sorted(list(namespace_counts.keys())),
+            "top_namespaces": [{"name": ns, "count": count} for ns, count in top_namespaces],
         }
+
+    def _get_healthy_components(self, findings: dict, summary: dict) -> list:
+        """Get list of healthy components for balanced view"""
+        healthy = []
+
+        # Check for categories with no issues
+        categories_with_issues = set(findings.keys())
+
+        # Define healthy checks based on missing findings
+        healthy_checks = {
+            "memory_pressure": ("Memory", "No memory pressure detected"),
+            "disk_pressure": ("Disk", "No disk pressure detected"),
+            "oom_killed": ("OOM", "No OOM kills in the analysis window"),
+            "node_issues": ("Nodes", "All nodes healthy"),
+            "control_plane_issues": ("Control Plane", "No critical control plane errors"),
+            "scheduling_failures": ("Scheduler", "No scheduling failures"),
+            "network_issues": ("Network", "No network issues detected"),
+            "rbac_issues": ("RBAC/IAM", "No authorization failures"),
+            "image_pull_failures": ("Images", "All images pulling successfully"),
+            "pvc_issues": ("Storage", "No PVC issues detected"),
+            "dns_issues": ("DNS", "CoreDNS operating normally"),
+            "addon_issues": ("Addons", "EKS addons healthy"),
+        }
+
+        for category, (name, message) in healthy_checks.items():
+            if category not in categories_with_issues:
+                healthy.append({"name": name, "message": message})
+
+        # Add healthy checks count from summary
+        healthy_checks_count = summary.get("healthy_checks", 0)
+        if healthy_checks_count > len(healthy):
+            healthy.append(
+                {"name": "Health Checks", "message": f"{healthy_checks_count} checks passed"}
+            )
+
+        return healthy[:6]  # Limit to 6 items
 
     def _category_breakdown(self, findings: dict) -> list:
         """Get breakdown of issues by category"""
@@ -1339,14 +1403,16 @@ class HTMLOutputFormatter(OutputFormatter):
             return '<span class="finding-type-badge current" title="Current cluster state (not filtered by date)">🔄 Current</span>'
 
     def _generate_executive_summary_html(self, exec_summary: dict) -> str:
-        """Generate HTML for the Executive Summary section"""
+        """Generate HTML for the Executive Summary section with Phase 1 enhancements"""
         health = exec_summary.get("health_status", {})
+        first_issue = exec_summary.get("first_issue")
         key_findings = exec_summary.get("key_findings", [])
         root_cause = exec_summary.get("root_cause_analysis", {})
         timeline = exec_summary.get("timeline_insights", {})
         actions = exec_summary.get("priority_actions", [])
         affected = exec_summary.get("affected_resources", {})
         categories = exec_summary.get("category_breakdown", [])
+        healthy_components = exec_summary.get("healthy_components", [])
 
         status_class = health.get("status", "healthy")
 
@@ -1370,45 +1436,135 @@ class HTMLOutputFormatter(OutputFormatter):
                         </div>
                     </div>
 
-                    <div class="summary-grid">
-                        <!-- Key Findings -->
-                        <div class="summary-block">
+                    <!-- At a Glance Stats -->
+                    <div class="at-a-glance">
+                        <div class="glance-stat">
+                            <div class="glance-value">{health.get("critical_count", 0)}</div>
+                            <div class="glance-label">Critical</div>
+                        </div>
+                        <div class="glance-stat">
+                            <div class="glance-value">{health.get("warning_count", 0)}</div>
+                            <div class="glance-label">Warnings</div>
+                        </div>
+                        <div class="glance-stat">
+                            <div class="glance-value">{affected.get("pods_affected", 0)}</div>
+                            <div class="glance-label">Pods</div>
+                        </div>
+                        <div class="glance-stat">
+                            <div class="glance-value">{affected.get("nodes_affected", 0)}</div>
+                            <div class="glance-label">Nodes</div>
+                        </div>
+                        <div class="glance-stat">
+                            <div class="glance-value">{affected.get("namespaces_affected", 0)}</div>
+                            <div class="glance-label">Namespaces</div>
+                        </div>
+                        <div class="glance-stat">
+                            <div class="glance-value">{affected.get("services_offline", 0)}</div>
+                            <div class="glance-label">Services Offline</div>
+                        </div>
+                    </div>
+        """
+
+        # First Issue Prominent (Phase 1 - #9)
+        if first_issue:
+            html += f"""
+                    <!-- First Detected Issue - Prominent -->
+                    <div class="first-issue-callout" onclick="this.classList.toggle('expanded')">
+                        <div class="first-issue-header">
+                            <span class="first-issue-icon">🎯</span>
+                            <span class="first-issue-title">First Detected Issue</span>
+                            <span class="first-issue-toggle">▼</span>
+                        </div>
+                        <div class="first-issue-content">
+                            <div class="first-issue-time">⏰ {first_issue.get("timestamp", "Unknown")}</div>
+                            <div class="first-issue-summary">{first_issue.get("summary", "Unknown")}</div>
+                            <div class="first-issue-category">Category: {first_issue.get("category", "Unknown")}</div>
+                            {"<div class='first-issue-badge'>⚠️ Potential Root Cause</div>" if first_issue.get("is_potential_root_cause") else ""}
+                        </div>
+                    </div>
+            """
+
+        # Collapsible Key Findings (Phase 1 - #10)
+        html += f"""
+                    <!-- Key Findings - Collapsible -->
+                    <div class="summary-block collapsible">
+                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
                             <div class="summary-block-title">
                                 <span>🔍</span> Key Findings
                             </div>
-                            {"<p style='color: var(--text-secondary); font-size: 0.9rem;'>No critical issues detected</p>" if not key_findings else ""}
+                            <span class="block-toggle">▼</span>
+                        </div>
+                        <div class="summary-block-content">
         """
 
-        for finding in key_findings[:5]:
-            severity_class = finding.get("severity", "info")
-            meta_parts = []
-            if finding.get("namespace"):
-                meta_parts.append(f"ns: {finding['namespace']}")
-            if finding.get("pod"):
-                meta_parts.append(f"pod: {finding['pod']}")
-            if finding.get("node"):
-                meta_parts.append(f"node: {finding['node']}")
-            meta_str = (
-                " | ".join(meta_parts)
-                if meta_parts
-                else finding.get("category", "").replace("_", " ").title()
-            )
-
-            html += f"""
+        if not key_findings:
+            html += """<p style='color: var(--text-secondary); font-size: 0.9rem;'>No critical issues detected</p>"""
+        else:
+            for finding in key_findings[:5]:
+                severity_class = finding.get("severity", "info")
+                meta_parts = []
+                if finding.get("namespace"):
+                    meta_parts.append(f"ns: {finding['namespace']}")
+                if finding.get("pod"):
+                    meta_parts.append(f"pod: {finding['pod']}")
+                if finding.get("node"):
+                    meta_parts.append(f"node: {finding['node']}")
+                meta_str = (
+                    " | ".join(meta_parts)
+                    if meta_parts
+                    else finding.get("category", "").replace("_", " ").title()
+                )
+                html += f"""
                             <div class="key-finding-item {severity_class}">
                                 <div class="key-finding-summary">{finding.get("summary", "Unknown")}</div>
                                 <div class="key-finding-meta">{meta_str}</div>
                             </div>
-            """
+                """
 
         html += """
                         </div>
+                    </div>
+        """
 
-                        <!-- Root Cause Analysis -->
-                        <div class="summary-block">
+        # Top Impacted Namespaces (Phase 1 - #3)
+        top_namespaces = affected.get("top_namespaces", [])
+        if top_namespaces:
+            html += """
+                    <!-- Top Impacted Namespaces -->
+                    <div class="summary-block collapsible">
+                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
+                            <div class="summary-block-title">
+                                <span>📍</span> Most Impacted Namespaces
+                            </div>
+                            <span class="block-toggle">▼</span>
+                        </div>
+                        <div class="summary-block-content">
+                            <div class="namespace-list">
+            """
+            for ns in top_namespaces[:5]:
+                html += f"""
+                                <div class="namespace-item">
+                                    <span class="namespace-name">{ns.get("name", "unknown")}</span>
+                                    <span class="namespace-count">{ns.get("count", 0)} issues</span>
+                                </div>
+                """
+            html += """
+                            </div>
+                        </div>
+                    </div>
+            """
+
+        # Root Cause Analysis
+        html += """
+                    <!-- Root Cause Analysis - Collapsible -->
+                    <div class="summary-block collapsible collapsed">
+                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
                             <div class="summary-block-title">
                                 <span>🔗</span> Root Cause Analysis
                             </div>
+                            <span class="block-toggle">▼</span>
+                        </div>
+                        <div class="summary-block-content">
         """
 
         if root_cause.get("has_root_cause"):
@@ -1419,28 +1575,25 @@ class HTMLOutputFormatter(OutputFormatter):
                                 <div class="root-cause-impact">Impact: {rc.get("impact", "N/A")}</div>
                             </div>
                 """
-
-            if root_cause.get("first_issue"):
-                fi = root_cause["first_issue"]
-                html += f"""
-                            <div class="root-cause-item" style="border-left-color: #f59e0b;">
-                                <div class="root-cause-text">📍 First detected issue: {fi.get("summary", "Unknown")}</div>
-                                <div class="root-cause-impact">Time: {fi.get("timestamp", "Unknown")}</div>
-                            </div>
-                """
         else:
             html += """<p style='color: var(--text-secondary); font-size: 0.9rem;'>No root cause correlations identified</p>"""
 
         html += """
                         </div>
                     </div>
+        """
 
-                    <div class="summary-grid">
-                        <!-- Priority Actions -->
-                        <div class="summary-block">
+        # Priority Actions
+        html += """
+                    <!-- Priority Actions - Collapsible -->
+                    <div class="summary-block collapsible">
+                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
                             <div class="summary-block-title">
                                 <span>⚡</span> Priority Actions
                             </div>
+                            <span class="block-toggle">▼</span>
+                        </div>
+                        <div class="summary-block-content">
         """
 
         if actions:
@@ -1457,65 +1610,52 @@ class HTMLOutputFormatter(OutputFormatter):
 
         html += """
                         </div>
+                    </div>
+        """
 
-                        <!-- Affected Resources -->
-                        <div class="summary-block">
+        # Healthy Components (Phase 1 - #7)
+        if healthy_components:
+            html += """
+                    <!-- Healthy Components -->
+                    <div class="summary-block healthy-block collapsible collapsed">
+                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
                             <div class="summary-block-title">
-                                <span>📊</span> Affected Resources
+                                <span>✅</span> Healthy Components
                             </div>
-                            <div class="affected-resources">
-        """
-
-        html += f"""
-                                <div class="resource-stat">
-                                    <div class="resource-stat-value">{affected.get("pods_affected", 0)}</div>
-                                    <div class="resource-stat-label">Pods</div>
-                                </div>
-                                <div class="resource-stat">
-                                    <div class="resource-stat-value">{affected.get("nodes_affected", 0)}</div>
-                                    <div class="resource-stat-label">Nodes</div>
-                                </div>
-                                <div class="resource-stat">
-                                    <div class="resource-stat-value">{affected.get("namespaces_affected", 0)}</div>
-                                    <div class="resource-stat-label">Namespaces</div>
-                                </div>
-        """
-
-        if timeline.get("has_timeline"):
-            html += f"""
-                                <div class="resource-stat">
-                                    <div class="resource-stat-value">{timeline.get("critical_periods", 0)}</div>
-                                    <div class="resource-stat-label">Critical Periods</div>
-                                </div>
+                            <span class="block-toggle">▼</span>
+                        </div>
+                        <div class="summary-block-content">
+                            <div class="healthy-grid">
             """
-
-        html += """
+            for comp in healthy_components:
+                html += f"""
+                                <div class="healthy-item">
+                                    <span class="healthy-icon">✓</span>
+                                    <div class="healthy-info">
+                                        <div class="healthy-name">{comp.get("name", "")}</div>
+                                        <div class="healthy-message">{comp.get("message", "")}</div>
+                                    </div>
+                                </div>
+                """
+            html += """
                             </div>
-        """
-
-        # Add timeline insight if available
-        if timeline.get("has_timeline") and timeline.get("insights"):
-            html += f"""
-                            <div style="margin-top: 1rem; padding: 0.75rem; background: white; border-radius: 8px;">
-                                <strong>🕐 Timeline:</strong> {timeline.get("start_time", "")} to {timeline.get("end_time", "")}
-                                <br><span style="color: var(--text-secondary); font-size: 0.85rem;">{timeline.get("insights", ["No insights"])[0]}</span>
-                            </div>
-            """
-
-        html += """
                         </div>
                     </div>
+            """
 
-                    <!-- Category Breakdown -->
-        """
-
+        # Category Breakdown
         if categories:
             max_count = max(c.get("count", 0) for c in categories) if categories else 1
             html += """
-                    <div class="summary-block">
-                        <div class="summary-block-title">
-                            <span>📈</span> Issues by Category
+                    <!-- Category Breakdown - Collapsible -->
+                    <div class="summary-block collapsible collapsed">
+                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
+                            <div class="summary-block-title">
+                                <span>📈</span> Issues by Category
+                            </div>
+                            <span class="block-toggle">▼</span>
                         </div>
+                        <div class="summary-block-content">
             """
             for cat in categories[:8]:
                 width = (cat.get("count", 0) / max_count * 100) if max_count > 0 else 0
@@ -1527,15 +1667,16 @@ class HTMLOutputFormatter(OutputFormatter):
                     else ""
                 )
                 html += f"""
-                        <div class="category-bar">
-                            <div class="category-name">{cat.get("display_name", cat.get("category", ""))}</div>
-                            <div class="category-bar-visual">
-                                <div class="category-bar-fill {fill_class}" style="width: {width}%;"></div>
+                            <div class="category-bar">
+                                <div class="category-name">{cat.get("display_name", cat.get("category", ""))}</div>
+                                <div class="category-bar-visual">
+                                    <div class="category-bar-fill {fill_class}" style="width: {width}%;"></div>
+                                </div>
+                                <div class="category-count">{cat.get("count", 0)}</div>
                             </div>
-                            <div class="category-count">{cat.get("count", 0)}</div>
-                        </div>
                 """
             html += """
+                        </div>
                     </div>
             """
 
@@ -2192,6 +2333,225 @@ class HTMLOutputFormatter(OutputFormatter):
             color: var(--text);
             width: 40px;
             text-align: right;
+        }}
+        
+        /* At a Glance Stats */
+        .at-a-glance {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            padding: 1rem;
+            background: #f8fafc;
+            border-radius: 12px;
+        }}
+        
+        .glance-stat {{
+            flex: 1;
+            min-width: 100px;
+            text-align: center;
+            padding: 0.75rem;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }}
+        
+        .glance-value {{
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: var(--primary);
+        }}
+        
+        .glance-label {{
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 0.25rem;
+        }}
+        
+        /* First Issue Callout */
+        .first-issue-callout {{
+            background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+            border: 2px solid #f59e0b;
+            border-radius: 12px;
+            margin-bottom: 1.5rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        
+        .first-issue-callout:hover {{
+            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.2);
+        }}
+        
+        .first-issue-header {{
+            display: flex;
+            align-items: center;
+            padding: 1rem 1.25rem;
+            gap: 0.75rem;
+        }}
+        
+        .first-issue-icon {{
+            font-size: 1.5rem;
+        }}
+        
+        .first-issue-title {{
+            flex: 1;
+            font-weight: 600;
+            color: #92400e;
+        }}
+        
+        .first-issue-toggle {{
+            color: #92400e;
+            font-size: 0.9rem;
+            transition: transform 0.2s;
+        }}
+        
+        .first-issue-callout.expanded .first-issue-toggle {{
+            transform: rotate(180deg);
+        }}
+        
+        .first-issue-content {{
+            display: none;
+            padding: 0 1.25rem 1.25rem;
+            border-top: 1px solid rgba(245, 158, 11, 0.3);
+        }}
+        
+        .first-issue-callout.expanded .first-issue-content {{
+            display: block;
+        }}
+        
+        .first-issue-time {{
+            font-size: 0.8rem;
+            color: #92400e;
+            margin-bottom: 0.5rem;
+        }}
+        
+        .first-issue-summary {{
+            font-weight: 600;
+            color: #78350f;
+            margin-bottom: 0.5rem;
+        }}
+        
+        .first-issue-category {{
+            font-size: 0.85rem;
+            color: #92400e;
+        }}
+        
+        .first-issue-badge {{
+            display: inline-block;
+            margin-top: 0.75rem;
+            padding: 0.25rem 0.75rem;
+            background: #dc2626;
+            color: white;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }}
+        
+        /* Collapsible Summary Blocks */
+        .summary-block.collapsible {{
+            margin-bottom: 1rem;
+        }}
+        
+        .summary-block.collapsed .summary-block-content {{
+            display: none;
+        }}
+        
+        .summary-block-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            padding: 0.5rem 0;
+        }}
+        
+        .summary-block-header:hover {{
+            opacity: 0.8;
+        }}
+        
+        .block-toggle {{
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            transition: transform 0.2s;
+        }}
+        
+        .summary-block.collapsed .block-toggle {{
+            transform: rotate(-90deg);
+        }}
+        
+        .summary-block-content {{
+            margin-top: 0.75rem;
+        }}
+        
+        /* Namespace List */
+        .namespace-list {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }}
+        
+        .namespace-item {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem 1rem;
+            background: white;
+            border-radius: 8px;
+            border-left: 3px solid var(--primary);
+        }}
+        
+        .namespace-name {{
+            font-weight: 500;
+            color: var(--text);
+        }}
+        
+        .namespace-count {{
+            background: #e2e8f0;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }}
+        
+        /* Healthy Components Grid */
+        .healthy-block {{
+            background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%) !important;
+            border: 1px solid #22c55e;
+        }}
+        
+        .healthy-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 0.75rem;
+        }}
+        
+        .healthy-item {{
+            display: flex;
+            align-items: flex-start;
+            gap: 0.5rem;
+            padding: 0.75rem;
+            background: white;
+            border-radius: 8px;
+        }}
+        
+        .healthy-icon {{
+            color: #22c55e;
+            font-weight: bold;
+        }}
+        
+        .healthy-info {{
+            flex: 1;
+        }}
+        
+        .healthy-name {{
+            font-weight: 600;
+            font-size: 0.9rem;
+            color: var(--text);
+        }}
+        
+        .healthy-message {{
+            font-size: 0.8rem;
+            color: var(--text-secondary);
         }}
         
         /* Findings Section */
@@ -3312,14 +3672,21 @@ class HTMLOutputFormatter(OutputFormatter):
             item.classList.toggle('expanded');
         }
         
+        function toggleSummaryBlock(header) {
+            const block = header.parentElement;
+            block.classList.toggle('collapsed');
+        }
+        
         function expandAll() {
             document.querySelectorAll('.section').forEach(s => s.classList.remove('collapsed'));
             document.querySelectorAll('.finding-item').forEach(f => f.classList.add('expanded'));
+            document.querySelectorAll('.summary-block.collapsible').forEach(b => b.classList.remove('collapsed'));
         }
         
         function collapseAll() {
             document.querySelectorAll('.section').forEach(s => s.classList.add('collapsed'));
             document.querySelectorAll('.finding-item').forEach(f => f.classList.remove('expanded'));
+            document.querySelectorAll('.summary-block.collapsible').forEach(b => b.classList.add('collapsed'));
         }
         
         function filterFindings() {

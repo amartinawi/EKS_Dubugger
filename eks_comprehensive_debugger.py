@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive EKS Debugging Tool v3.1.0
+Comprehensive EKS Debugging Tool v3.3.0
 
 A production-grade diagnostic tool for Amazon EKS cluster troubleshooting that provides
 systematic analysis of cluster health, workload issues, networking, storage, and control plane.
@@ -363,16 +363,21 @@ class IncrementalCache:
 
     def save(self, results: dict) -> None:
         try:
-            with open(self.cache_file, "w") as f:
-                json_module.dump(
-                    {
-                        "timestamp": time.time(),
-                        "cluster": self.cache_key,
-                        "results": results,
-                    },
-                    f,
-                    default=str,
-                )
+            fd = os.open(self.cache_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json_module.dump(
+                        {
+                            "timestamp": time.time(),
+                            "cluster": self.cache_key,
+                            "results": results,
+                        },
+                        f,
+                        default=str,
+                    )
+            except Exception:
+                os.close(fd)
+                raise
         except Exception:
             pass
 
@@ -412,6 +417,43 @@ class Thresholds:
     RESTART_CRITICAL = 10
     PENDING_POD_WARNING = 5
     PENDING_POD_CRITICAL = 10
+
+
+INPUT_VALIDATION_PATTERNS = {
+    "profile": re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$"),
+    "region": re.compile(r"^[a-z]{2}-[a-z]+-\d+$"),
+    "cluster_name": re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$"),
+    "namespace": re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"),
+    "kube_context": re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*$"),
+}
+
+
+def validate_input(name: str, value: str) -> str:
+    """Validate input parameter against safe pattern to prevent shell injection.
+
+    Args:
+        name: Parameter name (profile, region, cluster_name, namespace, kube_context)
+        value: Parameter value to validate
+
+    Returns:
+        The validated value (unchanged if valid)
+
+    Raises:
+        InputValidationError: If the value contains unsafe characters
+    """
+    if not value:
+        return value
+
+    if name not in INPUT_VALIDATION_PATTERNS:
+        raise InputValidationError(f"Unknown parameter: {name}")
+
+    pattern = INPUT_VALIDATION_PATTERNS[name]
+    if not pattern.match(value):
+        raise InputValidationError(
+            f"Invalid {name}: '{value}'. Contains characters that may be unsafe for shell commands."
+        )
+
+    return value
 
 
 def classify_severity(summary_text: str, details: Optional[dict] = None) -> str:
@@ -789,6 +831,12 @@ class KubectlNotAvailableError(EKSDebuggerError):
 
 class DateValidationError(EKSDebuggerError):
     """Invalid date format or range"""
+
+    pass
+
+
+class InputValidationError(EKSDebuggerError):
+    """Invalid or unsafe input parameter"""
 
     pass
 
@@ -4385,7 +4433,7 @@ class HTMLOutputFormatter(OutputFormatter):
 """
                 if corr.get("aws_doc"):
                     html += f"""
-                        <a href="{corr["aws_doc"]}" class="rec-link" target="_blank">
+                        <a href="{self._escape_html(corr["aws_doc"])}" class="rec-link" target="_blank">
                             📚 View AWS Documentation →
                         </a>
 """
@@ -4548,7 +4596,7 @@ class HTMLOutputFormatter(OutputFormatter):
 
                 if rec.get("aws_doc"):
                     html += f'''
-                        <a href="{rec["aws_doc"]}" class="rec-link" target="_blank">
+                        <a href="{self._escape_html(rec["aws_doc"])}" class="rec-link" target="_blank">
                             📚 View AWS Documentation →
                         </a>
 '''
@@ -4752,6 +4800,15 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             enable_cache: Enable API response caching (default: True)
             enable_incremental: Enable incremental analysis with delta reporting (default: True)
         """
+        validate_input("profile", profile)
+        validate_input("region", region)
+        if cluster_name:
+            validate_input("cluster_name", cluster_name)
+        if namespace:
+            validate_input("namespace", namespace)
+        if kube_context:
+            validate_input("kube_context", kube_context)
+
         self.profile = profile
         self.region = region
         self.cluster_name = cluster_name
@@ -4818,6 +4875,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         }
         self._shared_data_lock = __import__("threading").Lock()
 
+        # Thread-safe findings collection
+        self._findings_lock = __import__("threading").Lock()
+
         # Performance tracking for analysis methods
         self._perf_tracker = PerformanceTracker()
 
@@ -4828,8 +4888,15 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Validating AWS credentials...")
         try:
             identity = self.sts_client.get_caller_identity()
-            self.progress.info(f"Authenticated as: {identity['Arn']}")
-            self.progress.info(f"Account: {identity['Account']}")
+            # Mask sensitive data in logs for security
+            account_id = identity["Account"]
+            masked_account = f"****{account_id[-4:]}" if len(account_id) > 4 else "****"
+            arn = identity["Arn"]
+            # Extract just the role/user name from ARN for logging
+            arn_parts = arn.split("/")
+            masked_arn = arn_parts[-1] if len(arn_parts) > 1 else arn.split(":")[-1]
+            self.progress.info(f"Authenticated as: {masked_arn}")
+            self.progress.info(f"Account: {masked_account}")
             return True
         except Exception as e:
             raise AWSAuthenticationError(f"AWS authentication failed: {e}")
@@ -4921,8 +4988,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             return True
 
         try:
-            cmd = f"aws eks update-kubeconfig --name {self.cluster_name} --region {self.region} --profile {self.profile}"
-            result = subprocess.run(cmd, shell=True, check=True, capture_output=True, timeout=30)
+            cmd = [
+                "aws",
+                "eks",
+                "update-kubeconfig",
+                "--name",
+                self.cluster_name,
+                "--region",
+                self.region,
+                "--profile",
+                self.profile,
+            ]
+            result = subprocess.run(cmd, shell=False, check=True, capture_output=True, timeout=30)
             self.progress.info("kubeconfig updated")
             return True
 
@@ -5097,6 +5174,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             return None
         except subprocess.CalledProcessError as e:
             msg = f"kubectl command failed: {e.stderr if e.stderr else str(e)}"
+            if required:
+                raise EKSDebuggerError(msg)
+            self.progress.warning(msg)
+            return None
+        except FileNotFoundError:
+            msg = "kubectl not found in PATH"
             if required:
                 raise EKSDebuggerError(msg)
             self.progress.warning(msg)
@@ -5303,18 +5386,21 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
     ) -> bool:
         """Add finding to appropriate category with finding type classification.
 
+        Thread-safe: uses _findings_lock to protect concurrent access.
+
         Returns:
             True if finding was added, False if limit was reached.
         """
-        if category not in self.findings:
-            self.findings[category] = []
-        if len(self.findings[category]) >= self.max_findings:
-            return False
-        if details is None:
-            details = {}
-        details["finding_type"] = finding_type
-        self.findings[category].append({"summary": summary, "details": details})
-        return True
+        with self._findings_lock:
+            if category not in self.findings:
+                self.findings[category] = []
+            if len(self.findings[category]) >= self.max_findings:
+                return False
+            if details is None:
+                details = {}
+            details["finding_type"] = finding_type
+            self.findings[category].append({"summary": summary, "details": details})
+            return True
 
     def _classify_severity(self, summary_text: str, details: Optional[dict]) -> str:
         """Classify finding severity based on content (delegates to module-level function)."""
@@ -13295,8 +13381,13 @@ def output_results(results, cluster_name: str, timezone_name: str = "UTC"):
 
     try:
         html_output = html_formatter.format(results)
-        with open(html_file, "w") as f:
-            f.write(html_output)
+        fd = os.open(html_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(html_output)
+        except Exception:
+            os.close(fd)
+            raise
         print(f"✓ HTML Report:     {html_file}")
     except Exception as e:
         print(f"✗ Failed to write HTML report: {e}", file=sys.stderr)
@@ -13304,8 +13395,13 @@ def output_results(results, cluster_name: str, timezone_name: str = "UTC"):
 
     try:
         json_output = llm_formatter.format(results)
-        with open(json_file, "w") as f:
-            f.write(json_output)
+        fd = os.open(json_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json_output)
+        except Exception:
+            os.close(fd)
+            raise
         print(f"✓ LLM JSON Report: {json_file}")
     except Exception as e:
         print(f"✗ Failed to write JSON report: {e}", file=sys.stderr)

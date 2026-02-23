@@ -7,7 +7,7 @@
 
 A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 3.1.0 | **Analysis Methods:** 56 | **Catalog Coverage:** 100%
+**Version:** 3.3.0 | **Analysis Methods:** 56 | **Catalog Coverage:** 100%
 
 ---
 
@@ -91,6 +91,13 @@ Each finding is classified as either:
 - Timeline of events by hour
 - First issue detection (potential root cause)
 - Cascading failure analysis
+
+### Performance Optimizations (v3.3.0)
+- **Parallel Analysis** - 56 methods run concurrently using ThreadPoolExecutor
+- **Shared Data Pre-fetching** - CloudWatch log groups and kubectl data fetched once
+- **API Response Caching** - TTL-based cache for AWS API calls (5-minute default)
+- **kubectl Output Caching** - Reuses kubectl command results across methods
+- **Performance Metrics** - Reports slowest methods and cache statistics
 
 ### Automatic Report Generation
 - **HTML Report** - Interactive dashboard with sidebar navigation, search, and filtering

@@ -167,18 +167,235 @@ import html
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as date_parser
+from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+import hashlib
+import os
+import json as json_module
 import pytz
 
-VERSION = "3.1.0"
+VERSION = "3.3.0"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
 MAX_API_RETRIES = 3
 RETRY_DELAY_SECONDS = 1
-MAX_LOG_STREAMS = 50  # Increased from 5, now supports pagination
-MAX_EVENTS_PER_STREAM = 100  # Increased from 50
+MAX_LOG_STREAMS = 50
+MAX_EVENTS_PER_STREAM = 100
 MAX_CONSOLE_DISPLAY = 10
 MAX_HTML_DISPLAY = 50
 DATE_RANGE_WARNING_DAYS = 7
+MAX_FINDINGS_PER_CATEGORY = 500
+MAX_PARALLEL_WORKERS = 8
+API_CACHE_TTL_SECONDS = 300
+CACHE_DIR = os.path.expanduser("~/.eks-debugger-cache")
+
+
+class PerformanceTracker:
+    """Track and report performance metrics for analysis methods."""
+
+    def __init__(self):
+        self._timings: dict[str, list[float]] = {}
+        self._lock = __import__("threading").Lock()
+
+    def record(self, method_name: str, duration: float) -> None:
+        """Record execution time for a method."""
+        with self._lock:
+            if method_name not in self._timings:
+                self._timings[method_name] = []
+            self._timings[method_name].append(duration)
+
+    def get_summary(self) -> dict[str, dict]:
+        """Get summary statistics for all tracked methods."""
+        summary = {}
+        with self._lock:
+            for method, times in self._timings.items():
+                if times:
+                    summary[method] = {
+                        "calls": len(times),
+                        "total": sum(times),
+                        "avg": sum(times) / len(times),
+                        "min": min(times),
+                        "max": max(times),
+                    }
+        return summary
+
+    def get_slowest(self, limit: int = 10) -> list[tuple[str, float]]:
+        """Get the slowest methods by total time."""
+        summary = self.get_summary()
+        sorted_methods = sorted(summary.items(), key=lambda x: x[1]["total"], reverse=True)
+        return [(m, s["total"]) for m, s in sorted_methods[:limit]]
+
+
+class APICache:
+    """Thread-safe API response cache with TTL support."""
+
+    def __init__(self, ttl_seconds: int = API_CACHE_TTL_SECONDS):
+        self._cache: dict = {}
+        self._ttl = ttl_seconds
+        self._lock = __import__("threading").Lock()
+
+    def get(self, key: str) -> Optional[tuple]:
+        with self._lock:
+            if key in self._cache:
+                data, timestamp = self._cache[key]
+                if time.time() - timestamp < self._ttl:
+                    return data
+                del self._cache[key]
+        return None
+
+    def set(self, key: str, data: tuple) -> None:
+        with self._lock:
+            self._cache[key] = (data, time.time())
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+    @staticmethod
+    def make_key(func_name: str, *args, **kwargs) -> str:
+        key_parts = [func_name, repr(args), repr(sorted(kwargs.items()))]
+        key_str = "|".join(key_parts)
+        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+
+class TimezoneManager:
+    """Centralized timezone handling for consistent datetime operations."""
+
+    UTC = timezone.utc
+
+    @staticmethod
+    def ensure_utc(dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=TimezoneManager.UTC)
+        return dt.astimezone(TimezoneManager.UTC)
+
+    @staticmethod
+    def now_utc() -> datetime:
+        return datetime.now(TimezoneManager.UTC)
+
+    @staticmethod
+    def parse_iso_utc(iso_str: str) -> Optional[datetime]:
+        try:
+            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+            return TimezoneManager.ensure_utc(dt)
+        except (ValueError, AttributeError):
+            return None
+
+    @staticmethod
+    def to_iso_string(dt: datetime) -> str:
+        utc_dt = TimezoneManager.ensure_utc(dt)
+        return utc_dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+
+
+class ConfigLoader:
+    """Load configuration from YAML/JSON files with environment variable support."""
+
+    @staticmethod
+    def load(config_path: Optional[str] = None) -> dict:
+        config = {}
+        if config_path and os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                content = f.read()
+                if config_path.endswith((".yaml", ".yml")):
+                    try:
+                        import yaml
+
+                        config = yaml.safe_load(content) or {}
+                    except ImportError:
+                        pass
+                elif config_path.endswith(".json"):
+                    config = json_module.loads(content)
+        config.update(ConfigLoader._load_from_env())
+        return config
+
+    @staticmethod
+    def _load_from_env() -> dict:
+        env_mapping = {
+            "EKS_DEBUGGER_PROFILE": "profile",
+            "EKS_DEBUGGER_REGION": "region",
+            "EKS_DEBUGGER_CLUSTER": "cluster_name",
+            "EKS_DEBUGGER_NAMESPACE": "namespace",
+            "EKS_DEBUGGER_DAYS": "days",
+            "EKS_DEBUGGER_OUTPUT_FORMAT": "output_format",
+            "EKS_DEBUGGER_OUTPUT_FILE": "output_file",
+            "EKS_DEBUGGER_VERBOSE": "verbose",
+            "EKS_DEBUGGER_QUIET": "quiet",
+            "EKS_DEBUGGER_KUBE_CONTEXT": "kube_context",
+            "EKS_DEBUGGER_TIMEZONE": "timezone",
+            "EKS_DEBUGGER_PARALLEL": "parallel",
+            "EKS_DEBUGGER_MAX_FINDINGS": "max_findings",
+        }
+        config = {}
+        for env_var, config_key in env_mapping.items():
+            value = os.environ.get(env_var)
+            if value:
+                if config_key in ("verbose", "quiet", "parallel"):
+                    config[config_key] = value.lower() in ("true", "1", "yes")
+                elif config_key in ("days", "max_findings"):
+                    try:
+                        config[config_key] = int(value)
+                    except ValueError:
+                        pass
+                else:
+                    config[config_key] = value
+        return config
+
+
+class IncrementalCache:
+    """Cache for incremental analysis - stores previous results for delta reporting."""
+
+    def __init__(self, cluster_name: str, region: str):
+        self.cache_key = f"{cluster_name}-{region}"
+        self.cache_file = os.path.join(CACHE_DIR, f"{self.cache_key}.json")
+        os.makedirs(CACHE_DIR, exist_ok=True)
+
+    def load_previous(self) -> Optional[dict]:
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, "r") as f:
+                    data = json_module.load(f)
+                    if time.time() - data.get("timestamp", 0) < 86400:
+                        return data.get("results")
+            except (json_module.JSONDecodeError, KeyError):
+                pass
+        return None
+
+    def save(self, results: dict) -> None:
+        try:
+            with open(self.cache_file, "w") as f:
+                json_module.dump(
+                    {
+                        "timestamp": time.time(),
+                        "cluster": self.cache_key,
+                        "results": results,
+                    },
+                    f,
+                    default=str,
+                )
+        except Exception:
+            pass
+
+    def compute_delta(self, current: dict, previous: Optional[dict]) -> dict:
+        if not previous:
+            return {"is_first_run": True, "new_issues": 0, "resolved_issues": 0}
+        current_summaries = set()
+        for items in current.get("findings", {}).values():
+            for item in items:
+                current_summaries.add(item.get("summary", ""))
+        previous_summaries = set()
+        for items in previous.get("findings", {}).values():
+            for item in items:
+                previous_summaries.add(item.get("summary", ""))
+        new = current_summaries - previous_summaries
+        resolved = previous_summaries - current_summaries
+        return {
+            "is_first_run": False,
+            "new_issues": len(new),
+            "resolved_issues": len(resolved),
+            "new_issue_examples": list(new)[:10],
+            "resolved_issue_examples": list(resolved)[:10],
+        }
 
 
 class Thresholds:
@@ -195,6 +412,60 @@ class Thresholds:
     RESTART_CRITICAL = 10
     PENDING_POD_WARNING = 5
     PENDING_POD_CRITICAL = 10
+
+
+def classify_severity(summary_text: str, details: Optional[dict] = None) -> str:
+    """Classify finding severity based on content.
+
+    Module-level function used by ExecutiveSummaryGenerator, HTMLOutputFormatter,
+    and ComprehensiveEKSDebugger to ensure consistent severity classification.
+
+    Args:
+        summary_text: The summary text to classify
+        details: Optional details dict that may contain explicit severity
+
+    Returns:
+        "critical", "warning", or "info"
+    """
+    if details and isinstance(details, dict):
+        explicit_severity = details.get("severity")
+        if explicit_severity in ("critical", "warning", "info"):
+            return explicit_severity
+
+    summary_lower = summary_text.lower()
+
+    critical_keywords = [
+        "oom",
+        "killed",
+        "crash",
+        "critical",
+        "down",
+        "unhealthy",
+    ]
+    warning_keywords = [
+        "warning",
+        "warn",
+        "degraded",
+        "pressure",
+        "evicted",
+        "pending",
+        "timeout",
+        "error",
+        "failed",
+    ]
+    info_keywords = ["info", "notice", "fallback", "network not ready"]
+
+    for kw in critical_keywords:
+        if kw in summary_lower:
+            return "critical"
+    for kw in warning_keywords:
+        if kw in summary_lower:
+            return "warning"
+    for kw in info_keywords:
+        if kw in summary_lower:
+            return "info"
+
+    return "info"
 
 
 class FindingType:
@@ -626,191 +897,6 @@ class OutputFormatter:
         raise NotImplementedError
 
 
-class ConsoleOutputFormatter(OutputFormatter):
-    """Human-readable console output with colors"""
-
-    def format(self, results):
-        """Format results for console output"""
-        output = []
-
-        # Header
-        output.append("=" * 70)
-        output.append("COMPREHENSIVE EKS CLUSTER ANALYSIS REPORT")
-        output.append("=" * 70)
-        output.append(f"Cluster:    {results['metadata']['cluster']}")
-        output.append(f"Region:     {results['metadata']['region']}")
-        output.append(f"Analysis:   {results['metadata']['analysis_date']}")
-        output.append(
-            f"Date Range: {results['metadata']['date_range']['start']} to {results['metadata']['date_range']['end']}"
-        )
-        output.append("=" * 70)
-
-        # Summary
-        output.append("\n📊 SUMMARY")
-        output.append("-" * 70)
-        output.append(f"Total Issues Found: {results['summary']['total_issues']}")
-        output.append(f"  Critical: {results['summary']['critical']}")
-        output.append(f"  Warning:  {results['summary']['warning']}")
-
-        if results["summary"]["categories"]:
-            output.append(f"\nIssue Categories: {', '.join(results['summary']['categories'])}")
-
-        # Detailed findings by category
-        if results.get("findings"):
-            output.append("\n\n🔍 DETAILED FINDINGS")
-            output.append("=" * 70)
-
-            for category, items in results["findings"].items():
-                if items:
-                    category_title = category.replace("_", " ").title()
-                    output.append(f"\n{category_title} ({len(items)} items)")
-                    output.append("-" * 70)
-
-                    for idx, item in enumerate(items[:10], 1):  # Show first 10
-                        output.append(f"\n  {idx}. {item.get('summary', 'N/A')}")
-                        if item.get("details"):
-                            for key, value in item["details"].items():
-                                output.append(f"     {key}: {value}")
-
-                    if len(items) > 10:
-                        output.append(f"\n  ... and {len(items) - 10} more")
-
-        # Recommendations
-        if results.get("recommendations"):
-            output.append("\n\n💡 RECOMMENDATIONS")
-            output.append("=" * 70)
-            for idx, rec in enumerate(results["recommendations"], 1):
-                output.append(f"\n{idx}. {rec['title']}")
-                output.append(f"   Category: {rec['category']}")
-                output.append(f"   Priority: {rec['priority']}")
-                output.append(f"   Action: {rec['action']}")
-                if rec.get("aws_doc"):
-                    output.append(f"   AWS Doc: {rec['aws_doc']}")
-
-        # Errors
-        if results.get("errors"):
-            output.append("\n\n⚠️  ANALYSIS ERRORS")
-            output.append("=" * 70)
-            for error in results["errors"]:
-                output.append(f"  • {error['step']}: {error['message']}")
-
-        # Footer
-        output.append("\n" + "=" * 70)
-        output.append(f"✓ Analysis completed at {results['metadata']['analysis_date']}")
-        output.append("=" * 70)
-
-        return "\n".join(output)
-
-
-class JSONOutputFormatter(OutputFormatter):
-    """JSON output for automation"""
-
-    def format(self, results):
-        """Format results as JSON"""
-        return json.dumps(results, indent=2, default=str)
-
-
-class MarkdownOutputFormatter(OutputFormatter):
-    """Markdown output for reports"""
-
-    def format(self, results):
-        """Format results as Markdown"""
-        output = []
-
-        # Header
-        output.append("# EKS Cluster Analysis Report\n")
-        output.append(f"**Cluster:** {results['metadata']['cluster']}")
-        output.append(f"**Region:** {results['metadata']['region']}")
-        output.append(f"**Analysis Date:** {results['metadata']['analysis_date']}")
-        output.append(
-            f"**Date Range:** {results['metadata']['date_range']['start']} to {results['metadata']['date_range']['end']}\n"
-        )
-
-        # Summary
-        output.append("## Executive Summary\n")
-        output.append(f"- **Total Issues:** {results['summary']['total_issues']}")
-        output.append(f"- **Critical:** {results['summary']['critical']}")
-        output.append(f"- **Warning:** {results['summary']['warning']}")
-
-        if results["summary"]["categories"]:
-            output.append(f"- **Categories:** {', '.join(results['summary']['categories'])}\n")
-
-        # Detailed findings
-        if results.get("findings"):
-            output.append("## Detailed Findings\n")
-
-            for category, items in results["findings"].items():
-                if items:
-                    category_title = category.replace("_", " ").title()
-                    output.append(f"### {category_title} ({len(items)} instances)\n")
-
-                    for idx, item in enumerate(items, 1):
-                        output.append(f"{idx}. **{item.get('summary', 'N/A')}**")
-                        if item.get("details"):
-                            for key, value in item["details"].items():
-                                output.append(f"   - {key}: `{value}`")
-                        output.append("")
-
-        # Recommendations
-        if results.get("recommendations"):
-            output.append("## Recommendations\n")
-            for idx, rec in enumerate(results["recommendations"], 1):
-                output.append(f"### {idx}. {rec['title']}")
-                output.append(f"- **Category:** {rec['category']}")
-                output.append(f"- **Priority:** {rec['priority']}")
-                output.append(f"- **Action:** {rec['action']}")
-                if rec.get("aws_doc"):
-                    output.append(f"- **AWS Documentation:** [{rec['aws_doc']}]({rec['aws_doc']})")
-                output.append("")
-
-        # Errors
-        if results.get("errors"):
-            output.append("## Analysis Errors\n")
-            for error in results["errors"]:
-                output.append(f"- **{error['step']}:** {error['message']}")
-
-        # Footer
-        output.append(f"\n---\n*Generated with EKS Comprehensive Debugger v{VERSION}*")
-
-        return "\n".join(output)
-
-
-class YAMLOutputFormatter(OutputFormatter):
-    """YAML output for GitOps workflows"""
-
-    def format(self, results):
-        """Format results as YAML"""
-        try:
-            import yaml
-
-            return yaml.dump(results, default_flow_style=False, sort_keys=False)
-        except ImportError:
-            # Fallback to simple YAML-like formatting if pyyaml not available
-            return self._simple_yaml_format(results)
-
-    def _simple_yaml_format(self, obj, indent=0):
-        """Simple YAML-like formatting without pyyaml"""
-        output = []
-        indent_str = "  " * indent
-
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if isinstance(value, (dict, list)):
-                    output.append(f"{indent_str}{key}:")
-                    output.append(self._simple_yaml_format(value, indent + 1))
-                else:
-                    output.append(f"{indent_str}{key}: {value}")
-        elif isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, (dict, list)):
-                    output.append(f"{indent_str}-")
-                    output.append(self._simple_yaml_format(item, indent + 1))
-                else:
-                    output.append(f"{indent_str}- {item}")
-
-        return "\n".join(output)
-
-
 class LLMJSONOutputFormatter(OutputFormatter):
     """LLM-optimized JSON output for AI analysis"""
 
@@ -1089,7 +1175,7 @@ class ExecutiveSummaryGenerator:
 
         return all_findings[:limit]
 
-    def _analyze_root_causes(self, correlations: list, first_issue: dict | None) -> dict:
+    def _analyze_root_causes(self, correlations: list, first_issue: Optional[dict]) -> dict:
         """Analyze root causes from correlations and first issue"""
         root_causes = []
 
@@ -1168,7 +1254,7 @@ class ExecutiveSummaryGenerator:
             "trend": trend,
         }
 
-    def _calculate_trend(self, timeline: list) -> dict | None:
+    def _calculate_trend(self, timeline: list) -> Optional[dict]:
         """
         Calculate trend from last 2 time buckets.
 
@@ -1410,7 +1496,7 @@ class ExecutiveSummaryGenerator:
         return actions[:10]  # Top 10 actions
 
     def _generate_correlation_narrative(
-        self, correlations: list, first_issue: dict | None, findings: dict
+        self, correlations: list, first_issue: Optional[dict], findings: dict
     ) -> dict:
         """
         Generate a human-readable narrative from correlations (Phase 3 - #5).
@@ -1813,87 +1899,23 @@ class ExecutiveSummaryGenerator:
         return breakdown
 
     def _classify_severity(self, summary_text: str) -> str:
-        """Classify severity from summary text"""
-        summary_lower = summary_text.lower()
-
-        critical_keywords = ["oom", "killed", "crash", "critical", "down", "unhealthy", "notready"]
-        warning_keywords = [
-            "warning",
-            "warn",
-            "degraded",
-            "pressure",
-            "evicted",
-            "pending",
-            "timeout",
-            "error",
-            "failed",
-        ]
-        info_keywords = ["info", "notice", "fallback"]
-
-        for kw in critical_keywords:
-            if kw in summary_lower:
-                return "critical"
-        for kw in warning_keywords:
-            if kw in summary_lower:
-                return "warning"
-        for kw in info_keywords:
-            if kw in summary_lower:
-                return "info"
-
-        return "info"
+        """Classify severity from summary text (delegates to module-level function)."""
+        return classify_severity(summary_text)
 
 
 class HTMLOutputFormatter(OutputFormatter):
     """Modern HTML output with interactive features"""
 
     @staticmethod
-    def _escape_html(text: str | None) -> str:
+    def _escape_html(text: Optional[str]) -> str:
         """Escape HTML special characters to prevent XSS attacks"""
         if text is None:
             return ""
         return html.escape(str(text))
 
     def _classify_severity(self, summary_text, details):
-        """Classify finding severity based on content"""
-        if details and isinstance(details, dict):
-            explicit_severity = details.get("severity")
-            if explicit_severity in ("critical", "warning", "info"):
-                return explicit_severity
-
-        summary_lower = summary_text.lower()
-
-        critical_keywords = [
-            "oom",
-            "killed",
-            "crash",
-            "critical",
-            "down",
-            "unhealthy",
-        ]
-        warning_keywords = [
-            "warning",
-            "warn",
-            "degraded",
-            "pressure",
-            "evicted",
-            "pending",
-            "timeout",
-            "error",
-            "failed",
-        ]
-        info_keywords = ["info", "notice", "fallback", "network not ready"]
-
-        for kw in critical_keywords:
-            if kw in summary_lower:
-                return "critical"
-        for kw in warning_keywords:
-            if kw in summary_lower:
-                return "warning"
-        for kw in info_keywords:
-            if kw in summary_lower:
-                return "info"
-
-        return "info"
+        """Classify finding severity based on content (delegates to module-level function)."""
+        return classify_severity(summary_text, details)
 
     def _get_source_icon(self, details):
         """Get data source indicator"""
@@ -4354,12 +4376,12 @@ class HTMLOutputFormatter(OutputFormatter):
                 html += f"""
                     <div class="correlation-card {corr.get("severity", "warning")}">
                         <div class="corr-header">
-                            <div class="corr-title">🔍 {corr["root_cause"]}</div>
+                            <div class="corr-title">🔍 {self._escape_html(corr.get("root_cause", ""))}</div>
                             <span class="severity-badge {corr.get("severity", "warning")}">{corr.get("severity", "warning")}</span>
                         </div>
-                        <div class="corr-time">⏰ First detected: {corr.get("root_cause_time", "Unknown")}</div>
-                        <div class="corr-impact">📊 Impact: {corr["impact"]}</div>
-                        <div class="corr-recommendation">💡 Recommendation: {corr["recommendation"]}</div>
+                        <div class="corr-time">⏰ First detected: {self._escape_html(corr.get("root_cause_time", "Unknown"))}</div>
+                        <div class="corr-impact">📊 Impact: {self._escape_html(corr.get("impact", ""))}</div>
+                        <div class="corr-recommendation">💡 Recommendation: {self._escape_html(corr.get("recommendation", ""))}</div>
 """
                 if corr.get("aws_doc"):
                     html += f"""
@@ -4725,6 +4747,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             namespace: Kubernetes namespace filter (optional)
             progress: ProgressTracker instance
             kube_context: Kubernetes context name (optional, skips kubeconfig update if provided)
+            parallel: Enable parallel analysis (default: True)
+            max_findings: Maximum findings per category (default: MAX_FINDINGS_PER_CATEGORY)
+            enable_cache: Enable API response caching (default: True)
+            enable_incremental: Enable incremental analysis with delta reporting (default: True)
         """
         self.profile = profile
         self.region = region
@@ -4736,6 +4762,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.namespace = namespace
         self.progress = progress or ProgressTracker()
         self.kube_context = kube_context
+        self.parallel = True
+        self.max_findings = MAX_FINDINGS_PER_CATEGORY
+        self.enable_cache = True
+        self.enable_incremental = True
+
+        # API response cache
+        self._api_cache = APICache(ttl_seconds=API_CACHE_TTL_SECONDS)
 
         # AWS clients
         try:
@@ -4771,6 +4804,22 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.correlations = []
         self.timeline = []
         self.first_issue = None
+        self._incremental_cache: Optional[IncrementalCache] = None
+        self._previous_results: Optional[dict] = None
+        self.delta_report: Optional[dict] = None
+
+        # Pre-fetched shared data for performance (populated before parallel analysis)
+        self._shared_data: dict = {
+            "log_groups": {},  # log_group_prefix -> logGroups response
+            "log_streams": {},  # (log_group_name, limit) -> logStreams response
+            "kubectl_cache": {},  # cmd -> output
+            "node_info": None,  # kubectl get nodes output
+            "pod_info": None,  # kubectl get pods output
+        }
+        self._shared_data_lock = __import__("threading").Lock()
+
+        # Performance tracking for analysis methods
+        self._perf_tracker = PerformanceTracker()
 
     # === AWS Validation Methods (Reused from existing) ===
 
@@ -4884,13 +4933,146 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except FileNotFoundError:
             raise KubectlNotAvailableError("kubectl not found in PATH")
 
+    def _prefetch_shared_data(self):
+        """Pre-fetch commonly used data before parallel analysis for performance.
+
+        This method runs once before parallel analysis starts, fetching:
+        - CloudWatch log groups for the cluster
+        - Common kubectl outputs (nodes, pods)
+        - Shared data that multiple analysis methods need
+
+        This reduces redundant API calls when multiple methods need the same data.
+        """
+        self.progress.step("Pre-fetching shared data for performance...")
+        start_time = time.time()
+
+        # 1. Pre-fetch CloudWatch log groups
+        log_group_prefixes = [
+            f"/aws/eks/{self.cluster_name}/cluster",
+            f"/aws/containerinsights/{self.cluster_name}/application",
+            f"/aws/containerinsights/{self.cluster_name}/dataplane",
+            f"/aws/containerinsights/{self.cluster_name}/host",
+            f"/aws/containerinsights/{self.cluster_name}/performance",
+        ]
+
+        for prefix in log_group_prefixes:
+            success, response = self.safe_api_call(
+                self.logs_client.describe_log_groups,
+                logGroupNamePrefix=prefix,
+                use_cache=True,
+            )
+            if success:
+                with self._shared_data_lock:
+                    self._shared_data["log_groups"][prefix] = response
+
+        # 2. Pre-fetch kubectl data (nodes and pods)
+        # These are used by multiple analysis methods
+        try:
+            nodes_output = self.safe_kubectl_call("kubectl get nodes -o json")
+            if nodes_output:
+                with self._shared_data_lock:
+                    self._shared_data["kubectl_cache"]["kubectl get nodes -o json"] = nodes_output
+                    try:
+                        self._shared_data["node_info"] = json.loads(nodes_output)
+                    except json.JSONDecodeError:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            if self.namespace:
+                pods_cmd = f"kubectl get pods -n {self.namespace} -o json"
+            else:
+                pods_cmd = "kubectl get pods --all-namespaces -o json"
+            pods_output = self.safe_kubectl_call(pods_cmd)
+            if pods_output:
+                with self._shared_data_lock:
+                    self._shared_data["kubectl_cache"][pods_cmd] = pods_output
+                    try:
+                        self._shared_data["pod_info"] = json.loads(pods_output)
+                    except json.JSONDecodeError:
+                        pass
+        except Exception:
+            pass
+
+        elapsed = time.time() - start_time
+        cache_stats = f"{len(self._shared_data['log_groups'])} log groups"
+        if self._shared_data["node_info"]:
+            cache_stats += f", {len(self._shared_data['node_info'].get('items', []))} nodes"
+        if self._shared_data["pod_info"]:
+            cache_stats += f", {len(self._shared_data['pod_info'].get('items', []))} pods"
+        self.progress.info(f"Pre-fetched {cache_stats} in {elapsed:.1f}s")
+
+    def _get_cached_log_group(self, prefix: str) -> Optional[dict]:
+        """Get cached log group data or fetch if not cached.
+
+        Args:
+            prefix: Log group name prefix
+
+        Returns:
+            Log groups response dict or None
+        """
+        with self._shared_data_lock:
+            if prefix in self._shared_data["log_groups"]:
+                return self._shared_data["log_groups"][prefix]
+
+        # Not cached, fetch now
+        success, response = self.safe_api_call(
+            self.logs_client.describe_log_groups,
+            logGroupNamePrefix=prefix,
+            use_cache=True,
+        )
+        if success:
+            with self._shared_data_lock:
+                self._shared_data["log_groups"][prefix] = response
+            return response
+        return None
+
+    def _get_cached_kubectl(self, cmd: str) -> Optional[str]:
+        """Get cached kubectl output or execute if not cached.
+
+        Args:
+            cmd: kubectl command string
+
+        Returns:
+            Command output or None
+        """
+        with self._shared_data_lock:
+            if cmd in self._shared_data["kubectl_cache"]:
+                return self._shared_data["kubectl_cache"][cmd]
+
+        # Not cached, execute now
+        output = self.safe_kubectl_call(cmd)
+        if output:
+            with self._shared_data_lock:
+                self._shared_data["kubectl_cache"][cmd] = output
+        return output
+
     # === Helper Methods ===
 
-    def get_kubectl_output(self, cmd, timeout=DEFAULT_TIMEOUT, required=False):
-        """Run kubectl command with error handling"""
+    def get_kubectl_output(
+        self, cmd, timeout=DEFAULT_TIMEOUT, required=False, use_cache: bool = True
+    ):
+        """Run kubectl command with error handling and optional caching.
+
+        Args:
+            cmd: kubectl command to run
+            timeout: Timeout in seconds
+            required: If True, raises exception on failure
+            use_cache: If True, uses shared data cache (default: True)
+
+        Returns:
+            Command output string or None on failure
+        """
         # Add context flag if custom context is set
         if self.kube_context:
             cmd = f"{cmd} --context {self.kube_context}"
+
+        # Check cache first
+        if use_cache:
+            with self._shared_data_lock:
+                if cmd in self._shared_data["kubectl_cache"]:
+                    return self._shared_data["kubectl_cache"][cmd]
 
         try:
             result = subprocess.run(
@@ -4901,7 +5083,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 check=True,
                 timeout=timeout,
             )
-            return result.stdout
+            output = result.stdout
+            # Cache successful result
+            if use_cache and output:
+                with self._shared_data_lock:
+                    self._shared_data["kubectl_cache"][cmd] = output
+            return output
         except subprocess.TimeoutExpired:
             msg = f"kubectl command timed out: {cmd}"
             if required:
@@ -4915,12 +5102,27 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.warning(msg)
             return None
 
-    def safe_api_call(self, func, *args, **kwargs):
+    def safe_api_call(self, func, *args, use_cache: bool = True, **kwargs):
         """
-        Safely call AWS API with retry logic
+        Safely call AWS API with retry logic and optional caching.
+
+        Args:
+            func: The API function to call
+            *args: Positional arguments for the function
+            use_cache: Whether to use caching (default: True)
+            **kwargs: Keyword arguments for the function
 
         Returns: (success: bool, result: Any)
         """
+        cache_key = ""
+        if use_cache and self.enable_cache:
+            cache_key = APICache.make_key(
+                func.__name__ if hasattr(func, "__name__") else str(func), *args, **kwargs
+            )
+            cached = self._api_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         max_retries = 3
         retry_delay = 1
         last_error = None
@@ -4928,7 +5130,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         for attempt in range(max_retries):
             try:
                 result = func(*args, **kwargs)
-                return True, result
+                outcome = (True, result)
+                if use_cache and self.enable_cache and cache_key:
+                    self._api_cache.set(cache_key, outcome)
+                return outcome
             except Exception as e:
                 last_error = e
                 if attempt < max_retries - 1:
@@ -5071,7 +5276,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
         return f"kubectl get events --all-namespaces --field-selector reason={reason} -o json"
 
-    def _get_filtered_events(self, reason: str) -> dict | None:
+    def _get_filtered_events(self, reason: str) -> Optional[dict]:
         """Execute kubectl command and filter events by date."""
         cmd = self._build_kubectl_events_cmd(reason)
         output = self.safe_kubectl_call(cmd)
@@ -5093,56 +5298,27 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self,
         category: str,
         summary: str,
-        details: dict | None = None,
+        details: Optional[dict] = None,
         finding_type: str = FindingType.CURRENT_STATE,
-    ) -> None:
-        """Add finding to appropriate category with finding type classification."""
+    ) -> bool:
+        """Add finding to appropriate category with finding type classification.
+
+        Returns:
+            True if finding was added, False if limit was reached.
+        """
+        if category not in self.findings:
+            self.findings[category] = []
+        if len(self.findings[category]) >= self.max_findings:
+            return False
         if details is None:
             details = {}
         details["finding_type"] = finding_type
         self.findings[category].append({"summary": summary, "details": details})
+        return True
 
-    def _classify_severity(self, summary_text: str, details: dict | None) -> str:
-        """Classify finding severity based on content."""
-        if details and isinstance(details, dict):
-            explicit_severity = details.get("severity")
-            if explicit_severity in ("critical", "warning", "info"):
-                return explicit_severity
-
-        summary_lower = summary_text.lower()
-
-        critical_keywords = [
-            "oom",
-            "killed",
-            "crash",
-            "critical",
-            "down",
-            "unhealthy",
-        ]
-        warning_keywords = [
-            "warning",
-            "warn",
-            "degraded",
-            "pressure",
-            "evicted",
-            "pending",
-            "timeout",
-            "error",
-            "failed",
-        ]
-        info_keywords = ["info", "notice", "fallback", "network not ready"]
-
-        for kw in critical_keywords:
-            if kw in summary_lower:
-                return "critical"
-        for kw in warning_keywords:
-            if kw in summary_lower:
-                return "warning"
-        for kw in info_keywords:
-            if kw in summary_lower:
-                return "info"
-
-        return "info"
+    def _classify_severity(self, summary_text: str, details: Optional[dict]) -> str:
+        """Classify finding severity based on content (delegates to module-level function)."""
+        return classify_severity(summary_text, details)
 
     # === Existing Analysis Methods (Enhanced with date filtering) ===
 
@@ -5587,15 +5763,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Checking CloudWatch logging health...")
 
         try:
-            # 1. Check control plane logging
+            # 1. Check control plane logging (use cached data if available)
             control_plane_log_group = f"/aws/eks/{self.cluster_name}/cluster"
-            success, response = self.safe_api_call(
-                self.logs_client.describe_log_groups,
-                logGroupNamePrefix=control_plane_log_group,
-            )
+            response = self._get_cached_log_group(control_plane_log_group)
 
             control_plane_enabled = False
-            if success and response.get("logGroups"):
+            if response and response.get("logGroups"):
                 log_group = response["logGroups"][0]
                 retention = log_group.get("retentionInDays", -1)
                 success, streams = self.safe_api_call(
@@ -5632,16 +5805,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     }
                 )
 
-            # 2. Check Container Insights application logs
+            # 2. Check Container Insights application logs (use cached data if available)
             app_log_group = f"/aws/containerinsights/{self.cluster_name}/application"
-            success, response = self.safe_api_call(
-                self.logs_client.describe_log_groups, logGroupNamePrefix=app_log_group
-            )
+            response = self._get_cached_log_group(app_log_group)
 
             container_logs_enabled = False
             fluentbit_healthy = False
 
-            if success and response.get("logGroups"):
+            if response and response.get("logGroups"):
                 container_logs_enabled = True
 
             # Check FluentBit/CloudWatch agent DaemonSet
@@ -5827,11 +5998,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         log_group = f"/aws/eks/{self.cluster_name}/cluster"
 
         try:
-            success, response = self.safe_api_call(
-                self.logs_client.describe_log_groups, logGroupNamePrefix=log_group
-            )
+            # Use cached log group data if available
+            response = self._get_cached_log_group(log_group)
 
-            if not success or not response.get("logGroups"):
+            if not response or not response.get("logGroups"):
                 self.progress.info(
                     f"Control plane logging not enabled for cluster {self.cluster_name}"
                 )
@@ -12156,9 +12326,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         """
         Run all 56 analysis methods with graceful degradation.
 
-        Executes all analysis methods in sequence, catching exceptions from
-        individual methods to ensure the full analysis completes even if
-        some methods fail.
+        Supports parallel execution for improved performance and incremental
+        analysis with delta reporting when enabled.
 
         Returns:
             dict: Analysis results containing:
@@ -12170,6 +12339,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 - first_issue: Earliest detected issue
                 - recommendations: Evidence-based recommendations
                 - errors: Any errors encountered
+                - delta: Incremental analysis delta (if enabled)
 
         Raises:
             AWSAuthenticationError: If AWS credentials are invalid.
@@ -12187,10 +12357,24 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.error(f"Setup failed: {e}")
             raise
 
+        # Load previous results for incremental analysis
+        if self.enable_incremental and self.cluster_name:
+            self._incremental_cache = IncrementalCache(self.cluster_name, self.region)
+            self._previous_results = self._incremental_cache.load_previous()
+            if self._previous_results:
+                self.progress.info("Loaded previous analysis for delta comparison")
+
         # Detect Fargate-only cluster (no nodes)
         self._is_fargate_only = self._detect_fargate_only_cluster()
         if self._is_fargate_only:
             self.progress.info("Detected Fargate-only cluster - skipping node-specific checks")
+
+        # Pre-fetch shared data before parallel analysis for performance
+        if self.parallel:
+            try:
+                self._prefetch_shared_data()
+            except Exception as e:
+                self.progress.warning(f"Pre-fetch failed (will fetch on-demand): {e}")
 
         # Step 4-58: Run all analyses (graceful degradation)
         analysis_methods = [
@@ -12262,12 +12446,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.check_eks_addons,
         ]
 
-        for method in analysis_methods:
-            try:
-                method()
-            except Exception as e:
-                # Continue analysis even if one method fails
-                self.progress.warning(f"Analysis method {method.__name__} failed: {e}")
+        if self.parallel:
+            self._run_analysis_parallel(analysis_methods)
+        else:
+            self._run_analysis_sequential(analysis_methods)
 
         # Step 59: Run correlation analysis
         try:
@@ -12278,30 +12460,107 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         # Generate recommendations
         recommendations = self.generate_recommendations()
 
-        # Build results
+        # Build results using TimezoneManager for consistency
         results = {
             "metadata": {
                 "cluster": self.cluster_name,
                 "region": self.region,
-                "analysis_date": datetime.now(timezone.utc).isoformat(),
+                "analysis_date": TimezoneManager.to_iso_string(TimezoneManager.now_utc()),
                 "date_range": {
-                    "start": self.start_date.isoformat(),
-                    "end": self.end_date.isoformat(),
+                    "start": TimezoneManager.to_iso_string(self.start_date),
+                    "end": TimezoneManager.to_iso_string(self.end_date),
                 },
                 "namespace": self.namespace if self.namespace else "all",
+                "version": VERSION,
             },
             "summary": self._generate_summary(),
-            "findings": {
-                k: v for k, v in self.findings.items() if v
-            },  # Only include non-empty categories
+            "findings": {k: v for k, v in self.findings.items() if v},
             "correlations": self.correlations,
             "timeline": self.timeline,
             "first_issue": self.first_issue,
             "recommendations": recommendations,
             "errors": self.errors,
+            "performance": {
+                "slowest_methods": [
+                    {"method": m, "total_time_seconds": round(t, 2)}
+                    for m, t in self._perf_tracker.get_slowest(10)
+                ],
+                "cache_stats": {
+                    "log_groups_cached": len(self._shared_data["log_groups"]),
+                    "kubectl_commands_cached": len(self._shared_data["kubectl_cache"]),
+                },
+            },
         }
 
+        # Compute delta if incremental analysis is enabled
+        if self.enable_incremental and self._incremental_cache:
+            self.delta_report = self._incremental_cache.compute_delta(
+                results, self._previous_results
+            )
+            results["delta"] = self.delta_report
+            if not self.delta_report.get("is_first_run"):
+                self.progress.info(
+                    f"Delta: {self.delta_report['new_issues']} new, "
+                    f"{self.delta_report['resolved_issues']} resolved"
+                )
+            self._incremental_cache.save(results)
+
         return results
+
+    def _run_analysis_sequential(self, analysis_methods: list) -> None:
+        """Run analysis methods sequentially."""
+        for method in analysis_methods:
+            try:
+                method()
+            except Exception as e:
+                self.progress.warning(f"Analysis method {method.__name__} failed: {e}")
+
+    def _run_analysis_parallel(self, analysis_methods: list) -> None:
+        """Run analysis methods in parallel using ThreadPoolExecutor with performance tracking."""
+        import threading
+
+        findings_lock = threading.Lock()
+        errors_lock = threading.Lock()
+        timeline_lock = threading.Lock()
+
+        def safe_method_wrapper(method):
+            start_time = time.time()
+            try:
+                method()
+                duration = time.time() - start_time
+                return (method.__name__, True, None, duration)
+            except Exception as e:
+                duration = time.time() - start_time
+                return (method.__name__, False, str(e), duration)
+
+        completed = 0
+        total = len(analysis_methods)
+
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as executor:
+            futures = {executor.submit(safe_method_wrapper, m): m for m in analysis_methods}
+            for future in as_completed(futures):
+                method_name, success, error, duration = future.result()
+                completed += 1
+
+                # Track performance
+                self._perf_tracker.record(method_name, duration)
+
+                if not success:
+                    with errors_lock:
+                        self.errors.append({"step": method_name, "message": error})
+                    self.progress.warning(
+                        f"[{completed}/{total}] {method_name} failed: {error} ({duration:.1f}s)"
+                    )
+                else:
+                    self.progress.info(
+                        f"[{completed}/{total}] {method_name} completed ({duration:.1f}s)"
+                    )
+
+        # Log performance summary
+        slowest = self._perf_tracker.get_slowest(5)
+        if slowest:
+            slowest_str = ", ".join(f"{m}: {t:.1f}s" for m, t in slowest)
+            self.progress.info(f"Slowest methods: {slowest_str}")
 
     def _generate_summary(self):
         """Generate summary of findings using same severity logic as HTML output"""
@@ -12764,16 +13023,33 @@ Examples:
   python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \\
     --cluster-name my-cluster --namespace production
 
+  # Using config file
+  python eks_comprehensive_debugger.py --config eks-debugger.yaml
+
+  # Sequential execution (for debugging)
+  python eks_comprehensive_debugger.py --profile prod --region eu-west-1 --no-parallel
+
 Output:
   Always generates two files:
     - {cluster}-eks-report-{timestamp}.html      - Interactive HTML dashboard
     - {cluster}-eks-findings-{timestamp}.json    - LLM-ready JSON for AI analysis
+
+Environment Variables:
+  EKS_DEBUGGER_PROFILE       - AWS profile
+  EKS_DEBUGGER_REGION        - AWS region
+  EKS_DEBUGGER_CLUSTER       - Cluster name
+  EKS_DEBUGGER_NAMESPACE     - Namespace filter
+  EKS_DEBUGGER_DAYS          - Days to look back
+  EKS_DEBUGGER_PARALLEL      - Enable parallel execution (true/false)
+  EKS_DEBUGGER_MAX_FINDINGS  - Max findings per category
         """,
     )
 
-    # Required arguments
-    parser.add_argument("--profile", required=True, help="AWS profile from ~/.aws/credentials")
-    parser.add_argument("--region", required=True, help="AWS region (e.g., eu-west-1, us-east-1)")
+    parser.add_argument("--config", help="Path to YAML/JSON config file")
+
+    # Required arguments (can be overridden by config or env vars)
+    parser.add_argument("--profile", help="AWS profile from ~/.aws/credentials")
+    parser.add_argument("--region", help="AWS region (e.g., eu-west-1, us-east-1)")
 
     # Optional cluster specification
     parser.add_argument(
@@ -12807,6 +13083,29 @@ Output:
 
     # Filtering options
     parser.add_argument("--namespace", help="Focus on specific Kubernetes namespace")
+
+    # Performance options
+    parser.add_argument(
+        "--no-parallel",
+        action="store_true",
+        help="Disable parallel execution (run analysis sequentially)",
+    )
+    parser.add_argument(
+        "--max-findings",
+        type=int,
+        default=MAX_FINDINGS_PER_CATEGORY,
+        help=f"Maximum findings per category (default: {MAX_FINDINGS_PER_CATEGORY})",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable API response caching",
+    )
+    parser.add_argument(
+        "--no-incremental",
+        action="store_true",
+        help="Disable incremental analysis (no delta reporting)",
+    )
 
     # Verbosity options
     verbosity_group = parser.add_mutually_exclusive_group()

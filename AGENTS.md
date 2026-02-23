@@ -6,9 +6,9 @@ Guidelines for AI coding agents working in this EKS Debugger codebase.
 
 Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
 
-**Version:** 3.0.0  
-**Lines of Code:** ~10,500  
-**Analysis Methods:** 55  
+**Version:** 3.3.0  
+**Lines of Code:** ~13,400  
+**Analysis Methods:** 56  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)
 
 ## Quick Commands
@@ -17,11 +17,11 @@ Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file
 # Setup
 python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
 
-# Run analysis
-python eks_comprehensive_debugger.py --profile <profile> --region <region> --cluster-name <cluster> --days 2 --output-format html --output-file report.html
+# Run analysis (generates HTML + LLM-JSON reports)
+python eks_comprehensive_debugger.py --profile <profile> --region <region> --cluster-name <cluster> --days 2
 
 # With custom kubectl context
-python eks_comprehensive_debugger.py --profile <profile> --region <region> --cluster-name <cluster> --kube-context <context-name> --days 1 --output-format html
+python eks_comprehensive_debugger.py --profile <profile> --region <region> --cluster-name <cluster> --kube-context <context-name> --days 1
 
 # Lint/type check (optional)
 ruff check eks_comprehensive_debugger.py
@@ -31,7 +31,7 @@ mypy eks_comprehensive_debugger.py --ignore-missing-imports
 ## File Structure
 
 ```
-eks_comprehensive_debugger.py  # Main debugger (~10,500 lines, all-in-one)
+eks_comprehensive_debugger.py  # Main debugger (~13,400 lines, all-in-one)
 requirements.txt               # Python dependencies
 .gitignore                     # Git ignore rules
 README-EKS-DEBUGGER.md         # User documentation
@@ -129,6 +129,48 @@ CONTROL_PLANE_ERROR_PATTERNS = [
 | `_get_node_from_pod(pod_details)` | Extract node name from pod details |
 | `_get_bucket_severity(events)` | Determine severity for timeline bucket |
 
+### Performance Architecture (v3.3.0)
+
+The debugger uses several optimization strategies for fast analysis:
+
+**Shared Data Pre-fetching:**
+```python
+def _prefetch_shared_data(self):
+    """Pre-fetch commonly used data before parallel analysis."""
+    # Pre-fetches CloudWatch log groups, kubectl nodes/pods
+    # Reduces redundant API calls by 30-50%
+```
+
+**Caching Classes:**
+| Class | Purpose |
+|-------|---------|
+| `APICache` | Thread-safe TTL cache for AWS API responses |
+| `PerformanceTracker` | Track and report execution times for analysis methods |
+| `IncrementalCache` | Store previous results for delta reporting |
+
+**Helper Methods:**
+| Method | Purpose |
+|--------|---------|
+| `_get_cached_log_group(prefix)` | Get cached CloudWatch log group data |
+| `_get_cached_kubectl(cmd)` | Get cached kubectl output |
+| `get_kubectl_output(cmd, use_cache=True)` | Run kubectl with optional caching |
+
+**Parallel Execution:**
+- Uses `ThreadPoolExecutor` with `MAX_PARALLEL_WORKERS=8`
+- Analysis methods run concurrently with thread-safe findings collection
+- Performance metrics logged for each method
+
+**Results include performance data:**
+```python
+results = {
+    ...
+    "performance": {
+        "slowest_methods": [{"method": "analyze_control_plane_logs", "total_time_seconds": 12.5}],
+        "cache_stats": {"log_groups_cached": 5, "kubectl_commands_cached": 2}
+    }
+}
+```
+
 ### Smart Correlation (v1.4.0)
 
 The debugger performs intelligent correlation across data sources to identify root causes:
@@ -189,6 +231,15 @@ The debugger performs intelligent correlation across data sources to identify ro
 | `MarkdownOutputFormatter` | Markdown output |
 | `YAMLOutputFormatter` | YAML output |
 | `HTMLOutputFormatter` | Interactive HTML dashboard |
+| `LLMJSONOutputFormatter` | LLM-optimized JSON output |
+| `ExecutiveSummaryGenerator` | Generate executive summary from results |
+| `APICache` | Thread-safe TTL cache for AWS API responses |
+| `PerformanceTracker` | Track execution times for analysis methods |
+| `IncrementalCache` | Store previous results for delta reporting |
+| `TimezoneManager` | Centralized timezone handling |
+| `ConfigLoader` | Load configuration from YAML/JSON files |
+| `Thresholds` | Threshold configuration for alerts |
+| `FindingType` | Finding type constants (current state vs historical) |
 
 ### Exception Hierarchy
 
@@ -203,7 +254,7 @@ EKSDebuggerError (base)
 
 ---
 
-## Analysis Methods (55 total)
+## Analysis Methods (56 total)
 
 ### Pod Lifecycle & Health (9 methods)
 
@@ -393,7 +444,11 @@ results = {
     'timeline': list[dict],          # Event timeline by hour
     'first_issue': dict | None,      # Earliest detected issue
     'recommendations': list[dict],
-    'errors': list[dict]
+    'errors': list[dict],
+    'performance': {                 # v3.3.0+
+        'slowest_methods': list[dict],
+        'cache_stats': dict
+    }
 }
 ```
 

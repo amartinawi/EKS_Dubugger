@@ -923,6 +923,349 @@ class LLMJSONOutputFormatter(OutputFormatter):
         return json.dumps(llm_output, indent=2, default=str)
 
 
+class ExecutiveSummaryGenerator:
+    """Generate executive summary from analysis results"""
+
+    def generate(self, results: dict) -> dict:
+        """
+        Generate executive summary from analysis results.
+
+        Returns a dict with:
+        - health_status: overall health assessment
+        - key_findings: top critical issues
+        - root_cause_analysis: from correlations
+        - timeline_insights: when issues occurred
+        - priority_actions: recommended actions prioritized
+        - affected_resources: summary of impacted components
+        """
+        summary = results.get("summary", {})
+        findings = results.get("findings", {})
+        correlations = results.get("correlations", [])
+        timeline = results.get("timeline", [])
+        first_issue = results.get("first_issue")
+        recommendations = results.get("recommendations", [])
+        metadata = results.get("metadata", {})
+
+        # Determine overall health status
+        health_status = self._determine_health_status(summary)
+
+        # Get top critical issues
+        key_findings = self._extract_key_findings(findings, limit=5)
+
+        # Analyze root causes
+        root_cause_analysis = self._analyze_root_causes(correlations, first_issue)
+
+        # Timeline insights
+        timeline_insights = self._analyze_timeline(timeline, metadata)
+
+        # Prioritized actions
+        priority_actions = self._prioritize_actions(recommendations, findings, correlations)
+
+        # Affected resources summary
+        affected_resources = self._summarize_affected_resources(findings)
+
+        # Category breakdown
+        category_breakdown = self._category_breakdown(findings)
+
+        return {
+            "health_status": health_status,
+            "key_findings": key_findings,
+            "root_cause_analysis": root_cause_analysis,
+            "timeline_insights": timeline_insights,
+            "priority_actions": priority_actions,
+            "affected_resources": affected_resources,
+            "category_breakdown": category_breakdown,
+        }
+
+    def _determine_health_status(self, summary: dict) -> dict:
+        """Determine overall cluster health status"""
+        critical = summary.get("critical", 0)
+        warning = summary.get("warning", 0)
+        total = summary.get("total_issues", 0)
+        historical = summary.get("historical_event_count", 0)
+        current = summary.get("current_state_count", 0)
+
+        if critical >= 3:
+            status = "critical"
+            message = f"Cluster is in CRITICAL state with {critical} critical issues requiring immediate attention"
+            icon = "🔴"
+        elif critical >= 1:
+            status = "critical"
+            message = f"Cluster has {critical} critical issue(s) that need immediate attention"
+            icon = "🔴"
+        elif warning >= 5:
+            status = "warning"
+            message = f"Cluster is in WARNING state with {warning} issues detected"
+            icon = "⚠️"
+        elif warning >= 1:
+            status = "warning"
+            message = f"Cluster has {warning} warning(s) that should be reviewed"
+            icon = "⚠️"
+        else:
+            status = "healthy"
+            message = "Cluster is healthy with no significant issues detected"
+            icon = "✅"
+
+        return {
+            "status": status,
+            "icon": icon,
+            "message": message,
+            "critical_count": critical,
+            "warning_count": warning,
+            "total_issues": total,
+            "historical_events": historical,
+            "current_state_issues": current,
+        }
+
+    def _extract_key_findings(self, findings: dict, limit: int = 5) -> list:
+        """Extract top critical findings"""
+        all_findings = []
+
+        for category, items in findings.items():
+            for item in items:
+                details = item.get("details", {})
+                finding_type = details.get("finding_type", FindingType.CURRENT_STATE)
+
+                # Determine severity
+                severity = details.get("severity", "info")
+                if severity not in ("critical", "warning", "info"):
+                    severity = self._classify_severity(item.get("summary", ""))
+
+                all_findings.append(
+                    {
+                        "category": category,
+                        "summary": item.get("summary", ""),
+                        "severity": severity,
+                        "finding_type": finding_type,
+                        "timestamp": details.get("timestamp"),
+                        "pod": details.get("pod"),
+                        "node": details.get("node"),
+                        "namespace": details.get("namespace"),
+                    }
+                )
+
+        # Sort by severity (critical first), then by timestamp
+        severity_order = {"critical": 0, "warning": 1, "info": 2}
+        all_findings.sort(
+            key=lambda x: (severity_order.get(x["severity"], 2), x["timestamp"] or "")
+        )
+
+        return all_findings[:limit]
+
+    def _analyze_root_causes(self, correlations: list, first_issue: dict | None) -> dict:
+        """Analyze root causes from correlations and first issue"""
+        root_causes = []
+
+        for corr in correlations:
+            if corr.get("root_cause"):
+                root_causes.append(
+                    {
+                        "type": corr.get("correlation_type", "unknown"),
+                        "severity": corr.get("severity", "warning"),
+                        "root_cause": corr.get("root_cause"),
+                        "impact": corr.get("impact"),
+                        "recommendation": corr.get("recommendation"),
+                        "aws_doc": corr.get("aws_doc"),
+                    }
+                )
+
+        # Add first issue as potential root cause
+        first_issue_info = None
+        if first_issue and first_issue.get("potential_root_cause"):
+            first_issue_info = {
+                "timestamp": first_issue.get("timestamp"),
+                "category": first_issue.get("category"),
+                "summary": first_issue.get("summary"),
+            }
+
+        return {
+            "identified_root_causes": root_causes,
+            "first_issue": first_issue_info,
+            "has_root_cause": len(root_causes) > 0 or first_issue_info is not None,
+        }
+
+    def _analyze_timeline(self, timeline: list, metadata: dict) -> dict:
+        """Analyze timeline for insights"""
+        if not timeline:
+            return {
+                "has_timeline": False,
+                "insights": "No historical events in the specified date range",
+            }
+
+        # Find peak issue time
+        peak_bucket = max(timeline, key=lambda x: x.get("event_count", 0))
+
+        # Find most severe bucket
+        critical_buckets = [t for t in timeline if t.get("severity") == "critical"]
+
+        # Get time range
+        if timeline:
+            start_time = timeline[0].get("time_bucket", "")
+            end_time = timeline[-1].get("time_bucket", "")
+        else:
+            start_time = end_time = ""
+
+        insights = []
+        if critical_buckets:
+            insights.append(
+                f"Issues peaked at {critical_buckets[0].get('time_bucket', 'unknown')} with critical severity"
+            )
+        if peak_bucket.get("event_count", 0) > 10:
+            insights.append(
+                f"High activity period at {peak_bucket.get('time_bucket', 'unknown')} with {peak_bucket.get('event_count')} events"
+            )
+
+        return {
+            "has_timeline": True,
+            "start_time": start_time,
+            "end_time": end_time,
+            "total_buckets": len(timeline),
+            "peak_time": peak_bucket.get("time_bucket"),
+            "peak_event_count": peak_bucket.get("event_count", 0),
+            "critical_periods": len(critical_buckets),
+            "insights": insights if insights else ["Events distributed across the time range"],
+        }
+
+    def _prioritize_actions(
+        self, recommendations: list, findings: dict, correlations: list
+    ) -> list:
+        """Prioritize recommended actions"""
+        actions = []
+
+        # First, add actions from correlations (these are root cause based)
+        for corr in correlations:
+            if corr.get("recommendation"):
+                actions.append(
+                    {
+                        "priority": "high" if corr.get("severity") == "critical" else "medium",
+                        "action": corr.get("recommendation"),
+                        "category": corr.get("correlation_type", "correlation"),
+                        "source": "Root Cause Analysis",
+                        "aws_doc": corr.get("aws_doc"),
+                    }
+                )
+
+        # Then add top recommendations
+        for rec in recommendations[:5]:
+            priority = rec.get("priority", "medium")
+            if rec.get("critical_count", 0) > 0:
+                priority = "high"
+
+            actions.append(
+                {
+                    "priority": priority,
+                    "action": rec.get("action"),
+                    "category": rec.get("category"),
+                    "source": "Recommendation",
+                    "aws_doc": rec.get("aws_doc"),
+                }
+            )
+
+        # Sort by priority
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        actions.sort(key=lambda x: priority_order.get(x["priority"], 2))
+
+        return actions[:10]  # Top 10 actions
+
+    def _summarize_affected_resources(self, findings: dict) -> dict:
+        """Summarize affected resources"""
+        pods = set()
+        nodes = set()
+        namespaces = set()
+
+        for category, items in findings.items():
+            for item in items:
+                details = item.get("details", {})
+                if details.get("pod"):
+                    pods.add(details["pod"])
+                if details.get("node"):
+                    nodes.add(details["node"])
+                if details.get("namespace"):
+                    namespaces.add(details["namespace"])
+
+        return {
+            "pods_affected": len(pods),
+            "nodes_affected": len(nodes),
+            "namespaces_affected": len(namespaces),
+            "pod_list": sorted(list(pods))[:10],
+            "node_list": sorted(list(nodes))[:10],
+            "namespace_list": sorted(list(namespaces)),
+        }
+
+    def _category_breakdown(self, findings: dict) -> list:
+        """Get breakdown of issues by category"""
+        breakdown = []
+
+        category_names = {
+            "memory_pressure": "Memory Pressure",
+            "disk_pressure": "Disk Pressure",
+            "pod_errors": "Pod Errors",
+            "node_issues": "Node Issues",
+            "oom_killed": "OOM Killed",
+            "control_plane_issues": "Control Plane",
+            "scheduling_failures": "Scheduling",
+            "network_issues": "Network",
+            "rbac_issues": "RBAC/IAM",
+            "image_pull_failures": "Image Pull",
+            "resource_quota_exceeded": "Resource Quotas",
+            "pvc_issues": "Storage/PVC",
+            "dns_issues": "DNS",
+            "addon_issues": "EKS Addons",
+        }
+
+        for category, items in findings.items():
+            if not items:
+                continue
+
+            critical = sum(
+                1 for item in items if item.get("details", {}).get("severity") == "critical"
+            )
+            warning = sum(
+                1 for item in items if item.get("details", {}).get("severity") == "warning"
+            )
+
+            breakdown.append(
+                {
+                    "category": category,
+                    "display_name": category_names.get(
+                        category, category.replace("_", " ").title()
+                    ),
+                    "count": len(items),
+                    "critical": critical,
+                    "warning": warning,
+                }
+            )
+
+        # Sort by count descending
+        breakdown.sort(key=lambda x: x["count"], reverse=True)
+        return breakdown
+
+    def _classify_severity(self, summary_text: str) -> str:
+        """Classify severity from summary text"""
+        summary_lower = summary_text.lower()
+
+        critical_keywords = ["oom", "killed", "crash", "critical", "down", "unhealthy", "notready"]
+        warning_keywords = [
+            "warning",
+            "warn",
+            "degraded",
+            "pressure",
+            "evicted",
+            "pending",
+            "timeout",
+            "error",
+            "failed",
+        ]
+
+        for kw in critical_keywords:
+            if kw in summary_lower:
+                return "critical"
+        for kw in warning_keywords:
+            if kw in summary_lower:
+                return "warning"
+        return "info"
+
+
 class HTMLOutputFormatter(OutputFormatter):
     """Modern HTML output with interactive features"""
 
@@ -994,6 +1337,214 @@ class HTMLOutputFormatter(OutputFormatter):
             return '<span class="finding-type-badge historical" title="Event occurred within date range">📅 Historical</span>'
         else:
             return '<span class="finding-type-badge current" title="Current cluster state (not filtered by date)">🔄 Current</span>'
+
+    def _generate_executive_summary_html(self, exec_summary: dict) -> str:
+        """Generate HTML for the Executive Summary section"""
+        health = exec_summary.get("health_status", {})
+        key_findings = exec_summary.get("key_findings", [])
+        root_cause = exec_summary.get("root_cause_analysis", {})
+        timeline = exec_summary.get("timeline_insights", {})
+        actions = exec_summary.get("priority_actions", [])
+        affected = exec_summary.get("affected_resources", {})
+        categories = exec_summary.get("category_breakdown", [])
+
+        status_class = health.get("status", "healthy")
+
+        html = f"""
+            <!-- Executive Summary -->
+            <section class="executive-summary" id="executive-summary">
+                <div class="executive-summary-header">
+                    <div class="executive-summary-title">
+                        <span>📋</span>
+                        <span>Executive Summary</span>
+                    </div>
+                    <div class="executive-summary-subtitle">AI-Generated Analysis Overview</div>
+                </div>
+                <div class="executive-summary-content">
+                    <!-- Health Assessment -->
+                    <div class="health-assessment {status_class}">
+                        <div class="health-icon">{health.get("icon", "✅")}</div>
+                        <div class="health-message">
+                            <h3>Cluster Status: {health.get("status", "Unknown").upper()}</h3>
+                            <p>{health.get("message", "No status available")}</p>
+                        </div>
+                    </div>
+
+                    <div class="summary-grid">
+                        <!-- Key Findings -->
+                        <div class="summary-block">
+                            <div class="summary-block-title">
+                                <span>🔍</span> Key Findings
+                            </div>
+                            {"<p style='color: var(--text-secondary); font-size: 0.9rem;'>No critical issues detected</p>" if not key_findings else ""}
+        """
+
+        for finding in key_findings[:5]:
+            severity_class = finding.get("severity", "info")
+            meta_parts = []
+            if finding.get("namespace"):
+                meta_parts.append(f"ns: {finding['namespace']}")
+            if finding.get("pod"):
+                meta_parts.append(f"pod: {finding['pod']}")
+            if finding.get("node"):
+                meta_parts.append(f"node: {finding['node']}")
+            meta_str = (
+                " | ".join(meta_parts)
+                if meta_parts
+                else finding.get("category", "").replace("_", " ").title()
+            )
+
+            html += f"""
+                            <div class="key-finding-item {severity_class}">
+                                <div class="key-finding-summary">{finding.get("summary", "Unknown")}</div>
+                                <div class="key-finding-meta">{meta_str}</div>
+                            </div>
+            """
+
+        html += """
+                        </div>
+
+                        <!-- Root Cause Analysis -->
+                        <div class="summary-block">
+                            <div class="summary-block-title">
+                                <span>🔗</span> Root Cause Analysis
+                            </div>
+        """
+
+        if root_cause.get("has_root_cause"):
+            for rc in root_cause.get("identified_root_causes", [])[:3]:
+                html += f"""
+                            <div class="root-cause-item">
+                                <div class="root-cause-text">{rc.get("root_cause", "Unknown")}</div>
+                                <div class="root-cause-impact">Impact: {rc.get("impact", "N/A")}</div>
+                            </div>
+                """
+
+            if root_cause.get("first_issue"):
+                fi = root_cause["first_issue"]
+                html += f"""
+                            <div class="root-cause-item" style="border-left-color: #f59e0b;">
+                                <div class="root-cause-text">📍 First detected issue: {fi.get("summary", "Unknown")}</div>
+                                <div class="root-cause-impact">Time: {fi.get("timestamp", "Unknown")}</div>
+                            </div>
+                """
+        else:
+            html += """<p style='color: var(--text-secondary); font-size: 0.9rem;'>No root cause correlations identified</p>"""
+
+        html += """
+                        </div>
+                    </div>
+
+                    <div class="summary-grid">
+                        <!-- Priority Actions -->
+                        <div class="summary-block">
+                            <div class="summary-block-title">
+                                <span>⚡</span> Priority Actions
+                            </div>
+        """
+
+        if actions:
+            for action in actions[:5]:
+                priority = action.get("priority", "medium")
+                html += f"""
+                            <div class="action-item">
+                                <span class="action-priority {priority}">{priority}</span>
+                                <div class="action-text">{action.get("action", "No action specified")}</div>
+                            </div>
+                """
+        else:
+            html += """<p style='color: var(--text-secondary); font-size: 0.9rem;'>No priority actions identified</p>"""
+
+        html += """
+                        </div>
+
+                        <!-- Affected Resources -->
+                        <div class="summary-block">
+                            <div class="summary-block-title">
+                                <span>📊</span> Affected Resources
+                            </div>
+                            <div class="affected-resources">
+        """
+
+        html += f"""
+                                <div class="resource-stat">
+                                    <div class="resource-stat-value">{affected.get("pods_affected", 0)}</div>
+                                    <div class="resource-stat-label">Pods</div>
+                                </div>
+                                <div class="resource-stat">
+                                    <div class="resource-stat-value">{affected.get("nodes_affected", 0)}</div>
+                                    <div class="resource-stat-label">Nodes</div>
+                                </div>
+                                <div class="resource-stat">
+                                    <div class="resource-stat-value">{affected.get("namespaces_affected", 0)}</div>
+                                    <div class="resource-stat-label">Namespaces</div>
+                                </div>
+        """
+
+        if timeline.get("has_timeline"):
+            html += f"""
+                                <div class="resource-stat">
+                                    <div class="resource-stat-value">{timeline.get("critical_periods", 0)}</div>
+                                    <div class="resource-stat-label">Critical Periods</div>
+                                </div>
+            """
+
+        html += """
+                            </div>
+        """
+
+        # Add timeline insight if available
+        if timeline.get("has_timeline") and timeline.get("insights"):
+            html += f"""
+                            <div style="margin-top: 1rem; padding: 0.75rem; background: white; border-radius: 8px;">
+                                <strong>🕐 Timeline:</strong> {timeline.get("start_time", "")} to {timeline.get("end_time", "")}
+                                <br><span style="color: var(--text-secondary); font-size: 0.85rem;">{timeline.get("insights", ["No insights"])[0]}</span>
+                            </div>
+            """
+
+        html += """
+                        </div>
+                    </div>
+
+                    <!-- Category Breakdown -->
+        """
+
+        if categories:
+            max_count = max(c.get("count", 0) for c in categories) if categories else 1
+            html += """
+                    <div class="summary-block">
+                        <div class="summary-block-title">
+                            <span>📈</span> Issues by Category
+                        </div>
+            """
+            for cat in categories[:8]:
+                width = (cat.get("count", 0) / max_count * 100) if max_count > 0 else 0
+                fill_class = (
+                    "critical"
+                    if cat.get("critical", 0) > 0
+                    else "warning"
+                    if cat.get("warning", 0) > 0
+                    else ""
+                )
+                html += f"""
+                        <div class="category-bar">
+                            <div class="category-name">{cat.get("display_name", cat.get("category", ""))}</div>
+                            <div class="category-bar-visual">
+                                <div class="category-bar-fill {fill_class}" style="width: {width}%;"></div>
+                            </div>
+                            <div class="category-count">{cat.get("count", 0)}</div>
+                        </div>
+                """
+            html += """
+                    </div>
+            """
+
+        html += """
+                </div>
+            </section>
+        """
+
+        return html
 
     def format(self, results):
         """Format results as interactive HTML"""
@@ -1409,6 +1960,238 @@ class HTMLOutputFormatter(OutputFormatter):
         .finding-type-badge.current {{
             background: #fef3c7;
             color: #d97706;
+        }}
+        
+        /* Executive Summary Section */
+        .executive-summary {{
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+            margin-bottom: 2rem;
+            overflow: hidden;
+        }}
+        
+        .executive-summary-header {{
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            color: white;
+            padding: 1.5rem;
+        }}
+        
+        .executive-summary-title {{
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }}
+        
+        .executive-summary-subtitle {{
+            font-size: 0.9rem;
+            opacity: 0.8;
+        }}
+        
+        .executive-summary-content {{
+            padding: 1.5rem;
+        }}
+        
+        .health-assessment {{
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1.25rem;
+            border-radius: 12px;
+            margin-bottom: 1.5rem;
+        }}
+        
+        .health-assessment.critical {{
+            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+            border: 2px solid #ef4444;
+        }}
+        
+        .health-assessment.warning {{
+            background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
+            border: 2px solid #f59e0b;
+        }}
+        
+        .health-assessment.healthy {{
+            background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+            border: 2px solid #22c55e;
+        }}
+        
+        .health-icon {{
+            font-size: 3rem;
+        }}
+        
+        .health-message {{
+            flex: 1;
+        }}
+        
+        .health-message h3 {{
+            margin: 0 0 0.25rem 0;
+            font-size: 1.1rem;
+        }}
+        
+        .health-message p {{
+            margin: 0;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }}
+        
+        .summary-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
+        }}
+        
+        .summary-block {{
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 1.25rem;
+        }}
+        
+        .summary-block-title {{
+            font-weight: 600;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }}
+        
+        .key-finding-item {{
+            padding: 0.75rem;
+            background: white;
+            border-radius: 8px;
+            margin-bottom: 0.5rem;
+            border-left: 3px solid var(--border);
+        }}
+        
+        .key-finding-item.critical {{ border-left-color: var(--critical); }}
+        .key-finding-item.warning {{ border-left-color: var(--warning); }}
+        
+        .key-finding-summary {{
+            font-size: 0.9rem;
+            color: var(--text);
+            margin-bottom: 0.25rem;
+        }}
+        
+        .key-finding-meta {{
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }}
+        
+        .root-cause-item {{
+            padding: 1rem;
+            background: white;
+            border-radius: 8px;
+            margin-bottom: 0.5rem;
+            border-left: 3px solid #8b5cf6;
+        }}
+        
+        .root-cause-text {{
+            font-weight: 500;
+            color: var(--text);
+            margin-bottom: 0.5rem;
+        }}
+        
+        .root-cause-impact {{
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }}
+        
+        .action-item {{
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+            padding: 0.75rem;
+            background: white;
+            border-radius: 8px;
+            margin-bottom: 0.5rem;
+        }}
+        
+        .action-priority {{
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            flex-shrink: 0;
+        }}
+        
+        .action-priority.high {{ background: #fef2f2; color: #dc2626; }}
+        .action-priority.medium {{ background: #fffbeb; color: #d97706; }}
+        .action-priority.low {{ background: #f0fdf4; color: #16a34a; }}
+        
+        .action-text {{
+            flex: 1;
+            font-size: 0.9rem;
+        }}
+        
+        .affected-resources {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }}
+        
+        .resource-stat {{
+            text-align: center;
+            padding: 1rem;
+            background: white;
+            border-radius: 8px;
+            min-width: 80px;
+        }}
+        
+        .resource-stat-value {{
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--primary);
+        }}
+        
+        .resource-stat-label {{
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }}
+        
+        .category-bar {{
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.5rem 0;
+        }}
+        
+        .category-name {{
+            width: 120px;
+            font-size: 0.85rem;
+            color: var(--text);
+        }}
+        
+        .category-bar-visual {{
+            flex: 1;
+            height: 8px;
+            background: #e2e8f0;
+            border-radius: 4px;
+            overflow: hidden;
+        }}
+        
+        .category-bar-fill {{
+            height: 100%;
+            border-radius: 4px;
+        }}
+        
+        .category-bar-fill.critical {{ background: var(--critical); }}
+        .category-bar-fill.warning {{ background: var(--warning); }}
+        
+        .category-count {{
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text);
+            width: 40px;
+            text-align: right;
         }}
         
         /* Findings Section */
@@ -1911,6 +2694,9 @@ class HTMLOutputFormatter(OutputFormatter):
                 <a href="#summary" class="nav-item">
                     <span>📊 Dashboard</span>
                 </a>
+                <a href="#executive-summary" class="nav-item">
+                    <span>📋 Executive Summary</span>
+                </a>
                 <a href="#sources" class="nav-item">
                     <span>📡 Data Sources</span>
                 </a>
@@ -2082,6 +2868,12 @@ class HTMLOutputFormatter(OutputFormatter):
                 </div>
             </div>
 """
+
+        # Generate Executive Summary
+        exec_summary_gen = ExecutiveSummaryGenerator()
+        exec_summary = exec_summary_gen.generate(results)
+
+        html += self._generate_executive_summary_html(exec_summary)
 
         all_findings_json = []
 

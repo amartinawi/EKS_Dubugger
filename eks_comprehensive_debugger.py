@@ -1936,7 +1936,6 @@ class HTMLOutputFormatter(OutputFormatter):
                         <span>📋</span>
                         <span>Executive Summary</span>
                     </div>
-                    <div class="executive-summary-subtitle">AI-Generated Analysis Overview</div>
                 </div>
                 <div class="executive-summary-content">
                     <!-- Health Assessment with Trend -->

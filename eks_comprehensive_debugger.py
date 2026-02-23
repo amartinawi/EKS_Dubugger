@@ -980,6 +980,13 @@ class ExecutiveSummaryGenerator:
                 "is_potential_root_cause": first_issue.get("potential_root_cause", False),
             }
 
+        # Phase 2 enhancements
+        # Most common error types
+        common_errors = self._get_most_common_error_types(findings)
+
+        # External service impact
+        external_impact = self._get_external_service_impact(findings)
+
         return {
             "health_status": health_status,
             "first_issue": first_issue_prominent,
@@ -990,6 +997,10 @@ class ExecutiveSummaryGenerator:
             "affected_resources": affected_resources,
             "category_breakdown": category_breakdown,
             "healthy_components": healthy_components,
+            # Phase 2 additions
+            "trend": timeline_insights.get("trend"),
+            "common_errors": common_errors,
+            "external_impact": external_impact,
         }
 
     def _determine_health_status(self, summary: dict) -> dict:
@@ -1100,11 +1111,12 @@ class ExecutiveSummaryGenerator:
         }
 
     def _analyze_timeline(self, timeline: list, metadata: dict) -> dict:
-        """Analyze timeline for insights"""
+        """Analyze timeline for insights including trend calculation"""
         if not timeline:
             return {
                 "has_timeline": False,
                 "insights": "No historical events in the specified date range",
+                "trend": None,
             }
 
         # Find peak issue time
@@ -1119,6 +1131,9 @@ class ExecutiveSummaryGenerator:
             end_time = timeline[-1].get("time_bucket", "")
         else:
             start_time = end_time = ""
+
+        # Calculate trend from last 2 buckets (Phase 2 - #1)
+        trend = self._calculate_trend(timeline)
 
         insights = []
         if critical_buckets:
@@ -1139,6 +1154,207 @@ class ExecutiveSummaryGenerator:
             "peak_event_count": peak_bucket.get("event_count", 0),
             "critical_periods": len(critical_buckets),
             "insights": insights if insights else ["Events distributed across the time range"],
+            "trend": trend,
+        }
+
+    def _calculate_trend(self, timeline: list) -> dict | None:
+        """
+        Calculate trend from last 2 time buckets.
+
+        Returns trend with:
+        - direction: "increasing", "decreasing", "stable"
+        - percentage: change percentage
+        - icon: visual indicator
+        - message: human-readable description
+        """
+        if len(timeline) < 2:
+            return None
+
+        # Get last 2 buckets
+        last_bucket = timeline[-1]
+        second_last_bucket = timeline[-2]
+
+        last_count = last_bucket.get("event_count", 0)
+        second_last_count = second_last_bucket.get("event_count", 0)
+        last_time = last_bucket.get("time_bucket", "")
+        second_last_time = second_last_bucket.get("time_bucket", "")
+
+        # Calculate percentage change
+        if second_last_count == 0:
+            if last_count == 0:
+                percentage = 0
+                direction = "stable"
+            else:
+                percentage = 100  # New issues appeared
+                direction = "increasing"
+        else:
+            percentage = ((last_count - second_last_count) / second_last_count) * 100
+            # Determine direction with 10% threshold for "stable"
+            if percentage > 10:
+                direction = "increasing"
+            elif percentage < -10:
+                direction = "decreasing"
+            else:
+                direction = "stable"
+
+        # Set icon and color based on direction
+        if direction == "increasing":
+            icon = "📈"
+            color = "#ef4444"  # red
+            message = f"Issues increased by {abs(percentage):.0f}% in the last hour"
+        elif direction == "decreasing":
+            icon = "📉"
+            color = "#22c55e"  # green
+            message = f"Issues decreased by {abs(percentage):.0f}% in the last hour"
+        else:
+            icon = "➡️"
+            color = "#6b7280"  # gray
+            message = "Issue rate is stable"
+
+        return {
+            "direction": direction,
+            "percentage": round(percentage, 1),
+            "icon": icon,
+            "color": color,
+            "message": message,
+            "last_count": last_count,
+            "previous_count": second_last_count,
+            "last_time": last_time,
+            "previous_time": second_last_time,
+        }
+
+    def _get_most_common_error_types(self, findings: dict) -> list:
+        """
+        Extract and count the most common error types (Phase 2 - #4).
+
+        Looks for patterns like:
+        - CrashLoopBackOff
+        - ImagePullBackOff
+        - OOMKilled
+        - Evicted
+        - FailedScheduling
+        - etc.
+        """
+        error_counts: dict[str, dict] = {}
+
+        # Known error patterns to extract
+        error_patterns = [
+            "CrashLoopBackOff",
+            "ImagePullBackOff",
+            "ErrImagePull",
+            "OOMKilled",
+            "Evicted",
+            "FailedScheduling",
+            "FailedMount",
+            "FailedAttachVolume",
+            "FailedCreate",
+            "FailedGetResourceMetric",
+            "NodeNotReady",
+            "DiskPressure",
+            "MemoryPressure",
+            "PIDPressure",
+            "NetworkUnavailable",
+            "ContainerCreating",
+            "CreateContainerConfigError",
+            "RunContainerError",
+            "PostStartHookError",
+            "PreStopHookError",
+        ]
+
+        for category, items in findings.items():
+            for item in items:
+                summary = item.get("summary", "").lower()
+                details = item.get("details", {})
+                reason = details.get("reason", "").lower() if isinstance(details, dict) else ""
+
+                # Check for known error patterns
+                for pattern in error_patterns:
+                    pattern_lower = pattern.lower()
+                    if pattern_lower in summary or pattern_lower in reason:
+                        if pattern not in error_counts:
+                            error_counts[pattern] = {
+                                "error_type": pattern,
+                                "count": 0,
+                                "category": category,
+                                "examples": [],
+                            }
+                        error_counts[pattern]["count"] += 1
+
+                        # Store up to 2 examples
+                        if len(error_counts[pattern]["examples"]) < 2:
+                            example = {
+                                "summary": item.get("summary", ""),
+                                "namespace": details.get("namespace", ""),
+                                "pod": details.get("pod", ""),
+                            }
+                            if example not in error_counts[pattern]["examples"]:
+                                error_counts[pattern]["examples"].append(example)
+                        break
+
+        # Sort by count and return top 5
+        sorted_errors = sorted(error_counts.values(), key=lambda x: x["count"], reverse=True)
+        return sorted_errors[:5]
+
+    def _get_external_service_impact(self, findings: dict) -> dict:
+        """
+        Analyze impact on external services (Phase 2 - #6).
+
+        Counts:
+        - Services with no endpoints (offline)
+        - Ingress/ALB issues
+        - DNS resolution failures
+        """
+        services_offline = []
+        dns_failures = []
+        ingress_issues = []
+
+        # Check network issues for services with no endpoints
+        for item in findings.get("network_issues", []):
+            summary = item.get("summary", "").lower()
+            details = item.get("details", {})
+
+            if "no endpoints" in summary or "no ready endpoints" in summary:
+                services_offline.append(
+                    {
+                        "service": details.get("service", "unknown"),
+                        "namespace": details.get("namespace", "unknown"),
+                        "summary": item.get("summary", ""),
+                    }
+                )
+
+        # Check DNS issues
+        for item in findings.get("dns_issues", []):
+            details = item.get("details", {})
+            dns_failures.append(
+                {
+                    "summary": item.get("summary", ""),
+                    "namespace": details.get("namespace", ""),
+                }
+            )
+
+        # Calculate business impact level
+        total_offline = len(services_offline)
+        if total_offline >= 5:
+            impact_level = "critical"
+            impact_message = f"{total_offline} services are offline - likely impacting user traffic"
+        elif total_offline >= 2:
+            impact_level = "warning"
+            impact_message = f"{total_offline} services have no endpoints - may be impacting users"
+        elif total_offline == 1:
+            impact_level = "warning"
+            impact_message = "1 service has no endpoints"
+        else:
+            impact_level = "healthy"
+            impact_message = "All services have available endpoints"
+
+        return {
+            "impact_level": impact_level,
+            "impact_message": impact_message,
+            "services_offline_count": total_offline,
+            "services_offline": services_offline[:5],  # Top 5
+            "dns_failures_count": len(dns_failures),
+            "dns_failures": dns_failures[:3],
+            "has_external_impact": total_offline > 0 or len(dns_failures) > 0,
         }
 
     def _prioritize_actions(
@@ -1403,7 +1619,7 @@ class HTMLOutputFormatter(OutputFormatter):
             return '<span class="finding-type-badge current" title="Current cluster state (not filtered by date)">🔄 Current</span>'
 
     def _generate_executive_summary_html(self, exec_summary: dict) -> str:
-        """Generate HTML for the Executive Summary section with Phase 1 enhancements"""
+        """Generate HTML for the Executive Summary section with Phase 1 & 2 enhancements"""
         health = exec_summary.get("health_status", {})
         first_issue = exec_summary.get("first_issue")
         key_findings = exec_summary.get("key_findings", [])
@@ -1413,6 +1629,11 @@ class HTMLOutputFormatter(OutputFormatter):
         affected = exec_summary.get("affected_resources", {})
         categories = exec_summary.get("category_breakdown", [])
         healthy_components = exec_summary.get("healthy_components", [])
+
+        # Phase 2 additions
+        trend = exec_summary.get("trend")
+        common_errors = exec_summary.get("common_errors", [])
+        external_impact = exec_summary.get("external_impact", {})
 
         status_class = health.get("status", "healthy")
 
@@ -1427,7 +1648,7 @@ class HTMLOutputFormatter(OutputFormatter):
                     <div class="executive-summary-subtitle">AI-Generated Analysis Overview</div>
                 </div>
                 <div class="executive-summary-content">
-                    <!-- Health Assessment -->
+                    <!-- Health Assessment with Trend -->
                     <div class="health-assessment {status_class}">
                         <div class="health-icon">{health.get("icon", "✅")}</div>
                         <div class="health-message">
@@ -1436,6 +1657,26 @@ class HTMLOutputFormatter(OutputFormatter):
                         </div>
                     </div>
 
+                    <!-- Trend Indicator (Phase 2 - #1) -->
+        """
+
+        if trend:
+            trend_color = trend.get("color", "#6b7280")
+            html += f"""
+                    <div class="trend-indicator" style="background: linear-gradient(135deg, {trend_color}15 0%, {trend_color}30 100%); border-left: 4px solid {trend_color};">
+                        <span class="trend-icon">{trend.get("icon", "➡️")}</span>
+                        <div class="trend-content">
+                            <span class="trend-label">Trend</span>
+                            <span class="trend-message">{trend.get("message", "No trend data")}</span>
+                        </div>
+                        <div class="trend-details">
+                            <span class="trend-current">{trend.get("last_count", 0)} events</span>
+                            <span class="trend-previous">vs {trend.get("previous_count", 0)} in previous hour</span>
+                        </div>
+                    </div>
+            """
+
+        html += f"""
                     <!-- At a Glance Stats -->
                     <div class="at-a-glance">
                         <div class="glance-stat">
@@ -1459,7 +1700,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             <div class="glance-label">Namespaces</div>
                         </div>
                         <div class="glance-stat">
-                            <div class="glance-value">{affected.get("services_offline", 0)}</div>
+                            <div class="glance-value">{external_impact.get("services_offline_count", 0)}</div>
                             <div class="glance-label">Services Offline</div>
                         </div>
                     </div>
@@ -1550,6 +1791,99 @@ class HTMLOutputFormatter(OutputFormatter):
                 """
             html += """
                             </div>
+                        </div>
+                    </div>
+            """
+
+        # Most Common Error Types (Phase 2 - #4)
+        if common_errors:
+            html += """
+                    <!-- Most Common Error Types -->
+                    <div class="summary-block collapsible">
+                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
+                            <div class="summary-block-title">
+                                <span>🔥</span> Most Common Errors
+                            </div>
+                            <span class="block-toggle">▼</span>
+                        </div>
+                        <div class="summary-block-content">
+                            <div class="error-type-list">
+            """
+            for err in common_errors[:5]:
+                # Determine severity color based on error type
+                error_type = err.get("error_type", "")
+                if error_type in ["CrashLoopBackOff", "OOMKilled", "OOMKilled"]:
+                    severity_color = "#ef4444"  # red
+                elif error_type in ["ImagePullBackOff", "Evicted", "FailedScheduling"]:
+                    severity_color = "#f59e0b"  # amber
+                else:
+                    severity_color = "#6b7280"  # gray
+
+                html += f"""
+                                <div class="error-type-item">
+                                    <div class="error-type-header">
+                                        <span class="error-type-name" style="border-left: 3px solid {severity_color};">{error_type}</span>
+                                        <span class="error-type-count">{err.get("count", 0)}</span>
+                                    </div>
+                """
+                # Add examples
+                examples = err.get("examples", [])
+                if examples:
+                    for ex in examples[:2]:
+                        example_text = ex.get("pod", "") or ex.get("summary", "")
+                        if example_text:
+                            html += f"""
+                                    <div class="error-example">• {example_text}</div>
+                            """
+                html += """
+                                </div>
+                """
+            html += """
+                            </div>
+                        </div>
+                    </div>
+            """
+
+        # External Service Impact (Phase 2 - #6)
+        if external_impact.get("has_external_impact"):
+            impact_level = external_impact.get("impact_level", "healthy")
+            impact_message = external_impact.get("impact_message", "")
+            services_offline = external_impact.get("services_offline", [])
+
+            impact_color = "#ef4444" if impact_level == "critical" else "#f59e0b"
+
+            html += f"""
+                    <!-- External Service Impact -->
+                    <div class="summary-block impact-block" style="border-left: 4px solid {impact_color};">
+                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
+                            <div class="summary-block-title">
+                                <span>🌐</span> Business Impact
+                            </div>
+                            <span class="block-toggle">▼</span>
+                        </div>
+                        <div class="summary-block-content">
+                            <div class="impact-alert" style="background: {impact_color}15; border-radius: 8px; padding: 1rem; margin-bottom: 1rem;">
+                                <strong>⚠️ {impact_message}</strong>
+                            </div>
+            """
+
+            if services_offline:
+                html += """
+                            <div class="impact-services">
+                                <strong>Offline Services:</strong>
+                """
+                for svc in services_offline[:5]:
+                    html += f"""
+                                <div class="impact-service-item">
+                                    <span class="service-name">{svc.get("service", "unknown")}</span>
+                                    <span class="service-namespace">{svc.get("namespace", "")}</span>
+                                </div>
+                """
+                html += """
+                            </div>
+                """
+
+            html += """
                         </div>
                     </div>
             """
@@ -2550,6 +2884,123 @@ class HTMLOutputFormatter(OutputFormatter):
         }}
         
         .healthy-message {{
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }}
+        
+        /* Trend Indicator (Phase 2) */
+        .trend-indicator {{
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem 1.25rem;
+            border-radius: 12px;
+            margin-bottom: 1.5rem;
+        }}
+        
+        .trend-icon {{
+            font-size: 1.5rem;
+        }}
+        
+        .trend-content {{
+            flex: 1;
+        }}
+        
+        .trend-label {{
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+        }}
+        
+        .trend-message {{
+            font-weight: 600;
+            color: var(--text);
+        }}
+        
+        .trend-details {{
+            text-align: right;
+        }}
+        
+        .trend-current {{
+            display: block;
+            font-weight: 700;
+            font-size: 1.1rem;
+            color: var(--text);
+        }}
+        
+        .trend-previous {{
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }}
+        
+        /* Error Types (Phase 2) */
+        .error-type-list {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }}
+        
+        .error-type-item {{
+            background: white;
+            border-radius: 8px;
+            padding: 0.75rem 1rem;
+        }}
+        
+        .error-type-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        
+        .error-type-name {{
+            font-weight: 600;
+            color: var(--text);
+            padding-left: 0.75rem;
+        }}
+        
+        .error-type-count {{
+            background: #e2e8f0;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }}
+        
+        .error-example {{
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 0.5rem;
+            padding-left: 1rem;
+        }}
+        
+        /* Business Impact (Phase 2) */
+        .impact-block {{
+            background: #fef2f2 !important;
+        }}
+        
+        .impact-alert {{
+            margin-bottom: 0.75rem;
+        }}
+        
+        .impact-services {{
+            margin-top: 0.75rem;
+        }}
+        
+        .impact-service-item {{
+            display: flex;
+            justify-content: space-between;
+            padding: 0.5rem 0.75rem;
+            background: white;
+            border-radius: 6px;
+            margin-top: 0.5rem;
+        }}
+        
+        .service-name {{
+            font-weight: 500;
+        }}
+        
+        .service-namespace {{
             font-size: 0.8rem;
             color: var(--text-secondary);
         }}

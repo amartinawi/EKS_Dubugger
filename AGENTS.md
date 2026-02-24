@@ -40,12 +40,16 @@ requirements.txt               # Python dependencies (includes test deps)
 .gitignore                     # Git ignore rules
 README-EKS-DEBUGGER.md         # User documentation
 AGENTS.md                      # This file
-tests/                         # Unit tests (112 tests)
+tests/                         # Unit tests (158 tests)
 ├── __init__.py
 ├── conftest.py                # Shared fixtures
 ├── test_severity_classification.py  # Severity logic tests
 ├── test_input_validation.py         # Security/shell injection tests
-└── test_findings.py                 # Findings management tests
+├── test_findings.py                 # Findings management tests
+├── test_kubectl_execution.py        # Kubectl shell safety tests
+├── test_api_cache.py                # APICache tests
+├── test_incremental_cache.py        # IncrementalCache tests
+└── test_performance_tracker.py      # PerformanceTracker tests
 venv/                          # Virtual environment (gitignored)
 ```
 
@@ -335,9 +339,13 @@ The test suite covers critical security and functionality areas:
 
 | Test File | Tests | Coverage |
 |-----------|-------|----------|
-| `test_severity_classification.py` | 29 | Critical/warning/info keyword detection, priority ordering, case insensitivity |
-| `test_input_validation.py` | 70 | Shell injection prevention, invalid character detection, edge cases |
-| `test_findings.py` | 13 | Finding limits, thread safety with concurrent access |
+| `test_severity_classification.py` | 35 | Critical/warning/info keyword detection, priority ordering, case insensitivity |
+| `test_input_validation.py` | 67 | Shell injection prevention, invalid character detection, edge cases |
+| `test_findings.py` | 10 | Finding limits, thread safety with concurrent access |
+| `test_kubectl_execution.py` | 12 | shell=False execution, fallback logic, caching |
+| `test_api_cache.py` | 11 | TTL expiration, thread safety, key generation |
+| `test_incremental_cache.py` | 14 | Delta reporting, save/load, file permissions |
+| `test_performance_tracker.py` | 9 | Timing aggregation, slowest methods, thread safety |
 
 **Run Tests:**
 ```bash

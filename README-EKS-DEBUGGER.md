@@ -338,10 +338,13 @@ python3 -m pytest tests/ -v --cov=. --cov-report=term-missing
 
 | Test File | Tests | Coverage |
 |-----------|-------|----------|
-| `test_severity_classification.py` | 29 | Critical/warning/info keyword detection, priority ordering |
-| `test_input_validation.py` | 70 | Shell injection prevention, invalid character detection |
-| `test_findings.py` | 13 | Finding limits, thread safety with concurrent access |
+| `test_severity_classification.py` | 35 | Critical/warning/info keyword detection, priority ordering |
+| `test_input_validation.py` | 67 | Shell injection prevention, invalid character detection |
+| `test_findings.py` | 10 | Finding limits, thread safety with concurrent access |
 | `test_kubectl_execution.py` | 12 | shell=False execution, fallback logic, caching |
+| `test_api_cache.py` | 11 | TTL expiration, thread safety, key generation |
+| `test_incremental_cache.py` | 14 | Delta reporting, save/load, file permissions |
+| `test_performance_tracker.py` | 9 | Timing aggregation, slowest methods, thread safety |
 
 ---
 

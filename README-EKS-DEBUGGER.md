@@ -322,6 +322,28 @@ For private endpoints, connect via:
 
 ---
 
+## Unit Tests
+
+The debugger includes a comprehensive test suite covering security and core functionality:
+
+```bash
+# Run all tests
+python3 -m pytest tests/ -v
+
+# Run with coverage
+python3 -m pytest tests/ -v --cov=. --cov-report=term-missing
+```
+
+### Test Coverage
+
+| Test File | Tests | Coverage |
+|-----------|-------|----------|
+| `test_severity_classification.py` | 29 | Critical/warning/info keyword detection, priority ordering |
+| `test_input_validation.py` | 70 | Shell injection prevention, invalid character detection |
+| `test_findings.py` | 13 | Finding limits, thread safety with concurrent access |
+
+---
+
 ## Catalog Coverage
 
 This tool implements 100% coverage of three comprehensive EKS troubleshooting catalogs:

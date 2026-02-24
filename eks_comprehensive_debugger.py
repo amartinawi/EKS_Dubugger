@@ -4404,6 +4404,221 @@ class HTMLOutputFormatter(OutputFormatter):
 
         # Add correlations section
         correlations = results.get("correlations", [])
+        incident_story = results.get("incident_story", {})
+        dependency_chains = results.get("dependency_chains", [])
+
+        # Add Incident Story section (if available)
+        if incident_story and incident_story.get("timeline"):
+            html += f"""
+            <!-- Incident Story Section -->
+            <section class="section" id="incident-story">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <div class="section-title">
+                        <span class="section-icon">📖</span>
+                        <span>Incident Story: What Happened</span>
+                    </div>
+                    <div class="section-meta">
+                        <span class="section-toggle">▼</span>
+                    </div>
+                </div>
+                <div class="section-content" style="padding: 1.5rem;">
+                    <div class="incident-story">
+"""
+            # Add summary
+            if incident_story.get("summary"):
+                html += f"""
+                        <div class="story-summary">
+                            <pre style="white-space: pre-wrap; font-family: inherit; margin: 0;">{self._escape_html(incident_story["summary"])}</pre>
+                        </div>
+"""
+
+            # Add narrative timeline
+            if incident_story.get("timeline"):
+                html += """
+                        <h4 style="margin-top: 1.5rem; color: #60a5fa;">📅 Timeline</h4>
+                        <div class="story-timeline">
+"""
+                for event in incident_story["timeline"][:15]:
+                    severity_class = event.get("severity", "info")
+                    html += f"""
+                            <div class="timeline-event {severity_class}">
+                                <div class="event-time">{self._escape_html(event.get("time", ""))}</div>
+                                <div class="event-content">
+                                    <div class="event-what">{self._escape_html(event.get("what_happened", ""))}</div>
+                                    <div class="event-impact">{self._escape_html(event.get("impact", ""))}</div>
+                                </div>
+                            </div>
+"""
+                html += """
+                        </div>
+"""
+
+            # Add key events
+            if incident_story.get("key_events"):
+                html += """
+                        <h4 style="margin-top: 1.5rem; color: #f87171;">⚠️ Key Events</h4>
+                        <ul class="key-events-list">
+"""
+                for ke in incident_story["key_events"]:
+                    html += f"""
+                            <li>
+                                <strong>{self._escape_html(ke.get("time", ""))}</strong>: 
+                                {self._escape_html(ke.get("event", ""))}
+                                <span class="event-significance">({self._escape_html(ke.get("significance", ""))})</span>
+                            </li>
+"""
+                html += """
+                        </ul>
+"""
+
+            html += """
+                    </div>
+                </div>
+            </section>
+"""
+
+        # Add Dependency Chains section (if available)
+        if dependency_chains:
+            html += f"""
+            <!-- Dependency Chains Section -->
+            <section class="section" id="dependency-chains">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <div class="section-title">
+                        <span class="section-icon">⛓️</span>
+                        <span>Causal Chains</span>
+                    </div>
+                    <div class="section-meta">
+                        <span class="section-count">{len(dependency_chains)}</span>
+                        <span class="section-toggle">▼</span>
+                    </div>
+                </div>
+                <div class="section-content" style="padding: 1.5rem;">
+"""
+            for chain in dependency_chains:
+                html += f"""
+                    <div class="dependency-chain-card">
+                        <div class="chain-description">{self._escape_html(chain.get("chain_description", ""))}</div>
+                        <div class="chain-flow">
+"""
+                for i, step in enumerate(chain.get("cascade", [])):
+                    arrow = " → " if i > 0 else ""
+                    html += f"""
+                            {arrow}<span class="chain-step">{self._escape_html(step.get("type", ""))}</span>
+"""
+                html += f"""
+                        </div>
+                        <div class="chain-impact">Pods affected: {chain.get("total_pods_affected", 0)}</div>
+                    </div>
+"""
+            html += """
+                </div>
+            </section>
+"""
+
+        # Add Automated Fixes section (if available)
+        if incident_story and incident_story.get("automated_fixes"):
+            html += f"""
+            <!-- Automated Fixes Section -->
+            <section class="section" id="automated-fixes">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <div class="section-title">
+                        <span class="section-icon">🔧</span>
+                        <span>Automated Fix Commands</span>
+                    </div>
+                    <div class="section-meta">
+                        <span class="section-count">{len(incident_story["automated_fixes"])}</span>
+                        <span class="section-toggle">▼</span>
+                    </div>
+                </div>
+                <div class="section-content" style="padding: 1.5rem;">
+"""
+            for fix in incident_story["automated_fixes"]:
+                severity_badge = fix.get("severity", "warning")
+                html += f"""
+                    <div class="fix-card {severity_badge}">
+                        <div class="fix-header">
+                            <span class="fix-issue">{self._escape_html(fix.get("issue", ""))}</span>
+                            <span class="fix-severity {severity_badge}">{severity_badge}</span>
+                        </div>
+                        <div class="fix-description">{self._escape_html(fix.get("description", ""))}</div>
+"""
+                # Add affected resources
+                if fix.get("affected_resources"):
+                    html += """
+                        <div class="fix-resources">
+                            <strong>Affected:</strong>
+                            <ul>
+"""
+                    for res in fix["affected_resources"][:5]:
+                        html += f"""
+                                <li>{self._escape_html(res)}</li>
+"""
+                    html += """
+                            </ul>
+                        </div>
+"""
+                # Add commands
+                if fix.get("commands"):
+                    html += """
+                        <div class="fix-commands">
+                            <strong>Commands:</strong>
+"""
+                    for cmd in fix["commands"]:
+                        safe_badge = (
+                            '<span class="safe-badge">✓ Safe</span>'
+                            if cmd.get("safe")
+                            else '<span class="unsafe-badge">⚠ Review</span>'
+                        )
+                        html += f"""
+                            <div class="command-block">
+                                <div class="command-desc">{self._escape_html(cmd.get("description", ""))} {safe_badge}</div>
+                                <pre class="command-code">{self._escape_html(cmd.get("command", ""))}</pre>
+                                <div class="command-explanation">{self._escape_html(cmd.get("explanation", ""))}</div>
+                            </div>
+"""
+                    html += """
+                        </div>
+"""
+                html += """
+                    </div>
+"""
+            html += """
+                </div>
+            </section>
+"""
+
+        # Add Verification Steps section
+        if incident_story and incident_story.get("verification_steps"):
+            html += f"""
+            <!-- Verification Steps Section -->
+            <section class="section" id="verification-steps">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <div class="section-title">
+                        <span class="section-icon">✅</span>
+                        <span>Verification Steps</span>
+                    </div>
+                    <div class="section-meta">
+                        <span class="section-count">{len(incident_story["verification_steps"])}</span>
+                        <span class="section-toggle">▼</span>
+                    </div>
+                </div>
+                <div class="section-content" style="padding: 1.5rem;">
+                    <ol class="verification-steps-list">
+"""
+            for step in incident_story["verification_steps"]:
+                html += f"""
+                        <li>
+                            <strong>{self._escape_html(step.get("action", ""))}</strong>
+                            <pre class="verification-command">{self._escape_html(step.get("command", ""))}</pre>
+                            <div class="verification-expected">Expected: {self._escape_html(step.get("expected_result", ""))}</div>
+                        </li>
+"""
+            html += """
+                    </ol>
+                </div>
+            </section>
+"""
+
         if correlations:
             html += f"""
             <!-- Correlations Section -->
@@ -4421,13 +4636,39 @@ class HTMLOutputFormatter(OutputFormatter):
                 <div class="section-content" style="padding: 1.5rem;">
 """
             for corr in correlations:
+                # Add root cause score if available
+                score_badge = ""
+                if corr.get("root_cause_score"):
+                    tier = corr.get("ranking_tier", "")
+                    tier_icon = (
+                        "🥇" if tier == "primary" else ("🥈" if tier == "secondary" else "ℹ️")
+                    )
+                    score_badge = f'<span class="score-badge {tier}">{tier_icon} Score: {corr["root_cause_score"]}</span>'
+
                 html += f"""
                     <div class="correlation-card {corr.get("severity", "warning")}">
                         <div class="corr-header">
                             <div class="corr-title">🔍 {self._escape_html(corr.get("root_cause", ""))}</div>
-                            <span class="severity-badge {corr.get("severity", "warning")}">{corr.get("severity", "warning")}</span>
+                            <div class="corr-badges">
+                                <span class="severity-badge {corr.get("severity", "warning")}">{corr.get("severity", "warning")}</span>
+                                {score_badge}
+                            </div>
                         </div>
                         <div class="corr-time">⏰ First detected: {self._escape_html(corr.get("root_cause_time", "Unknown"))}</div>
+"""
+                # Add temporal causality info
+                if corr.get("temporal_confidence"):
+                    confidence_pct = int(corr["temporal_confidence"] * 100)
+                    html += f"""
+                        <div class="corr-confidence">📊 Confidence: {confidence_pct}% (avg lag: {corr.get("avg_lag_minutes", "?")} min)</div>
+"""
+                # Add blast radius
+                blast = corr.get("blast_radius", {})
+                if blast:
+                    html += f"""
+                        <div class="corr-blast">💥 Blast radius: {blast.get("pods", 0)} pods, {blast.get("nodes", 0)} nodes, {blast.get("namespaces", 0)} namespaces ({blast.get("capacity_impact_percent", 0)}% capacity)</div>
+"""
+                html += f"""
                         <div class="corr-impact">📊 Impact: {self._escape_html(corr.get("impact", ""))}</div>
                         <div class="corr-recommendation">💡 Recommendation: {self._escape_html(corr.get("recommendation", ""))}</div>
 """
@@ -8279,9 +8520,174 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 }
             )
 
-        # Store correlations
+        # Correlation Rule 9: Storage Cascade (EBS attachment → Pod startup failures)
+        pvc_pending = [
+            f
+            for f in self.findings.get("pvc_issues", [])
+            if "pending" in f.get("summary", "").lower()
+            or "ProvisioningFailed" in f.get("summary", "")
+        ]
+        storage_related_pods = [
+            f
+            for f in self.findings.get("pod_errors", [])
+            if any(
+                kw in f.get("summary", "").lower()
+                for kw in ["containercreating", "mount", "volume", "attach"]
+            )
+        ]
+        if pvc_pending and storage_related_pods:
+            pvc_times = [self._extract_timestamp(f.get("details", {})) for f in pvc_pending]
+            first_pvc = min(t for t in pvc_times if t) if any(pvc_times) else None
+            correlations.append(
+                {
+                    "correlation_type": "storage_cascade",
+                    "severity": "critical",
+                    "root_cause": "Storage attachment issues detected",
+                    "root_cause_time": str(first_pvc) if first_pvc else "Unknown",
+                    "affected_components": {
+                        "pending_pvcs": len(pvc_pending),
+                        "affected_pods": len(storage_related_pods),
+                        "pvc_examples": [f.get("summary", "")[:80] for f in pvc_pending[:3]],
+                    },
+                    "impact": f"{len(pvc_pending)} PVCs pending, blocking {len(storage_related_pods)} pod startups",
+                    "recommendation": "Check EBS CSI driver, storage class, and IAM permissions. Verify volumes exist and are available.",
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html",
+                }
+            )
+
+        # Correlation Rule 10: IRSA Cascade (IAM issues → Application failures)
+        iam_issues = self.findings.get("rbac_issues", [])
+        credential_failures = [
+            f
+            for f in self.findings.get("pod_errors", [])
+            if any(
+                kw in str(f.get("details", {})).lower()
+                for kw in ["403", "unauthorized", "credential", "access denied", "token"]
+            )
+        ]
+        if iam_issues and credential_failures:
+            iam_times = [self._extract_timestamp(f.get("details", {})) for f in iam_issues]
+            first_iam = min(t for t in iam_times if t) if any(iam_times) else None
+            correlations.append(
+                {
+                    "correlation_type": "irsa_cascade",
+                    "severity": "critical",
+                    "root_cause": "IAM/IRSA authentication issues detected",
+                    "root_cause_time": str(first_iam) if first_iam else "Unknown",
+                    "affected_components": {
+                        "iam_issues": len(iam_issues),
+                        "credential_failures": len(credential_failures),
+                        "examples": [f.get("summary", "")[:80] for f in credential_failures[:3]],
+                    },
+                    "impact": f"{len(iam_issues)} IAM issues causing {len(credential_failures)} application failures",
+                    "recommendation": "Verify IRSA annotation, IAM role trust policy, and service account configuration",
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html",
+                }
+            )
+
+        # Correlation Rule 11: HPA Thrashing (rapid scale events → instability)
+        hpa_events = self.findings.get("scheduling_failures", []) + [
+            f
+            for f in self.findings.get("pod_errors", [])
+            if "scale" in f.get("summary", "").lower() or "replica" in f.get("summary", "").lower()
+        ]
+        if len(hpa_events) >= 3:
+            hpa_times = [self._extract_timestamp(f.get("details", {})) for f in hpa_events]
+            valid_times = [t for t in hpa_times if t]
+            if valid_times:
+                # Check if events occurred in rapid succession (within 30 minutes)
+                time_span = (max(valid_times) - min(valid_times)).total_seconds() / 60
+                if time_span <= 30:
+                    first_hpa = min(valid_times)
+                    correlations.append(
+                        {
+                            "correlation_type": "hpa_thrashing",
+                            "severity": "warning",
+                            "root_cause": "HPA thrashing detected (rapid scale up/down)",
+                            "root_cause_time": str(first_hpa),
+                            "affected_components": {
+                                "hpa_events": len(hpa_events),
+                                "time_span_minutes": round(time_span, 1),
+                                "examples": [f.get("summary", "")[:80] for f in hpa_events[:3]],
+                            },
+                            "impact": f"{len(hpa_events)} scaling events in {round(time_span, 1)} minutes causing pod churn",
+                            "recommendation": "Review HPA metrics, thresholds, and consider stabilization window",
+                            "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/horizontal-pod-autoscaler.html",
+                        }
+                    )
+
+        # Correlation Rule 12: Quota Exhaustion (ResourceQuota → Scheduling failures)
+        quota_issues = self.findings.get("resource_quota_exceeded", [])
+        sched_failures = self.findings.get("scheduling_failures", [])
+        if quota_issues and sched_failures:
+            quota_times = [self._extract_timestamp(f.get("details", {})) for f in quota_issues]
+            first_quota = min(t for t in quota_times if t) if any(quota_times) else None
+            correlations.append(
+                {
+                    "correlation_type": "quota_exhaustion",
+                    "severity": "warning",
+                    "root_cause": "Resource quota exhaustion blocking scheduling",
+                    "root_cause_time": str(first_quota) if first_quota else "Unknown",
+                    "affected_components": {
+                        "quota_issues": len(quota_issues),
+                        "scheduling_failures": len(sched_failures),
+                        "examples": [f.get("summary", "")[:80] for f in quota_issues[:3]],
+                    },
+                    "impact": f"{len(quota_issues)} quota limits hit, causing {len(sched_failures)} scheduling failures",
+                    "recommendation": "Review resource quotas and requests. Consider increasing quotas or optimizing resource usage",
+                    "aws_doc": "https://kubernetes.io/docs/concepts/policy/resource-quotas/",
+                }
+            )
+
+        # Correlation Rule 13: Certificate Cascade (Cert expiry → Webhook failures)
+        cert_issues = self.findings.get("node_issues", []) + [
+            f
+            for f in self.findings.get("control_plane_issues", [])
+            if any(
+                kw in f.get("summary", "").lower() for kw in ["cert", "tls", "x509", "certificate"]
+            )
+        ]
+        webhook_failures = [
+            f
+            for f in self.findings.get("control_plane_issues", [])
+            if "webhook" in f.get("summary", "").lower()
+            or "admission" in f.get("summary", "").lower()
+        ]
+        deployment_failures = [
+            f
+            for f in self.findings.get("pod_errors", [])
+            if "rollout" in f.get("summary", "").lower()
+            or "deployment" in f.get("summary", "").lower()
+        ]
+        if cert_issues and (webhook_failures or deployment_failures):
+            cert_times = [self._extract_timestamp(f.get("details", {})) for f in cert_issues]
+            first_cert = min(t for t in cert_times if t) if any(cert_times) else None
+            correlations.append(
+                {
+                    "correlation_type": "certificate_cascade",
+                    "severity": "critical",
+                    "root_cause": "Certificate issues causing webhook/deployment failures",
+                    "root_cause_time": str(first_cert) if first_cert else "Unknown",
+                    "affected_components": {
+                        "cert_issues": len(cert_issues),
+                        "webhook_failures": len(webhook_failures),
+                        "deployment_failures": len(deployment_failures),
+                    },
+                    "impact": f"Certificate issues affecting {len(webhook_failures)} webhooks and {len(deployment_failures)} deployments",
+                    "recommendation": "Check certificate expiration and rotation. Verify kubelet and API server certificates",
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/certificate-rotation.html",
+                }
+            )
+
+        # Store correlations and enhance them
         if correlations:
             self.correlations = correlations
+            # Add temporal causality, blast radius, and ranking
+            self._enhance_correlations()
+            # Generate incident story for narrative output
+            self.incident_story = self._generate_incident_story()
+        else:
+            self.incident_story = {}
 
         # Build incident timeline
         if timeline_events:
@@ -8331,6 +8737,437 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         self.progress.info(f"Correlation analysis complete: {len(correlations)} correlations found")
 
+    def _generate_incident_story(self) -> dict:
+        """Generate a narrative story of what happened.
+
+        Creates a human-readable timeline that tells the story of the incident,
+        linking events together in a logical sequence.
+
+        Returns:
+            Dict with story narrative, key events, and remediation steps
+        """
+        story = {
+            "title": "",
+            "summary": "",
+            "timeline": [],
+            "key_events": [],
+            "automated_fixes": [],
+            "verification_steps": [],
+        }
+
+        if not self.correlations:
+            return story
+
+        # Sort timeline events
+        timeline_events = []
+        for category, findings_list in self.findings.items():
+            for finding in findings_list:
+                ts = self._extract_timestamp(finding.get("details", {}))
+                if ts:
+                    timeline_events.append(
+                        {
+                            "timestamp": ts,
+                            "category": category,
+                            "summary": finding.get("summary", ""),
+                            "severity": finding.get("details", {}).get("severity", "info"),
+                        }
+                    )
+
+        timeline_events.sort(key=lambda x: x["timestamp"])
+
+        if not timeline_events:
+            return story
+
+        # Generate story title based on primary correlation
+        primary_correlation = self.correlations[0] if self.correlations else None
+        if primary_correlation:
+            corr_type = primary_correlation.get("correlation_type", "incident")
+            story["title"] = f"{corr_type.replace('_', ' ').title()} Detected"
+        else:
+            story["title"] = "Cluster Health Issues Detected"
+
+        # Build narrative timeline
+        narrative_events = []
+        for i, event in enumerate(timeline_events[:20]):  # Top 20 events
+            time_str = event["timestamp"].strftime("%H:%M")
+
+            # Determine what happened
+            what_happened = event["summary"]
+            category = event["category"]
+            severity = event["severity"]
+
+            # Determine impact
+            impact = self._determine_impact(event, timeline_events[i:])
+
+            narrative_events.append(
+                {
+                    "time": time_str,
+                    "what_happened": what_happened[:150],
+                    "category": category,
+                    "severity": severity,
+                    "impact": impact,
+                }
+            )
+
+        story["timeline"] = narrative_events
+
+        # Extract key events (critical and high impact)
+        key_events = [
+            {
+                "time": e["time"],
+                "event": e["what_happened"],
+                "significance": self._get_event_significance(e),
+            }
+            for e in narrative_events
+            if e["severity"] in ["critical", "warning"]
+        ][:5]
+        story["key_events"] = key_events
+
+        # Generate automated fixes based on correlations
+        story["automated_fixes"] = self._generate_automated_fixes()
+
+        # Generate verification steps
+        story["verification_steps"] = self._generate_verification_steps()
+
+        # Generate summary paragraph
+        story["summary"] = self._generate_story_summary(narrative_events, primary_correlation)
+
+        return story
+
+    def _determine_impact(self, event: dict, subsequent_events: list) -> str:
+        """Determine the impact of an event based on subsequent events."""
+        category = event["category"]
+        severity = event["severity"]
+
+        # Count affected resources in subsequent events
+        affected_pods = sum(1 for e in subsequent_events if "pod" in e["category"])
+        affected_nodes = sum(1 for e in subsequent_events if "node" in e["category"])
+        affected_services = sum(
+            1 for e in subsequent_events if "service" in e["category"] or "dns" in e["category"]
+        )
+
+        if category in ["oom_killed", "memory_pressure"]:
+            return f"Potential impact: {affected_pods} pods may experience restart issues"
+        elif category in ["node_issues", "disk_pressure"]:
+            return f"Potential impact: {affected_pods} pods at risk of eviction"
+        elif category in ["network_issues", "dns_issues"]:
+            return f"Potential impact: {affected_services} services may have connectivity issues"
+        elif severity == "critical":
+            return f"High priority: Requires immediate attention"
+        elif severity == "warning":
+            return f"Medium priority: Monitor and plan remediation"
+        else:
+            return "Informational: No immediate action required"
+
+    def _get_event_significance(self, event: dict) -> str:
+        """Get significance description for an event."""
+        category = event["category"]
+        severity = event["severity"]
+
+        significance_map = {
+            "oom_killed": "Memory exhaustion - indicates resource constraints",
+            "memory_pressure": "Node under memory stress - may cause cascading failures",
+            "disk_pressure": "Storage pressure - can lead to pod evictions",
+            "node_issues": "Node health degraded - affects workload placement",
+            "pod_errors": "Workload disruption - impacts service availability",
+            "network_issues": "Connectivity problems - affects service communication",
+            "dns_issues": "DNS resolution failures - impacts service discovery",
+            "control_plane_issues": "Control plane stress - cluster stability concern",
+        }
+
+        return significance_map.get(
+            category, f"{category.replace('_', ' ')} - requires investigation"
+        )
+
+    def _generate_automated_fixes(self) -> list:
+        """Generate copy-pasteable fix commands based on findings."""
+        fixes = []
+
+        # OOM fixes
+        oom_findings = self.findings.get("oom_killed", [])
+        if oom_findings:
+            affected_pods = set()
+            for f in oom_findings:
+                pod_name = f.get("details", {}).get("pod", "")
+                namespace = f.get("details", {}).get("namespace", "default")
+                if pod_name:
+                    affected_pods.add(f"{namespace}/{pod_name}")
+
+            if affected_pods:
+                fixes.append(
+                    {
+                        "issue": "OOM Killed Pods",
+                        "severity": "critical",
+                        "description": f"{len(oom_findings)} pods killed due to memory limits",
+                        "commands": [
+                            {
+                                "description": "Check current memory limits",
+                                "command": f"kubectl get pods -A -o json | jq -r '.items[] | select(.status.containerStatuses[0].state.terminated.reason==\"OOMKilled\") | {{name: .metadata.name, namespace: .metadata.namespace, limits: .spec.containers[0].resources.limits}}'",
+                                "explanation": "Lists pods with OOM kills and their current memory limits",
+                                "safe": True,
+                            },
+                            {
+                                "description": "Increase memory limit for affected deployment",
+                                "command": f"# For each affected pod, update its deployment:\nkubectl set resources deployment/<deployment-name> -n <namespace> --limits=memory=512Mi --requests=memory=256Mi",
+                                "explanation": "Increases memory limit. Replace <deployment-name> and <namespace> with actual values.",
+                                "safe": False,
+                                "requires_input": True,
+                            },
+                        ],
+                        "affected_resources": list(affected_pods)[:5],
+                    }
+                )
+
+        # Image pull fixes
+        image_findings = self.findings.get("image_pull_failures", [])
+        if image_findings:
+            fixes.append(
+                {
+                    "issue": "Image Pull Failures",
+                    "severity": "critical",
+                    "description": f"{len(image_findings)} pods failed to pull images",
+                    "commands": [
+                        {
+                            "description": "Check image pull secrets",
+                            "command": "kubectl get secrets -A | grep -E 'docker|ecr|registry'",
+                            "explanation": "Lists available image pull secrets",
+                            "safe": True,
+                        },
+                        {
+                            "description": "Describe pod to see image pull error details",
+                            "command": "kubectl describe pod <pod-name> -n <namespace> | grep -A 10 'Events:'",
+                            "explanation": "Shows detailed image pull error. Replace <pod-name> and <namespace>",
+                            "safe": True,
+                            "requires_input": True,
+                        },
+                        {
+                            "description": "Check ECR access (if using ECR)",
+                            "command": 'kubectl get pods -A -o jsonpath=\'{range .items[?(@.status.containerStatuses[0].state.waiting.reason=="ImagePullBackOff")]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}\'',
+                            "explanation": "Lists all pods in ImagePullBackOff state",
+                            "safe": True,
+                        },
+                    ],
+                    "affected_resources": [f.get("summary", "")[:100] for f in image_findings[:5]],
+                }
+            )
+
+        # Node pressure fixes
+        pressure_findings = self.findings.get("memory_pressure", []) + self.findings.get(
+            "disk_pressure", []
+        )
+        if pressure_findings:
+            affected_nodes = set()
+            for f in pressure_findings:
+                node = f.get("details", {}).get("node", "")
+                if node:
+                    affected_nodes.add(node)
+
+            fixes.append(
+                {
+                    "issue": "Node Resource Pressure",
+                    "severity": "critical",
+                    "description": f"{len(pressure_findings)} nodes under resource pressure",
+                    "commands": [
+                        {
+                            "description": "Check node resource usage",
+                            "command": "kubectl describe nodes | grep -A 5 'Allocated resources'",
+                            "explanation": "Shows resource allocation on all nodes",
+                            "safe": True,
+                        },
+                        {
+                            "description": "Check for evicted pods",
+                            "command": "kubectl get pods -A --field-selector=status.phase=Failed -o wide",
+                            "explanation": "Lists failed/evicted pods",
+                            "safe": True,
+                        },
+                        {
+                            "description": "Cordon node to prevent new scheduling",
+                            "command": "# kubectl cordon <node-name>  # Uncomment and replace <node-name>",
+                            "explanation": "Prevents new pods from scheduling on stressed node",
+                            "safe": False,
+                            "requires_input": True,
+                        },
+                    ],
+                    "affected_resources": list(affected_nodes)[:5],
+                }
+            )
+
+        # CrashLoopBackOff fixes
+        crash_findings = [
+            f
+            for cat in ["pod_errors"]
+            for f in self.findings.get(cat, [])
+            if "crash" in f.get("summary", "").lower()
+        ]
+        if crash_findings:
+            fixes.append(
+                {
+                    "issue": "Pod Crashes (CrashLoopBackOff)",
+                    "severity": "critical",
+                    "description": f"{len(crash_findings)} pods in crash loop",
+                    "commands": [
+                        {
+                            "description": "Get crash logs",
+                            "command": "kubectl logs <pod-name> -n <namespace> --previous --tail=100",
+                            "explanation": "Shows logs from previous container instance",
+                            "safe": True,
+                            "requires_input": True,
+                        },
+                        {
+                            "description": "Check pod events",
+                            "command": "kubectl get events --field-selector involvedObject.name=<pod-name> -n <namespace>",
+                            "explanation": "Shows events related to the pod",
+                            "safe": True,
+                            "requires_input": True,
+                        },
+                        {
+                            "description": "Check liveness/readiness probes",
+                            "command": "kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.containers[*].livenessProbe}'",
+                            "explanation": "Shows liveness probe configuration",
+                            "safe": True,
+                            "requires_input": True,
+                        },
+                    ],
+                    "affected_resources": [f.get("summary", "")[:100] for f in crash_findings[:5]],
+                }
+            )
+
+        # DNS issues fixes
+        dns_findings = self.findings.get("dns_issues", [])
+        if dns_findings:
+            fixes.append(
+                {
+                    "issue": "DNS Resolution Issues",
+                    "severity": "warning",
+                    "description": f"{len(dns_findings)} DNS-related issues",
+                    "commands": [
+                        {
+                            "description": "Check CoreDNS pod status",
+                            "command": "kubectl get pods -n kube-system -l k8s-app=kube-dns -o wide",
+                            "explanation": "Shows CoreDNS pod health",
+                            "safe": True,
+                        },
+                        {
+                            "description": "Check CoreDNS logs",
+                            "command": "kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50",
+                            "explanation": "Shows recent CoreDNS logs",
+                            "safe": True,
+                        },
+                        {
+                            "description": "Test DNS resolution from a pod",
+                            "command": "kubectl run dns-test --image=busybox:1.28 --rm -it --restart=Never -- nslookup kubernetes.default",
+                            "explanation": "Tests DNS resolution from inside cluster",
+                            "safe": True,
+                        },
+                    ],
+                    "affected_resources": [f.get("summary", "")[:100] for f in dns_findings[:5]],
+                }
+            )
+
+        return fixes
+
+    def _generate_verification_steps(self) -> list:
+        """Generate verification steps to confirm fixes worked."""
+        steps = []
+
+        # Generic verification steps
+        steps.append(
+            {
+                "step": 1,
+                "action": "Check overall cluster health",
+                "command": "kubectl get nodes",
+                "expected_result": "All nodes should show 'Ready' status",
+            }
+        )
+
+        steps.append(
+            {
+                "step": 2,
+                "action": "Check pod health across namespaces",
+                "command": "kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded | head -20",
+                "expected_result": "Should show minimal or no problematic pods",
+            }
+        )
+
+        steps.append(
+            {
+                "step": 3,
+                "action": "Check recent events for new issues",
+                "command": "kubectl get events -A --sort-by='.lastTimestamp' | tail -20",
+                "expected_result": "No critical or warning events in recent history",
+            }
+        )
+
+        # Add specific verification based on findings
+        if self.findings.get("oom_killed"):
+            steps.append(
+                {
+                    "step": 4,
+                    "action": "Verify no new OOM kills",
+                    "command": "kubectl get pods -A -o json | jq -r '.items[] | select(.status.containerStatuses[0].state.terminated.reason==\"OOMKilled\") | .metadata.name'",
+                    "expected_result": "Should return no results (empty)",
+                }
+            )
+
+        if self.findings.get("image_pull_failures"):
+            steps.append(
+                {
+                    "step": 5,
+                    "action": "Verify image pulls working",
+                    "command": "kubectl get pods -A --field-selector=status.phase=Pending -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}' | head -10",
+                    "expected_result": "Pending pods should be minimal (only those waiting for other reasons)",
+                }
+            )
+
+        return steps
+
+    def _generate_story_summary(self, narrative_events: list, primary_correlation: dict) -> str:
+        """Generate a summary paragraph of the incident."""
+        if not narrative_events:
+            return "No significant issues detected during the analysis period."
+
+        # Count issues by severity
+        critical_count = sum(1 for e in narrative_events if e["severity"] == "critical")
+        warning_count = sum(1 for e in narrative_events if e["severity"] == "warning")
+        info_count = len(narrative_events) - critical_count - warning_count
+
+        # Get time range
+        if narrative_events:
+            start_time = narrative_events[0]["time"]
+            end_time = narrative_events[-1]["time"]
+            time_range = f"{start_time} to {end_time}"
+        else:
+            time_range = "N/A"
+
+        # Get primary root cause
+        if primary_correlation:
+            root_cause = primary_correlation.get("root_cause", "Unknown issue")
+            impact = primary_correlation.get("impact", "")
+        else:
+            root_cause = "Multiple issues detected"
+            impact = ""
+
+        # Build summary
+        summary_parts = [
+            f"**Incident Summary** ({time_range})",
+            "",
+            f"**Root Cause**: {root_cause}",
+            "",
+            f"**Impact**: {critical_count} critical, {warning_count} warning, {info_count} informational findings detected.",
+            "",
+        ]
+
+        if impact:
+            summary_parts.append(f"**Details**: {impact}")
+            summary_parts.append("")
+
+        # Add key affected areas
+        categories = list(set(e["category"] for e in narrative_events[:10]))
+        if categories:
+            summary_parts.append(f"**Affected Areas**: {', '.join(categories[:5])}")
+
+        return "\n".join(summary_parts)
+
     def _get_bucket_severity(self, events):
         """Determine severity for a timeline bucket"""
         categories = [e["category"] for e in events]
@@ -8339,6 +9176,332 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         elif any("control_plane" in c or "node" in c for c in categories):
             return "warning"
         return "info"
+
+    # =========================================================================
+    # ENHANCED ROOT CAUSE DETECTION METHODS
+    # =========================================================================
+
+    CAUSAL_CHAINS = [
+        ("node_pressure_cascade", "oom_pattern", "Node pressure triggered OOM kills"),
+        ("cni_cascade", "dns_pattern", "CNI failure caused DNS resolution issues"),
+        ("control_plane_impact", "scheduling_pattern", "API server issues blocked pod scheduling"),
+        (
+            "scheduling_pattern",
+            "image_pull_pattern",
+            "Pending pods caused repeated image pull attempts",
+        ),
+        ("cluster_upgrade", "node_pressure_cascade", "Upgrade triggered node pressure events"),
+        ("storage_cascade", "scheduling_pattern", "Storage issues prevented pod scheduling"),
+    ]
+
+    def _score_temporal_causality(
+        self, cause_events: list, effect_events: list, max_lag_minutes: int = 30
+    ) -> dict:
+        """Score how likely cause preceded effect within a time window.
+
+        Args:
+            cause_events: List of potential cause events
+            effect_events: List of potential effect events
+            max_lag_minutes: Maximum time window for causality
+
+        Returns:
+            Dict with confidence score, average lag, and causal pairs
+        """
+        causal_pairs = []
+
+        for effect in effect_events:
+            effect_ts = self._extract_timestamp(effect.get("details", {}))
+            if not effect_ts:
+                continue
+
+            # Find closest preceding cause
+            best_cause = None
+            best_lag = None
+
+            for cause in cause_events:
+                cause_ts = self._extract_timestamp(cause.get("details", {}))
+                if not cause_ts:
+                    continue
+
+                lag = (effect_ts - cause_ts).total_seconds() / 60
+
+                # Cause must precede effect
+                if 0 < lag <= max_lag_minutes:
+                    if best_lag is None or lag < best_lag:
+                        best_cause = cause
+                        best_lag = lag
+
+            if best_cause:
+                causal_pairs.append(
+                    {
+                        "cause": best_cause.get("summary", "")[:100],
+                        "effect": effect.get("summary", "")[:100],
+                        "lag_minutes": round(best_lag, 1),
+                    }
+                )
+
+        confidence = len(causal_pairs) / len(effect_events) if effect_events else 0
+        avg_lag = (
+            sum(p["lag_minutes"] for p in causal_pairs) / len(causal_pairs) if causal_pairs else 0
+        )
+
+        return {
+            "confidence": round(confidence, 2),
+            "avg_lag_minutes": round(avg_lag, 1),
+            "causal_pairs_count": len(causal_pairs),
+            "total_effects": len(effect_events),
+            "causal_pairs": causal_pairs[:5],  # Top 5 examples
+        }
+
+    def _calculate_blast_radius(self, root_cause_time: str) -> dict:
+        """Calculate how many resources are affected after a root cause event.
+
+        Args:
+            root_cause_time: ISO timestamp of the root cause
+
+        Returns:
+            Dict with counts of affected namespaces, pods, nodes, services
+        """
+        affected = {
+            "namespaces": set(),
+            "pods": set(),
+            "nodes": set(),
+            "services": set(),
+            "deployments": set(),
+        }
+
+        # Parse root cause time
+        try:
+            from dateutil import parser
+
+            root_time = parser.parse(root_cause_time)
+        except Exception:
+            return {k: 0 for k in affected}
+
+        # Walk all findings that fall within the causal window
+        for category, findings_list in self.findings.items():
+            for finding in findings_list:
+                ts = self._extract_timestamp(finding.get("details", {}))
+                if ts and ts >= root_time:
+                    details = finding.get("details", {})
+
+                    if details.get("namespace"):
+                        affected["namespaces"].add(details["namespace"])
+
+                    if details.get("pod"):
+                        ns = details.get("namespace", "")
+                        affected["pods"].add(f"{ns}/{details['pod']}" if ns else details["pod"])
+
+                    if details.get("node"):
+                        affected["nodes"].add(details["node"])
+
+                    if details.get("service"):
+                        affected["services"].add(details["service"])
+
+                    if details.get("deployment"):
+                        affected["deployments"].add(details["deployment"])
+
+        # Calculate capacity impact percentage (rough estimate)
+        total_pods = sum(len(v) for v in self.findings.values())
+        affected_pods_count = len(affected["pods"])
+        capacity_impact = round((affected_pods_count / max(total_pods, 1)) * 100, 1)
+
+        return {
+            "namespaces": len(affected["namespaces"]),
+            "pods": len(affected["pods"]),
+            "nodes": len(affected["nodes"]),
+            "services": len(affected["services"]),
+            "deployments": len(affected["deployments"]),
+            "capacity_impact_percent": capacity_impact,
+            "affected_namespaces": list(affected["namespaces"])[:10],
+            "affected_nodes": list(affected["nodes"])[:10],
+        }
+
+    def _build_dependency_chains(self, correlations: list) -> list:
+        """Link correlations into causal chains.
+
+        Turns "3 separate correlations" into "1 chain: A → B → C"
+
+        Args:
+            correlations: List of correlation dicts
+
+        Returns:
+            List of dependency chain dicts
+        """
+        corr_map = {c["correlation_type"]: c for c in correlations}
+        chains = []
+        used_correlations = set()
+
+        for upstream, downstream, desc in self.CAUSAL_CHAINS:
+            if upstream in corr_map and downstream in corr_map:
+                upstream_corr = corr_map[upstream]
+                downstream_corr = corr_map[downstream]
+
+                # Calculate combined impact
+                upstream_impact = upstream_corr.get("affected_components", {})
+                downstream_impact = downstream_corr.get("affected_components", {})
+
+                total_pods = (
+                    upstream_impact.get("evicted_pods_count", 0)
+                    + upstream_impact.get("oom_killed_pods", 0)
+                    + downstream_impact.get("total_scheduling_failures", 0)
+                    + downstream_impact.get("dns_issues_count", 0)
+                )
+
+                chains.append(
+                    {
+                        "chain_description": desc,
+                        "upstream_cause": upstream_corr.get("root_cause", ""),
+                        "upstream_time": upstream_corr.get("root_cause_time", ""),
+                        "cascade": [
+                            {"type": upstream, "summary": upstream_corr.get("root_cause", "")},
+                            {"type": downstream, "summary": downstream_corr.get("root_cause", "")},
+                        ],
+                        "total_pods_affected": total_pods,
+                        "severity": upstream_corr.get("severity", "warning"),
+                        "recommendation": upstream_corr.get("recommendation", ""),
+                    }
+                )
+
+                used_correlations.add(upstream)
+                used_correlations.add(downstream)
+
+        # Add standalone correlations
+        for corr in correlations:
+            if corr["correlation_type"] not in used_correlations:
+                chains.append(
+                    {
+                        "chain_description": f"Standalone: {corr.get('root_cause', '')}",
+                        "upstream_cause": corr.get("root_cause", ""),
+                        "upstream_time": corr.get("root_cause_time", ""),
+                        "cascade": [
+                            {
+                                "type": corr["correlation_type"],
+                                "summary": corr.get("root_cause", ""),
+                            }
+                        ],
+                        "total_pods_affected": 0,
+                        "severity": corr.get("severity", "info"),
+                        "recommendation": corr.get("recommendation", ""),
+                    }
+                )
+
+        return chains
+
+    def _rank_root_causes(self, correlations: list) -> list:
+        """Rank root causes by confidence and impact.
+
+        Scoring:
+        - Temporal causality: 0-40 points
+        - Severity: 0-30 points
+        - Blast radius: 0-20 points
+        - AWS API confirmation: 0-10 points
+
+        Args:
+            correlations: List of correlation dicts
+
+        Returns:
+            Sorted list of correlations with root_cause_score
+        """
+        for corr in correlations:
+            score = 0
+
+            # Temporal causality score (0-40 points)
+            score += corr.get("temporal_confidence", 0) * 40
+
+            # Severity (0-30 points)
+            severity_scores = {"critical": 30, "high": 25, "warning": 15, "info": 5}
+            score += severity_scores.get(corr.get("severity", "info"), 5)
+
+            # Blast radius (0-20 points) - pods affected
+            blast = corr.get("blast_radius", {})
+            score += min(blast.get("pods", 0), 20)
+
+            # AWS API confirmation (0-10 points)
+            if corr.get("affected_components", {}).get("aws_api_confirmed"):
+                score += 10
+
+            # Explanatory power (0-10 bonus) - how many findings does this explain?
+            total_findings = corr.get("affected_components", {}).get("total_findings", 0)
+            if total_findings > 10:
+                score += 10
+            elif total_findings > 5:
+                score += 5
+
+            corr["root_cause_score"] = round(score, 1)
+            corr["ranking_tier"] = (
+                "primary" if score >= 70 else "secondary" if score >= 40 else "contextual"
+            )
+
+        return sorted(correlations, key=lambda x: x.get("root_cause_score", 0), reverse=True)
+
+    def _enhance_correlations(self) -> None:
+        """Enhance all correlations with temporal causality, blast radius, and ranking.
+
+        Called after correlate_findings() to add enhanced analysis.
+        """
+        for corr in self.correlations:
+            # Add temporal causality scoring
+            if corr["correlation_type"] == "node_pressure_cascade":
+                pressure_type = "memory" if self.findings["memory_pressure"] else "disk"
+                cause_events = self.findings.get(f"{pressure_type}_pressure", [])
+                effect_events = self.findings.get("pod_errors", [])
+
+                causality = self._score_temporal_causality(cause_events, effect_events)
+                corr["temporal_confidence"] = causality["confidence"]
+                corr["avg_lag_minutes"] = causality["avg_lag_minutes"]
+                corr["causal_evidence"] = causality["causal_pairs"]
+
+            elif corr["correlation_type"] == "oom_pattern":
+                # OOM usually follows memory pressure
+                cause_events = self.findings.get("memory_pressure", [])
+                effect_events = self.findings.get("oom_killed", [])
+
+                causality = self._score_temporal_causality(cause_events, effect_events)
+                corr["temporal_confidence"] = causality["confidence"]
+                corr["avg_lag_minutes"] = causality["avg_lag_minutes"]
+                corr["causal_evidence"] = causality["causal_pairs"]
+
+            elif corr["correlation_type"] == "cni_cascade":
+                cause_events = [
+                    f
+                    for f in self.findings.get("network_issues", [])
+                    if any(p in str(f.get("details", {})).lower() for p in ["cni", "aws-node"])
+                ]
+                effect_events = [
+                    f
+                    for f in self.findings.get("network_issues", [])
+                    if "NetworkNotReady" in f.get("summary", "")
+                ]
+
+                causality = self._score_temporal_causality(cause_events, effect_events)
+                corr["temporal_confidence"] = causality["confidence"]
+                corr["avg_lag_minutes"] = causality["avg_lag_minutes"]
+                corr["causal_evidence"] = causality["causal_pairs"]
+
+            else:
+                # Default confidence based on evidence count
+                corr["temporal_confidence"] = (
+                    0.5 if corr.get("affected_components", {}).get("aws_api_confirmed") else 0.3
+                )
+
+            # Add blast radius
+            root_time = corr.get("root_cause_time", "")
+            if root_time and root_time != "Unknown":
+                corr["blast_radius"] = self._calculate_blast_radius(root_time)
+            else:
+                corr["blast_radius"] = {
+                    "pods": 0,
+                    "nodes": 0,
+                    "namespaces": 0,
+                    "capacity_impact_percent": 0,
+                }
+
+        # Rank correlations
+        self.correlations = self._rank_root_causes(self.correlations)
+
+        # Build dependency chains
+        self.dependency_chains = self._build_dependency_chains(self.correlations)
 
     def analyze_cpu_throttling(self):
         """
@@ -13099,6 +14262,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "summary": self._generate_summary(),
             "findings": {k: v for k, v in self.findings.items() if v},
             "correlations": self.correlations,
+            "dependency_chains": getattr(self, "dependency_chains", []),
+            "incident_story": getattr(self, "incident_story", {}),
             "timeline": self.timeline,
             "first_issue": self.first_issue,
             "recommendations": recommendations,

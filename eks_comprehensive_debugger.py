@@ -2343,36 +2343,30 @@ class HTMLOutputFormatter(OutputFormatter):
                     </div>
             """
 
-        # Root Cause Analysis
-        html += """
-                    <!-- Root Cause Analysis - Collapsible -->
-                    <div class="summary-block collapsible collapsed">
-                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
+        # Root Cause Summary - links to unified What Happened section
+        if root_cause.get("has_root_cause"):
+            html += """
+                    <!-- Root Cause Quick View -->
+                    <div class="summary-block">
+                        <div class="summary-block-header" style="cursor: pointer;" onclick="document.getElementById('what-happened').scrollIntoView({behavior: 'smooth'})">
                             <div class="summary-block-title">
-                                <span>🔗</span> Root Cause Analysis
+                                <span>🎯</span> Root Cause
                             </div>
-                            <span class="block-toggle">▼</span>
+                            <span class="block-toggle" style="font-size: 0.8rem;">View Details →</span>
                         </div>
                         <div class="summary-block-content">
-        """
-
-        if root_cause.get("has_root_cause"):
-            for rc in root_cause.get("identified_root_causes", [])[:3]:
-                escaped_root_cause = self._escape_html(rc.get("root_cause", "Unknown"))
-                escaped_impact = self._escape_html(rc.get("impact", "N/A"))
-                html += f"""
-                            <div class="root-cause-item">
-                                <div class="root-cause-text">{escaped_root_cause}</div>
-                                <div class="root-cause-impact">Impact: {escaped_impact}</div>
+            """
+            primary_rc = root_cause.get("identified_root_causes", [{}])[0]
+            escaped_root_cause = self._escape_html(primary_rc.get("root_cause", "Unknown"))
+            html += f"""
+                            <div class="root-cause-item" style="margin: 0;">
+                                <div class="root-cause-text" style="font-size: 0.9rem;">{escaped_root_cause}</div>
                             </div>
-                """
-        else:
-            html += """<p style='color: var(--text-secondary); font-size: 0.9rem;'>No root cause correlations identified</p>"""
-
-        html += """
+            """
+            html += """
                         </div>
                     </div>
-        """
+            """
 
         # Priority Actions
         html += """
@@ -4075,20 +4069,12 @@ class HTMLOutputFormatter(OutputFormatter):
                 </a>
 """
 
-        # Add correlation navigation items
-        if correlations:
+        # Unified What Happened navigation (consolidates correlations + first_issue)
+        if correlations or first_issue:
             html += f"""
-                <a href="#correlations" class="nav-item">
-                    <span>🔗 Root Cause Analysis</span>
+                <a href="#what-happened" class="nav-item">
+                    <span>📖 What Happened</span>
                     <span class="nav-count has-issues">{len(correlations)}</span>
-                </a>
-"""
-
-        if first_issue:
-            html += """
-                <a href="#first-issue" class="nav-item">
-                    <span>🎯 Potential Root Cause</span>
-                    <span class="nav-count">1</span>
                 </a>
 """
 

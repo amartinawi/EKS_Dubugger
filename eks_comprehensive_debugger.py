@@ -8177,6 +8177,43 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             or total_indicators >= 3
             or (len(node_ready_events) >= 2 and len(ds_restarts) >= 1)
         ):
+            # Count findings by severity
+            total_findings = sum(len(v) for v in self.findings.values())
+            critical_findings = sum(
+                1
+                for cat, findings in self.findings.items()
+                for f in findings
+                if f.get("details", {}).get("severity") == "critical"
+            )
+            warning_findings = sum(
+                1
+                for cat, findings in self.findings.items()
+                for f in findings
+                if f.get("details", {}).get("severity") == "warning"
+            )
+            info_findings = total_findings - critical_findings - warning_findings
+
+            # Get affected categories
+            affected_categories = []
+            for cat, findings in self.findings.items():
+                if findings:
+                    affected_categories.append(cat)
+            # Get representative examples (top 3 critical, then top 2 warning)
+            examples = []
+            for cat, findings_list in self.findings.items():
+                if not findings_list:
+                    continue
+                for f in findings_list:
+                    sev = f.get("details", {}).get("severity", "")
+                    if sev == "critical" and len(examples) < 3:
+                        examples.append({"category": cat, "summary": f.get("summary", "")[:100]})
+            for cat, findings_list in self.findings.items():
+                if not findings_list:
+                    continue
+                for f in findings_list:
+                    sev = f.get("details", {}).get("severity", "")
+                    if sev == "warning" and len(examples) < 5:
+                        examples.append({"category": cat, "summary": f.get("summary", "")[:100]})
             # Prefer AWS API data if available
             if aws_upgrade_info:
                 upgrade_type = aws_upgrade_info.get("upgrade_type", "Cluster upgrade")
@@ -8185,7 +8222,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 )
                 aws_updates = aws_upgrade_info.get("updates", [])
                 correlation_severity = "info"
-                impact_msg = f"Confirmed via AWS API: {upgrade_type} detected. {aws_upgrade_info.get('total_updates', 0)} updates in date range."
+                impact_msg = (
+                    f"Confirmed via AWS API: {upgrade_type} at {first_upgrade}. "
+                    f"This explains {total_findings} findings ({critical_findings} critical, {warning_findings} warning, {info_findings} info). "
+                    f"Affected categories: {', '.join(affected_categories[:3])}. "
+                    f"Examples: {examples[0]['summary'] if examples else 'None'}"
+                )
             else:
                 # Fallback to event-based detection
                 upgrade_times = []
@@ -8196,9 +8238,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     ts = self._extract_timestamp(f.get("details", {}))
                     if ts:
                         upgrade_times.append(ts)
-
                 first_upgrade = min(upgrade_times) if upgrade_times else "Unknown"
-
                 # Determine upgrade type
                 upgrade_type = "Cluster upgrade"
                 if any("node" in ind["summary"].lower() for ind in upgrade_indicators):
@@ -8207,8 +8247,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     upgrade_type = "EKS addon upgrade"
                 aws_updates = []
                 correlation_severity = "info"
-                impact_msg = f"Findings are likely due to cluster upgrade activity. {total_indicators} upgrade-related events detected."
-
+                impact_msg = (
+                    f"Findings are likely due to cluster upgrade activity. "
+                    f"{total_indicators} upgrade-related events detected. "
+                    f"This explains {total_findings} findings ({critical_findings} critical, {warning_findings} warning). "
+                    f"Affected categories: {', '.join(affected_categories[:3])}. "
+                    f"Examples: {examples[0]['summary'] if examples else 'None'}"
+                )
             correlations.append(
                 {
                     "correlation_type": "cluster_upgrade",
@@ -8221,9 +8266,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "node_events": len(node_ready_events),
                         "daemonset_restarts": len(ds_restarts),
                         "aws_updates": aws_updates[:5] if aws_updates else [],
-                        "categories_affected": list(
-                            set(ind["category"] for ind in upgrade_indicators)
-                        ),
+                        "categories_affected": affected_categories[:3],
+                        "total_findings": total_findings,
+                        "critical_findings": critical_findings,
+                        "warning_findings": warning_findings,
+                        "info_findings": info_findings,
+                        "example_findings": examples[:5],
                     },
                     "impact": impact_msg,
                     "recommendation": "Review findings in context of ongoing upgrade. Most issues should resolve automatically. Monitor cluster health post-upgrade.",

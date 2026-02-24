@@ -6012,7 +6012,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 container_logs_enabled = True
 
             # Check FluentBit/CloudWatch agent DaemonSet
-            cmd = "kubectl get daemonset -n amazon-cloudwatch -o json 2>/dev/null || kubectl get daemonset -n kube-system -l k8s-app=aws-node -o json 2>/dev/null"
+            cmd = "kubectl get daemonset -n amazon-cloudwatch -o json || kubectl get daemonset -n kube-system -l k8s-app=aws-node -o json"
             output = self.safe_kubectl_call(cmd)
 
             if output:
@@ -6084,7 +6084,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 prometheus_enabled = True
 
             # Check for CloudWatch agent with Prometheus scraping
-            cmd = "kubectl get deployment -n amazon-cloudwatch -o json 2>/dev/null"
+            cmd = "kubectl get deployment -n amazon-cloudwatch -o json"
             output = self.safe_kubectl_call(cmd)
 
             prometheus_agent_found = False
@@ -7462,7 +7462,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         try:
             # Check for EKS Pod Identity Agent
-            cmd = "kubectl get deployment eks-pod-identity-agent -n kube-system -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get deployment eks-pod-identity-agent -n kube-system -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -8435,7 +8435,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         try:
             # Check EBS CSI controller deployment
-            cmd = "kubectl get deployment ebs-csi-controller -n kube-system -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get deployment ebs-csi-controller -n kube-system -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -8469,7 +8469,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     )
 
             # Check for volume attachment events
-            cmd = "kubectl get events --all-namespaces --field-selector reason=VolumeAttachFailed -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get events --all-namespaces --field-selector reason=VolumeAttachFailed -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -8624,7 +8624,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         try:
             cas_issues = []
 
-            cmd = "kubectl get deployment cluster-autoscaler -n kube-system -o json 2>/dev/null || kubectl get deployment cluster-autoscaler-aws-cluster-autoscaler -n kube-system -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get deployment cluster-autoscaler -n kube-system -o json || kubectl get deployment cluster-autoscaler-aws-cluster-autoscaler -n kube-system -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -8656,7 +8656,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         },
                     )
 
-            cmd = "kubectl logs -l app=cluster-autoscaler -n kube-system --tail=100 2>/dev/null || echo 'not found'"
+            cmd = "kubectl logs -l app=cluster-autoscaler -n kube-system --tail=100 || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -8719,7 +8719,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Analyzing HPA/VPA health...")
 
         try:
-            cmd = "kubectl get hpa --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get hpa --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -8854,7 +8854,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     },
                                 )
 
-            cmd = "kubectl get events --all-namespaces --field-selector reason=TLSHealthCheckSucceeded -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get events --all-namespaces --field-selector reason=TLSHealthCheckSucceeded -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -8893,7 +8893,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Analyzing AWS Load Balancer Controller...")
 
         try:
-            cmd = "kubectl get deployment aws-load-balancer-controller -n kube-system -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get deployment aws-load-balancer-controller -n kube-system -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -8924,7 +8924,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         },
                     )
 
-            cmd = "kubectl logs -l app.kubernetes.io/name=aws-load-balancer-controller -n kube-system --tail=100 2>/dev/null || echo 'not found'"
+            cmd = "kubectl logs -l app.kubernetes.io/name=aws-load-balancer-controller -n kube-system --tail=100 || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -8982,7 +8982,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         try:
             ec2_client = self.session.client("ec2")
 
-            cmd = "kubectl get nodes -o jsonpath='{.items[*].spec.providerID}' 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get nodes -o jsonpath='{.items[*].spec.providerID}' || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if not output or "not found" in output.lower():
@@ -9076,7 +9076,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Analyzing Karpenter health...")
 
         try:
-            cmd = "kubectl get deployment karpenter -n kube-system -o json 2>/dev/null || kubectl get deployment -l app.kubernetes.io/name=karpenter -n kube-system -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get deployment karpenter -n kube-system -o json || kubectl get deployment -l app.kubernetes.io/name=karpenter -n kube-system -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -9107,7 +9107,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         },
                     )
 
-            cmd = "kubectl get nodepools -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get nodepools -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -9151,7 +9151,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Analyzing EFS CSI driver health...")
 
         try:
-            cmd = "kubectl get deployment efs-csi-controller -n kube-system -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get deployment efs-csi-controller -n kube-system -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -9182,21 +9182,30 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         },
                     )
 
-            cmd = "kubectl get events --all-namespaces --field-selector reason=Warning -o json 2>/dev/null | grep -i efs || echo ''"
+            cmd = "kubectl get events --all-namespaces --field-selector reason=Warning -o json || echo ''"
             output = self.safe_kubectl_call(cmd)
 
-            if output and output.strip():
-                self._add_finding_dict(
-                    "pvc_issues",
-                    {
-                        "summary": "EFS-related warnings detected",
-                        "details": {
-                            "severity": "warning",
-                            "finding_type": FindingType.HISTORICAL_EVENT,
-                            "recommendation": "Review events for EFS mount issues",
-                        },
-                    },
-                )
+            if output and output.strip() and "error" not in output.lower():
+                try:
+                    events_data = json.loads(output)
+                    for event in events_data.get("items", []):
+                        message = event.get("message", "").lower()
+                        if "efs" in message:
+                            self._add_finding_dict(
+                                "pvc_issues",
+                                {
+                                    "summary": "EFS-related warnings detected",
+                                    "details": {
+                                        "severity": "warning",
+                                        "finding_type": FindingType.HISTORICAL_EVENT,
+                                        "recommendation": "Review events for EFS mount issues",
+                                        "message": event.get("message", "")[:200],
+                                    },
+                                },
+                            )
+                            break  # Only add one finding
+                except json.JSONDecodeError:
+                    pass
 
             self.progress.info("EFS CSI driver analysis completed")
 
@@ -9282,7 +9291,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         },
                                     )
             else:
-                cmd = "kubectl get events --all-namespaces --field-selector reason=FailedScheduling -o json 2>/dev/null || echo 'not found'"
+                cmd = "kubectl get events --all-namespaces --field-selector reason=FailedScheduling -o json || echo 'not found'"
                 output = self.safe_kubectl_call(cmd)
 
                 if output and "not found" not in output.lower():
@@ -9382,7 +9391,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         )
 
             if windows_nodes:
-                cmd = "kubectl get events --all-namespaces --field-selector reason=FailedScheduling -o json 2>/dev/null || echo 'not found'"
+                cmd = "kubectl get events --all-namespaces --field-selector reason=FailedScheduling -o json || echo 'not found'"
                 output = self.safe_kubectl_call(cmd)
 
                 if output and "not found" not in output.lower():
@@ -9477,17 +9486,30 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     for rule in outbound_rules
                 )
 
-            cmd = "kubectl get events --all-namespaces -o json 2>/dev/null | grep -i 'security.*group\\|timeout.*connection\\|connection.*refused' || echo ''"
+            cmd = "kubectl get events --all-namespaces -o json || echo ''"
             output = self.safe_kubectl_call(cmd)
 
-            if output and output.strip():
-                sg_issues.append(
-                    {
-                        "issue": "Network connectivity issues detected in events",
-                        "severity": "warning",
-                        "recommendation": "Check security group rules allow required traffic",
-                    }
-                )
+            if output and output.strip() and "error" not in output.lower():
+                try:
+                    events_data = json.loads(output)
+                    import re
+
+                    sg_pattern = re.compile(
+                        r"security.*group|timeout.*connection|connection.*refused", re.IGNORECASE
+                    )
+                    for event in events_data.get("items", []):
+                        message = event.get("message", "")
+                        if sg_pattern.search(message):
+                            sg_issues.append(
+                                {
+                                    "issue": "Network connectivity issues detected in events",
+                                    "severity": "warning",
+                                    "recommendation": "Check security group rules allow required traffic",
+                                }
+                            )
+                            break  # Only add one finding
+                except json.JSONDecodeError:
+                    pass
 
             for issue in sg_issues:
                 self._add_finding_dict(
@@ -9561,7 +9583,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             },
                         )
 
-            cmd = "kubectl get pods --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get pods --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -9975,7 +9997,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                     "diagnostic_steps": [
                         "Check: kubectl get events --all-namespaces | grep 'space exceeded'",
-                        "Count objects: kubectl api-resources --verbs=list --namespaced=false -o name | xargs -I{} kubectl get {} --all-namespaces --no-headers 2>/dev/null | wc -l",
+                        "Count objects: kubectl api-resources --verbs=list --namespaced=false -o name | xargs -I{} kubectl get {} --all-namespaces --no-headers | wc -l",
                         "Clean up: kubectl delete events --all-namespaces --field-selector reason!=''",
                         "Delete old ReplicaSets: kubectl get rs --all-namespaces -o json | jq '.items[] | select(.spec.replicas==0)' | kubectl delete -f -",
                         "Delete completed Pods: kubectl delete pods --all-namespaces --field-selector=status.phase==Succeeded",
@@ -10358,7 +10380,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         try:
             # Check validating webhooks
-            cmd = "kubectl get validatingwebhookconfigurations -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get validatingwebhookconfigurations -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -10392,7 +10414,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             )
 
             # Check for webhook-related events
-            cmd = "kubectl get events --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get events --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -10497,7 +10519,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 )
 
             # Check events for PLEG issues
-            cmd = "kubectl get events --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get events --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -10542,7 +10564,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         try:
             # Check for runtime-related events
-            cmd = "kubectl get events --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get events --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -10843,7 +10865,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     )
 
             # Check for volume detach events
-            cmd = "kubectl get events --all-namespaces --field-selector reason=FailedMount -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get events --all-namespaces --field-selector reason=FailedMount -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -11065,7 +11087,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         )
 
             # Check CronJobs
-            cmd = "kubectl get cronjobs --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get cronjobs --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -11132,7 +11154,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Analyzing NetworkPolicies...")
 
         try:
-            cmd = "kubectl get networkpolicies --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get networkpolicies --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if not output or "not found" in output.lower():
@@ -11228,7 +11250,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         try:
             # Check AWS Load Balancer Controller
-            cmd = "kubectl get deployment aws-load-balancer-controller -n kube-system -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get deployment aws-load-balancer-controller -n kube-system -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -11254,7 +11276,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     )
 
             # Check Ingress resources for issues
-            cmd = "kubectl get ingress --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get ingress --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -11424,7 +11446,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 if volume_claims:
                     # Get PVCs for this StatefulSet
                     pvc_prefix = sts_name
-                    cmd = f"kubectl get pvc -n {namespace} -o json 2>/dev/null || echo 'not found'"
+                    cmd = f"kubectl get pvc -n {namespace} -o json || echo 'not found'"
                     pvc_output = self.safe_kubectl_call(cmd)
 
                     if pvc_output and "not found" not in pvc_output.lower():
@@ -11472,7 +11494,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         try:
             # Check for conntrack-related events
-            cmd = "kubectl get events --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get events --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -11523,7 +11545,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         )
 
             # Check kube-proxy logs for conntrack issues
-            cmd = "kubectl logs -n kube-system -l k8s-app=kube-proxy --tail=100 2>/dev/null || echo 'not found'"
+            cmd = "kubectl logs -n kube-system -l k8s-app=kube-proxy --tail=100 || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -11621,7 +11643,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             ]
 
             for label in operator_labels:
-                cmd = f"kubectl get pods --all-namespaces -l {label} -o json 2>/dev/null || echo 'not found'"
+                cmd = f"kubectl get pods --all-namespaces -l {label} -o json || echo 'not found'"
                 output = self.safe_kubectl_call(cmd)
 
                 if not output or "not found" in output.lower():
@@ -11689,7 +11711,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 )
 
             # Check for controller-related events
-            cmd = "kubectl get events --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get events --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -11747,7 +11769,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         )
 
             # Check CRD health
-            cmd = "kubectl get crds -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get crds -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():
@@ -11793,7 +11815,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         try:
             # Check namespace PSA labels
-            cmd = "kubectl get namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             namespaces_with_psa = []
@@ -11821,9 +11843,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         )
 
                         # Check for pods that might violate PSA
-                        cmd = (
-                            f"kubectl get pods -n {ns_name} -o json 2>/dev/null || echo 'not found'"
-                        )
+                        cmd = f"kubectl get pods -n {ns_name} -o json || echo 'not found'"
                         pod_output = self.safe_kubectl_call(cmd)
 
                         if pod_output and "not found" not in pod_output.lower():
@@ -11925,7 +11945,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     )
 
             # Check for PSA-related events (rejections)
-            cmd = "kubectl get events --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            cmd = "kubectl get events --all-namespaces -o json || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
             if output and "not found" not in output.lower():

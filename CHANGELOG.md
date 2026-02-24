@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-02-24
+
+### Security
+- Eliminated all `shell=True` subprocess calls to prevent shell injection
+- Added `_run_kubectl_command()` helper with `shell=False` and list args
+- Implemented `||` fallback logic in Python instead of shell
+- Added 12 kubectl execution tests for shell safety verification
+
+### Added
+- 38 new unit tests for cache and performance classes
+  - `test_api_cache.py`: 12 tests for APICache
+  - `test_incremental_cache.py`: 16 tests for IncrementalCache
+  - `test_performance_tracker.py`: 10 tests for PerformanceTracker
+- Total test count: 158 (up from 124)
+
+## [3.4.0] - 2026-02-23
+
+### Security
+- Input validation with strict regex patterns for all user inputs
+- Secure file permissions (0o600) on HTML/JSON/cache files
+- Log sanitization (masked AWS Account ID and truncated ARN)
+- Escaped `aws_doc` hrefs in HTML output
+
+### Added
+- Thread-safe findings collection with `_findings_lock`
+- `_add_finding_dict()` wrapper for consistent finding management
+- 112 unit tests covering severity, input validation, and findings
+
 ## [3.0.0] - 2025-02-22
 
 ### Added

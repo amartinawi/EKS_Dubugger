@@ -7723,11 +7723,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     def _extract_timestamp(self, details):
         """Extract timestamp from finding details"""
-        ts = details.get("timestamp") or details.get("lastTimestamp") or details.get("eventTime")
+        ts = (
+            details.get("timestamp")
+            or details.get("lastTimestamp")
+            or details.get("eventTime")
+            or details.get("firstTimestamp")
+            or details.get("creationTimestamp")
+        )
         if ts:
             try:
+                if isinstance(ts, datetime):
+                    return ts
                 if isinstance(ts, str):
-                    if "T" in ts:
+                    if "T" in ts or "-" in ts:
                         return date_parser.parse(ts)
             except Exception:
                 pass
@@ -8571,7 +8579,16 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         if not self.correlations:
             return story
 
-        # Sort timeline events
+        primary_correlation = self.correlations[0] if self.correlations else None
+
+        # Generate story title based on primary correlation
+        if primary_correlation:
+            corr_type = primary_correlation.get("correlation_type", "incident")
+            story["title"] = f"{corr_type.replace('_', ' ').title()} Detected"
+        else:
+            story["title"] = "Cluster Health Issues Detected"
+
+        # Sort timeline events from findings
         timeline_events = []
         for category, findings_list in self.findings.items():
             for finding in findings_list:
@@ -8588,28 +8605,46 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         timeline_events.sort(key=lambda x: x["timestamp"])
 
-        if not timeline_events:
-            return story
+        # If no timestamps from findings, build timeline from correlations
+        if not timeline_events and primary_correlation:
+            rc_time = primary_correlation.get("root_cause_time", "")
+            if rc_time:
+                try:
+                    ts = date_parser.parse(rc_time) if isinstance(rc_time, str) else rc_time
+                    timeline_events.append(
+                        {
+                            "timestamp": ts,
+                            "category": primary_correlation.get("correlation_type", "incident"),
+                            "summary": primary_correlation.get("root_cause", "Unknown issue"),
+                            "severity": primary_correlation.get("severity", "warning"),
+                        }
+                    )
+                except Exception:
+                    pass
 
-        # Generate story title based on primary correlation
-        primary_correlation = self.correlations[0] if self.correlations else None
-        if primary_correlation:
-            corr_type = primary_correlation.get("correlation_type", "incident")
-            story["title"] = f"{corr_type.replace('_', ' ').title()} Detected"
-        else:
-            story["title"] = "Cluster Health Issues Detected"
+            # Add impact events from correlation
+            impact = primary_correlation.get("impact", "")
+            if impact:
+                timeline_events.append(
+                    {
+                        "timestamp": timeline_events[0]["timestamp"]
+                        if timeline_events
+                        else datetime.now(tz=timezone.utc),
+                        "category": "impact",
+                        "summary": impact[:150],
+                        "severity": primary_correlation.get("severity", "warning"),
+                    }
+                )
 
         # Build narrative timeline
         narrative_events = []
         for i, event in enumerate(timeline_events[:20]):  # Top 20 events
-            time_str = event["timestamp"].strftime("%H:%M")
+            time_str = event["timestamp"].strftime("%Y-%m-%d %H:%M")
 
-            # Determine what happened
             what_happened = event["summary"]
             category = event["category"]
             severity = event["severity"]
 
-            # Determine impact
             impact = self._determine_impact(event, timeline_events[i:])
 
             narrative_events.append(

@@ -5174,8 +5174,15 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         import shlex
 
         # Add context flag if custom context is set
+        # Must add it BEFORE any || fallback patterns
         if self.kube_context:
-            cmd = f"{cmd} --context {self.kube_context}"
+            # Check if command has || fallback
+            if " || " in cmd:
+                # Add context only to the first command, not the fallback
+                parts = cmd.split(" || ", 1)
+                cmd = f"{parts[0]} --context {self.kube_context} || {parts[1]}"
+            else:
+                cmd = f"{cmd} --context {self.kube_context}"
 
         # Check cache first
         if use_cache:

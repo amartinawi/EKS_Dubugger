@@ -6,10 +6,11 @@ Guidelines for AI coding agents working in this EKS Debugger codebase.
 
 Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
 
-**Version:** 3.3.0  
-**Lines of Code:** ~13,400  
+**Version:** 3.4.0  
+**Lines of Code:** ~13,600  
 **Analysis Methods:** 56  
-**Catalog Coverage:** 100% (79 issues across 3 catalogs)
+**Catalog Coverage:** 100% (79 issues across 3 catalogs)  
+**Unit Tests:** 112 tests
 
 ## Quick Commands
 
@@ -23,6 +24,9 @@ python eks_comprehensive_debugger.py --profile <profile> --region <region> --clu
 # With custom kubectl context
 python eks_comprehensive_debugger.py --profile <profile> --region <region> --cluster-name <cluster> --kube-context <context-name> --days 1
 
+# Run unit tests
+python3 -m pytest tests/ -v
+
 # Lint/type check (optional)
 ruff check eks_comprehensive_debugger.py
 mypy eks_comprehensive_debugger.py --ignore-missing-imports
@@ -31,11 +35,17 @@ mypy eks_comprehensive_debugger.py --ignore-missing-imports
 ## File Structure
 
 ```
-eks_comprehensive_debugger.py  # Main debugger (~13,400 lines, all-in-one)
-requirements.txt               # Python dependencies
+eks_comprehensive_debugger.py  # Main debugger (~13,600 lines, all-in-one)
+requirements.txt               # Python dependencies (includes test deps)
 .gitignore                     # Git ignore rules
 README-EKS-DEBUGGER.md         # User documentation
 AGENTS.md                      # This file
+tests/                         # Unit tests (112 tests)
+├── __init__.py
+├── conftest.py                # Shared fixtures
+├── test_severity_classification.py  # Severity logic tests
+├── test_input_validation.py         # Security/shell injection tests
+└── test_findings.py                 # Findings management tests
 venv/                          # Virtual environment (gitignored)
 ```
 
@@ -43,8 +53,70 @@ venv/                          # Virtual environment (gitignored)
 
 Required: `boto3>=1.26.0`, `python-dateutil>=2.8.0`, `pytz>=2023.0`
 Optional: `pyyaml>=6.0` (for YAML output)
+Testing: `pytest>=8.0.0`, `pytest-mock>=3.12.0`
 
 ## Code Architecture
+
+### Security Architecture (v3.4.0)
+
+The debugger implements defense-in-depth security for production use:
+
+**Input Validation:**
+```python
+INPUT_VALIDATION_PATTERNS = {
+    "profile": re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$"),
+    "region": re.compile(r"^[a-z]{2}-[a-z]+-\d+$"),
+    "cluster_name": re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$"),
+    "namespace": re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"),
+    "kube_context": re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*$"),
+}
+
+def validate_input(name: str, value: str) -> str:
+    """Validate input parameter against safe pattern to prevent shell injection."""
+```
+
+**Shell Injection Prevention:**
+- All user inputs (profile, region, cluster_name, namespace, kube_context) validated with strict regex
+- Blocks: `;`, `|`, `&&`, `$()`, backticks, redirections, special chars
+- `update_kubeconfig()`: Uses `shell=False` with list args
+- `get_kubectl_output()`: Uses `shell=True` (required for `||`, pipes) with validated inputs
+
+**File Permissions:**
+- Output files (HTML, JSON) created with `0o600` (owner-only)
+- IncrementalCache files created with `0o600`
+- Prevents credential leakage via world-readable reports
+
+**Log Sanitization:**
+- AWS Account ID masked (shows only last 4 digits: `****1234`)
+- IAM ARN truncated to role/user name only
+
+### Thread Safety (v3.4.0)
+
+The debugger uses thread-safe data structures for parallel analysis:
+
+```python
+self._findings_lock = threading.Lock()  # Protects self.findings mutations
+self._shared_data_lock = threading.Lock()  # Protects cache access
+```
+
+**Finding Addition Pattern:**
+```python
+def _add_finding(self, category, summary, details, finding_type):
+    with self._findings_lock:
+        if len(self.findings[category]) >= self.max_findings:
+            return False  # Limit enforced
+        self.findings[category].append({...})
+        return True
+
+def _add_finding_dict(self, category, finding):
+    """Convenience wrapper for dict-based findings."""
+    return self._add_finding(category, finding["summary"], ...)
+```
+
+All 131+ finding additions go through `_add_finding_dict()` for:
+1. Thread safety via lock
+2. Max findings limit (500 per category)
+3. Consistent finding_type classification
 
 ### Configuration Constants (v3.0.0)
 
@@ -123,11 +195,13 @@ CONTROL_PLANE_ERROR_PATTERNS = [
 | `_build_kubectl_events_cmd(reason)` | Build kubectl events command with namespace/context |
 | `_get_filtered_events(reason)` | Get and parse events filtered by reason |
 | `_parse_event_common(event)` | Extract common fields from kubectl event |
-| `_add_finding(category, summary, details)` | Append finding to category with validation |
+| `_add_finding(category, summary, details)` | Thread-safe finding addition with limit enforcement |
+| `_add_finding_dict(category, finding)` | Convenience wrapper for dict-based findings |
 | `_classify_severity(summary, details)` | Classify finding severity based on content |
 | `_extract_timestamp(details)` | Extract timestamp from finding details |
 | `_get_node_from_pod(pod_details)` | Extract node name from pod details |
 | `_get_bucket_severity(events)` | Determine severity for timeline bucket |
+| `validate_input(name, value)` | Validate input against safe patterns (shell injection prevention) |
 
 ### Performance Architecture (v3.3.0)
 
@@ -249,7 +323,25 @@ EKSDebuggerError (base)
 ├── ClusterNotFoundError
 ├── KubectlNotAvailableError
 ├── DateValidationError
+├── InputValidationError    # v3.4.0: Invalid/unsafe input
 └── EKSDebuggerError (general)
+```
+
+---
+
+## Unit Tests (v3.4.0)
+
+The test suite covers critical security and functionality areas:
+
+| Test File | Tests | Coverage |
+|-----------|-------|----------|
+| `test_severity_classification.py` | 29 | Critical/warning/info keyword detection, priority ordering, case insensitivity |
+| `test_input_validation.py` | 70 | Shell injection prevention, invalid character detection, edge cases |
+| `test_findings.py` | 13 | Finding limits, thread safety with concurrent access |
+
+**Run Tests:**
+```bash
+python3 -m pytest tests/ -v
 ```
 
 ---
@@ -380,7 +472,18 @@ def safe_api_call(self, func: Callable, *args, **kwargs) -> tuple[bool, Any]:
 ```
 
 ### Error Handling
-Use graceful degradation pattern:
+
+**Analysis Methods Exception Philosophy:**
+Each of the 56 analysis methods wraps its logic in `try/except Exception` for **graceful degradation**. This is intentional: if one analysis method fails (e.g., API timeout, malformed data), other methods continue and the tool still produces useful output.
+
+Known exception sources within methods:
+- `json.loads()` → `json.JSONDecodeError` (malformed kubectl/AWS responses)
+- Dict access → `KeyError` (unexpected response structure)
+- boto3 API calls → `botocore.exceptions.ClientError` (permissions, throttling)
+- subprocess → `subprocess.CalledProcessError`, `TimeoutExpired` (kubectl failures)
+
+These are caught by `safe_kubectl_call()` and `safe_api_call()` helpers, but dict access and JSON parsing may still raise. The outer `Exception` catch is the safety net.
+
 ```python
 try:
     method()

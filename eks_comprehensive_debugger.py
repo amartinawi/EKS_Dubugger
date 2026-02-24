@@ -175,7 +175,7 @@ import os
 import json as json_module
 import pytz
 
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
 MAX_API_RETRIES = 3

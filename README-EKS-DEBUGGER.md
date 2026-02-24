@@ -4,10 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![AWS EKS](https://img.shields.io/badge/AWS-EKS-orange.svg)](https://aws.amazon.com/eks/)
 [![Catalog Coverage](https://img.shields.io/badge/catalog%20coverage-100%25-green.svg)](#catalog-coverage)
+[![Tests](https://img.shields.io/badge/tests-112%20passing-brightgreen.svg)](#unit-tests)
 
 A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 3.3.0 | **Analysis Methods:** 56 | **Catalog Coverage:** 100%
+**Version:** 3.4.0 | **Analysis Methods:** 56 | **Catalog Coverage:** 100% | **Tests:** 112
 
 ---
 
@@ -98,6 +99,13 @@ Each finding is classified as either:
 - **API Response Caching** - TTL-based cache for AWS API calls (5-minute default)
 - **kubectl Output Caching** - Reuses kubectl command results across methods
 - **Performance Metrics** - Reports slowest methods and cache statistics
+
+### Security Features (v3.4.0)
+- **Input Validation** - All CLI parameters validated with strict regex patterns
+- **Shell Injection Prevention** - Blocks dangerous characters (`;`, `|`, `&&`, `$()`, backticks)
+- **Secure File Permissions** - Output files created with `0o600` (owner-only)
+- **Log Sanitization** - AWS Account ID masked, IAM ARN truncated
+- **Thread-Safe Operations** - Concurrent analysis with proper locking
 
 ### Automatic Report Generation
 - **HTML Report** - Interactive dashboard with sidebar navigation, search, and filtering

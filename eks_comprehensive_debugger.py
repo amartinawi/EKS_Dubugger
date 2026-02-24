@@ -5203,10 +5203,16 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     commands.append(" ".join(current))
                     current = []
             else:
-                # Track quote state
+                # Track quote state - only enter quote mode if quotes are unbalanced
                 if "'" in part or '"' in part:
                     if in_quote is None:
-                        in_quote = "'" if "'" in part else '"'
+                        # Only enter quote mode if this part has unbalanced quotes
+                        single_count = part.count("'")
+                        double_count = part.count('"')
+                        if single_count % 2 == 1:
+                            in_quote = "'"
+                        elif double_count % 2 == 1:
+                            in_quote = '"'
                     elif part.count(in_quote) % 2 == 1:
                         in_quote = None
                 current.append(part)

@@ -6,11 +6,11 @@ Guidelines for AI coding agents working in this EKS Debugger codebase.
 
 Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
 
-**Version:** 3.4.0  
-**Lines of Code:** ~13,600  
+**Version:** 3.5.0  
+**Lines of Code:** ~13,700  
 **Analysis Methods:** 56  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)  
-**Unit Tests:** 112 tests
+**Unit Tests:** 124 tests
 
 ## Quick Commands
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive EKS Debugging Tool v3.4.0
+Comprehensive EKS Debugging Tool v3.5.0
 
 A production-grade diagnostic tool for Amazon EKS cluster troubleshooting that provides
 systematic analysis of cluster health, workload issues, networking, storage, and control plane.
@@ -175,7 +175,7 @@ import os
 import json as json_module
 import pytz
 
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
 MAX_API_RETRIES = 3
@@ -5127,13 +5127,43 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     # === Helper Methods ===
 
+    def _run_kubectl_command(self, cmd_parts: list, timeout: int) -> tuple[bool, str]:
+        """Run a single kubectl command with shell=False.
+
+        Args:
+            cmd_parts: List of command parts (e.g., ['kubectl', 'get', 'nodes', '-o', 'json'])
+            timeout: Timeout in seconds
+
+        Returns:
+            Tuple of (success, output or error message)
+        """
+        try:
+            result = subprocess.run(
+                cmd_parts,
+                shell=False,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=timeout,
+            )
+            return True, result.stdout
+        except subprocess.TimeoutExpired:
+            return False, f"Command timed out"
+        except subprocess.CalledProcessError as e:
+            return False, e.stderr if e.stderr else "Command failed"
+        except FileNotFoundError:
+            return False, "kubectl not found in PATH"
+
     def get_kubectl_output(
         self, cmd, timeout=DEFAULT_TIMEOUT, required=False, use_cache: bool = True
     ):
         """Run kubectl command with error handling and optional caching.
 
+        Uses shell=False for security. Handles shell fallback patterns (||)
+        by trying each command in sequence.
+
         Args:
-            cmd: kubectl command to run
+            cmd: kubectl command to run (may contain || for fallbacks)
             timeout: Timeout in seconds
             required: If True, raises exception on failure
             use_cache: If True, uses shared data cache (default: True)
@@ -5141,6 +5171,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Returns:
             Command output string or None on failure
         """
+        import shlex
+
         # Add context flag if custom context is set
         if self.kube_context:
             cmd = f"{cmd} --context {self.kube_context}"
@@ -5151,39 +5183,65 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 if cmd in self._shared_data["kubectl_cache"]:
                     return self._shared_data["kubectl_cache"][cmd]
 
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=timeout,
-            )
-            output = result.stdout
-            # Cache successful result
-            if use_cache and output:
-                with self._shared_data_lock:
-                    self._shared_data["kubectl_cache"][cmd] = output
-            return output
-        except subprocess.TimeoutExpired:
-            msg = f"kubectl command timed out: {cmd}"
-            if required:
-                raise EKSDebuggerError(msg)
-            self.progress.warning(msg)
-            return None
-        except subprocess.CalledProcessError as e:
-            msg = f"kubectl command failed: {e.stderr if e.stderr else str(e)}"
-            if required:
-                raise EKSDebuggerError(msg)
-            self.progress.warning(msg)
-            return None
-        except FileNotFoundError:
-            msg = "kubectl not found in PATH"
-            if required:
-                raise EKSDebuggerError(msg)
-            self.progress.warning(msg)
-            return None
+        # Parse shell fallback patterns: "cmd1 || cmd2 || echo 'fallback'"
+        # Split on || but be careful about quotes
+        commands = []
+        current = []
+        in_quote = None
+        parts = cmd.split()
+
+        for i, part in enumerate(parts):
+            if part == "||" and not in_quote:
+                if current:
+                    commands.append(" ".join(current))
+                    current = []
+            else:
+                # Track quote state
+                if "'" in part or '"' in part:
+                    if in_quote is None:
+                        in_quote = "'" if "'" in part else '"'
+                    elif part.count(in_quote) % 2 == 1:
+                        in_quote = None
+                current.append(part)
+
+        if current:
+            commands.append(" ".join(current))
+
+        # Try each command in sequence until one succeeds
+        output = None
+        for i, subcmd in enumerate(commands):
+            # Check for echo fallback (terminal command)
+            if subcmd.startswith("echo "):
+                # This is a fallback - return the echoed value or empty
+                echo_match = subcmd[5:].strip().strip("'\"")
+                output = echo_match if echo_match else ""
+                break
+
+            # Parse command into list for shell=False
+            try:
+                cmd_parts = shlex.split(subcmd)
+            except ValueError:
+                cmd_parts = subcmd.split()
+
+            success, result = self._run_kubectl_command(cmd_parts, timeout)
+
+            if success:
+                output = result
+                break
+            elif i == len(commands) - 1:
+                # Last command failed
+                msg = f"kubectl command failed: {result}"
+                if required:
+                    raise EKSDebuggerError(msg)
+                self.progress.warning(msg)
+                return None
+
+        # Cache successful result
+        if use_cache and output is not None:
+            with self._shared_data_lock:
+                self._shared_data["kubectl_cache"][cmd] = output
+
+        return output
 
     def safe_api_call(self, func, *args, use_cache: bool = True, **kwargs):
         """
@@ -5426,23 +5484,32 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     # === Analysis Methods ===
     #
-    # EXCEPTION HANDLING PHILOSOPHY:
-    # =============================
-    # Each analysis method wraps its logic in try/except Exception for GRACEFUL DEGRADATION.
+    # EXCEPTION HANDLING PHILOSOPHY (v3.5.0):
+    # =======================================
+    # Each analysis method wraps its logic in try/except for GRACEFUL DEGRADATION.
     # This is intentional: if one analysis method fails (e.g., API timeout, malformed data),
     # other methods continue and the tool still produces useful output.
     #
-    # Known exception sources within methods:
+    # RECOMMENDED PATTERN (narrowed exceptions):
+    # -------------------------------------------
+    # try:
+    #     # Analysis logic
+    # except json.JSONDecodeError as e:
+    #     self.errors.append({"step": "method_name", "message": f"Malformed JSON: {e}"})
+    # except KeyError as e:
+    #     self.errors.append({"step": "method_name", "message": f"Unexpected response structure: {e}"})
+    # except Exception as e:
+    #     # Fallback for unknown issues
+    #     self.errors.append({"step": "method_name", "message": str(e)})
+    #
+    # Known exception sources:
     #   - json.loads() → json.JSONDecodeError (malformed kubectl/AWS responses)
     #   - dict access → KeyError (unexpected response structure)
     #   - boto3 API calls → botocore.exceptions.ClientError (permissions, throttling)
     #   - subprocess → subprocess.CalledProcessError, TimeoutExpired (kubectl failures)
     #
-    # These are caught by safe_kubectl_call() and safe_api_call() helpers, but dict access
-    # and JSON parsing may still raise. The outer Exception catch is the safety net.
-    #
-    # Future improvement: Consider narrowing to specific exceptions where the failure
-    # mode is well-understood, but maintain the fallback Exception handler for unknown issues.
+    # The safe_kubectl_call() and safe_api_call() helpers handle subprocess/boto3 exceptions.
+    # Direct dict access and JSON parsing in analysis methods use the outer Exception catch.
 
     # === Existing Analysis Methods (Enhanced with date filtering) ===
 

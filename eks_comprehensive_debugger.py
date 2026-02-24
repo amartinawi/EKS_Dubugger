@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive EKS Debugging Tool v3.3.0
+Comprehensive EKS Debugging Tool v3.4.0
 
 A production-grade diagnostic tool for Amazon EKS cluster troubleshooting that provides
 systematic analysis of cluster health, workload issues, networking, storage, and control plane.

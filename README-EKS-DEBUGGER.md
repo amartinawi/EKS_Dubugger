@@ -126,7 +126,7 @@ pip install -r requirements.txt
 
 ### Prerequisites
 
-1. **Python 3.10+** (required for modern type hint syntax)
+1. **Python 3.8+**
 2. **kubectl** installed and configured
 3. **AWS CLI** with appropriate credentials
 4. **IAM Permissions**:

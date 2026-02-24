@@ -2264,35 +2264,6 @@ class HTMLOutputFormatter(OutputFormatter):
                     </div>
             """
 
-        # Phase 3: Correlation-Based Narrative
-        narrative = exec_summary.get("narrative", {})
-        if narrative.get("has_narrative"):
-            narrative_text = narrative.get("narrative", "")
-            short_summary = narrative.get("short_summary", "")
-
-            # First escape HTML, then convert markdown-style bold to HTML
-            escaped_narrative = self._escape_html(narrative_text)
-            escaped_summary = self._escape_html(short_summary)
-            narrative_html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped_narrative)
-
-            html += f"""
-                    <!-- What Happened - Narrative (Phase 3 - #5) -->
-                    <div class="summary-block narrative-block">
-                        <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
-                            <div class="summary-block-title">
-                                <span>📖</span> What Happened
-                            </div>
-                            <span class="block-toggle">▼</span>
-                        </div>
-                        <div class="summary-block-content">
-                            <div class="narrative-summary">{escaped_summary}</div>
-                            <div class="narrative-details">
-                                {narrative_html.replace(chr(10), "<br>")}
-                            </div>
-                        </div>
-                    </div>
-            """
-
         # Phase 3: Quick Wins
         quick_wins = exec_summary.get("quick_wins", [])
         if quick_wins:

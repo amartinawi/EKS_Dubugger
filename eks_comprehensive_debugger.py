@@ -4406,308 +4406,164 @@ class HTMLOutputFormatter(OutputFormatter):
         correlations = results.get("correlations", [])
         incident_story = results.get("incident_story", {})
         dependency_chains = results.get("dependency_chains", [])
+        first_issue = results.get("first_issue")
 
-        # Add Incident Story section (if available)
-        if incident_story and incident_story.get("timeline"):
+        # Unified "What Happened" section combining all root cause analysis
+        has_story = incident_story and (
+            incident_story.get("timeline") or incident_story.get("summary")
+        )
+        has_correlations = correlations or first_issue
+
+        if has_story or has_correlations:
             html += f"""
-            <!-- Incident Story Section -->
-            <section class="section" id="incident-story">
+            <!-- Unified What Happened Section -->
+            <section class="section" id="what-happened">
                 <div class="section-header" onclick="toggleSection(this)">
                     <div class="section-title">
                         <span class="section-icon">📖</span>
-                        <span>Incident Story: What Happened</span>
+                        <span>What Happened</span>
                     </div>
                     <div class="section-meta">
                         <span class="section-toggle">▼</span>
                     </div>
                 </div>
                 <div class="section-content" style="padding: 1.5rem;">
-                    <div class="incident-story">
 """
-            # Add summary
-            if incident_story.get("summary"):
+            # Root Cause Summary (from primary correlation)
+            if correlations:
+                primary = correlations[0] if correlations else {}
+                blast = primary.get("blast_radius", {})
+                confidence = primary.get("temporal_confidence", 0)
+                confidence_pct = int(confidence * 100) if confidence else None
+
                 html += f"""
-                        <div class="story-summary">
-                            <pre style="white-space: pre-wrap; font-family: inherit; margin: 0;">{self._escape_html(incident_story["summary"])}</pre>
+                    <div class="root-cause-summary" style="background: #1e293b; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;">
+                        <h3 style="margin: 0 0 0.5rem 0; color: #60a5fa;">🎯 Root Cause</h3>
+                        <p style="margin: 0; font-size: 1.1rem;">{self._escape_html(primary.get("root_cause", "Unknown issue"))}</p>
+                        <div style="margin-top: 0.5rem; display: flex; gap: 1rem; flex-wrap: wrap; font-size: 0.9rem; color: #94a3b8;">
+                            <span>⏰ {self._escape_html(primary.get("root_cause_time", "Unknown"))}</span>
+                            {f"<span>📊 {confidence_pct}% confidence</span>" if confidence_pct else ""}
+                            {f"<span>💥 {blast.get('pods', 0)} pods, {blast.get('nodes', 0)} nodes affected</span>" if blast.get("pods") or blast.get("nodes") else ""}
                         </div>
+                    </div>
 """
 
-            # Add narrative timeline
-            if incident_story.get("timeline"):
-                html += """
-                        <h4 style="margin-top: 1.5rem; color: #60a5fa;">📅 Timeline</h4>
-                        <div class="story-timeline">
+            # Incident Summary paragraph
+            if incident_story and incident_story.get("summary"):
+                html += f"""
+                    <div class="incident-summary" style="margin-bottom: 1.5rem;">
+                        <pre style="white-space: pre-wrap; font-family: inherit; margin: 0; background: #0f172a; padding: 1rem; border-radius: 6px;">{self._escape_html(incident_story["summary"])}</pre>
+                    </div>
 """
-                for event in incident_story["timeline"][:15]:
-                    severity_class = event.get("severity", "info")
+
+            # Timeline
+            if incident_story and incident_story.get("timeline"):
+                html += """
+                    <h4 style="margin: 1.5rem 0 0.75rem 0; color: #60a5fa;">📅 Timeline</h4>
+                    <div class="story-timeline" style="border-left: 2px solid #334155; padding-left: 1rem;">
+"""
+                for event in incident_story["timeline"][:12]:
+                    sev = event.get("severity", "info")
+                    sev_color = (
+                        "#ef4444"
+                        if sev == "critical"
+                        else ("#f59e0b" if sev == "warning" else "#6b7280")
+                    )
                     html += f"""
-                            <div class="timeline-event {severity_class}">
-                                <div class="event-time">{self._escape_html(event.get("time", ""))}</div>
-                                <div class="event-content">
-                                    <div class="event-what">{self._escape_html(event.get("what_happened", ""))}</div>
-                                    <div class="event-impact">{self._escape_html(event.get("impact", ""))}</div>
+                        <div style="margin-bottom: 0.75rem; position: relative;">
+                            <div style="position: absolute; left: -1.35rem; width: 0.5rem; height: 0.5rem; background: {sev_color}; border-radius: 50%;"></div>
+                            <div style="font-weight: 600; color: {sev_color};">{self._escape_html(event.get("time", ""))}</div>
+                            <div style="font-size: 0.95rem;">{self._escape_html(event.get("what_happened", ""))}</div>
+                            <div style="font-size: 0.85rem; color: #94a3b8;">{self._escape_html(event.get("impact", ""))}</div>
+                        </div>
+"""
+                html += """
+                    </div>
+"""
+
+            # Automated Fixes (collapsible within the section)
+            if incident_story and incident_story.get("automated_fixes"):
+                html += f"""
+                    <details style="margin-top: 1.5rem;">
+                        <summary style="cursor: pointer; font-weight: 600; color: #60a5fa;">
+                            🔧 Fix Commands ({len(incident_story["automated_fixes"])} issues)
+                        </summary>
+                        <div style="margin-top: 1rem;">
+"""
+                for fix in incident_story["automated_fixes"]:
+                    html += f"""
+                            <div style="background: #1e293b; padding: 1rem; border-radius: 6px; margin-bottom: 1rem;">
+                                <div style="font-weight: 600; margin-bottom: 0.5rem;">
+                                    {self._escape_html(fix.get("issue", ""))}
+                                    <span style="font-size: 0.8rem; padding: 0.15rem 0.5rem; border-radius: 4px; margin-left: 0.5rem; background: {"#dc2626" if fix.get("severity") == "critical" else "#f59e0b"};">{fix.get("severity", "warning")}</span>
+                                </div>
+                                <div style="font-size: 0.9rem; color: #94a3b8; margin-bottom: 0.5rem;">{self._escape_html(fix.get("description", ""))}</div>
+"""
+                    if fix.get("commands"):
+                        html += """<div style="margin-top: 0.5rem;">"""
+                        for cmd in fix["commands"]:
+                            safe_icon = "✅" if cmd.get("safe") else "⚠️"
+                            html += f"""
+                                <div style="margin-bottom: 0.5rem;">
+                                    <div style="font-size: 0.85rem; color: #94a3b8;">{safe_icon} {self._escape_html(cmd.get("description", ""))}</div>
+                                    <pre style="background: #0f172a; padding: 0.5rem; border-radius: 4px; overflow-x: auto; font-size: 0.85rem; margin: 0.25rem 0;">{self._escape_html(cmd.get("command", ""))}</pre>
+                                </div>
+"""
+                        html += """</div>"""
+                    html += """</div>"""
+                html += """
+                        </div>
+                    </details>
+"""
+
+            # Verification Steps (collapsible)
+            if incident_story and incident_story.get("verification_steps"):
+                html += f"""
+                    <details style="margin-top: 1rem;">
+                        <summary style="cursor: pointer; font-weight: 600; color: #22c55e;">
+                            ✅ Verification Steps ({len(incident_story["verification_steps"])} checks)
+                        </summary>
+                        <ol style="margin-top: 1rem; padding-left: 1.5rem;">
+"""
+                for step in incident_story["verification_steps"]:
+                    html += f"""
+                            <li style="margin-bottom: 0.75rem;">
+                                <div style="font-weight: 500;">{self._escape_html(step.get("action", ""))}</div>
+                                <pre style="background: #0f172a; padding: 0.5rem; border-radius: 4px; font-size: 0.85rem; margin: 0.25rem 0; overflow-x: auto;">{self._escape_html(step.get("command", ""))}</pre>
+                                <div style="font-size: 0.85rem; color: #94a3b8;">Expected: {self._escape_html(step.get("expected_result", ""))}</div>
+                            </li>
+"""
+                html += """
+                        </ol>
+                    </details>
+"""
+
+            # Additional correlations (if more than one)
+            if len(correlations) > 1:
+                html += f"""
+                    <details style="margin-top: 1rem;">
+                        <summary style="cursor: pointer; font-weight: 600; color: #94a3b8;">
+                            🔗 Additional Findings ({len(correlations) - 1} more)
+                        </summary>
+                        <div style="margin-top: 1rem;">
+"""
+                for corr in correlations[1:]:
+                    blast = corr.get("blast_radius", {})
+                    html += f"""
+                            <div style="background: #1e293b; padding: 0.75rem; border-radius: 6px; margin-bottom: 0.75rem;">
+                                <div style="font-weight: 500;">{self._escape_html(corr.get("root_cause", ""))}</div>
+                                <div style="font-size: 0.85rem; color: #94a3b8;">
+                                    {self._escape_html(corr.get("impact", ""))}
+                                    {f" | 💥 {blast.get('pods', 0)} pods affected" if blast.get("pods") else ""}
                                 </div>
                             </div>
 """
                 html += """
                         </div>
-"""
-
-            # Add key events
-            if incident_story.get("key_events"):
-                html += """
-                        <h4 style="margin-top: 1.5rem; color: #f87171;">⚠️ Key Events</h4>
-                        <ul class="key-events-list">
-"""
-                for ke in incident_story["key_events"]:
-                    html += f"""
-                            <li>
-                                <strong>{self._escape_html(ke.get("time", ""))}</strong>: 
-                                {self._escape_html(ke.get("event", ""))}
-                                <span class="event-significance">({self._escape_html(ke.get("significance", ""))})</span>
-                            </li>
-"""
-                html += """
-                        </ul>
+                    </details>
 """
 
             html += """
-                    </div>
-                </div>
-            </section>
-"""
-
-        # Add Dependency Chains section (if available)
-        if dependency_chains:
-            html += f"""
-            <!-- Dependency Chains Section -->
-            <section class="section" id="dependency-chains">
-                <div class="section-header" onclick="toggleSection(this)">
-                    <div class="section-title">
-                        <span class="section-icon">⛓️</span>
-                        <span>Causal Chains</span>
-                    </div>
-                    <div class="section-meta">
-                        <span class="section-count">{len(dependency_chains)}</span>
-                        <span class="section-toggle">▼</span>
-                    </div>
-                </div>
-                <div class="section-content" style="padding: 1.5rem;">
-"""
-            for chain in dependency_chains:
-                html += f"""
-                    <div class="dependency-chain-card">
-                        <div class="chain-description">{self._escape_html(chain.get("chain_description", ""))}</div>
-                        <div class="chain-flow">
-"""
-                for i, step in enumerate(chain.get("cascade", [])):
-                    arrow = " → " if i > 0 else ""
-                    html += f"""
-                            {arrow}<span class="chain-step">{self._escape_html(step.get("type", ""))}</span>
-"""
-                html += f"""
-                        </div>
-                        <div class="chain-impact">Pods affected: {chain.get("total_pods_affected", 0)}</div>
-                    </div>
-"""
-            html += """
-                </div>
-            </section>
-"""
-
-        # Add Automated Fixes section (if available)
-        if incident_story and incident_story.get("automated_fixes"):
-            html += f"""
-            <!-- Automated Fixes Section -->
-            <section class="section" id="automated-fixes">
-                <div class="section-header" onclick="toggleSection(this)">
-                    <div class="section-title">
-                        <span class="section-icon">🔧</span>
-                        <span>Automated Fix Commands</span>
-                    </div>
-                    <div class="section-meta">
-                        <span class="section-count">{len(incident_story["automated_fixes"])}</span>
-                        <span class="section-toggle">▼</span>
-                    </div>
-                </div>
-                <div class="section-content" style="padding: 1.5rem;">
-"""
-            for fix in incident_story["automated_fixes"]:
-                severity_badge = fix.get("severity", "warning")
-                html += f"""
-                    <div class="fix-card {severity_badge}">
-                        <div class="fix-header">
-                            <span class="fix-issue">{self._escape_html(fix.get("issue", ""))}</span>
-                            <span class="fix-severity {severity_badge}">{severity_badge}</span>
-                        </div>
-                        <div class="fix-description">{self._escape_html(fix.get("description", ""))}</div>
-"""
-                # Add affected resources
-                if fix.get("affected_resources"):
-                    html += """
-                        <div class="fix-resources">
-                            <strong>Affected:</strong>
-                            <ul>
-"""
-                    for res in fix["affected_resources"][:5]:
-                        html += f"""
-                                <li>{self._escape_html(res)}</li>
-"""
-                    html += """
-                            </ul>
-                        </div>
-"""
-                # Add commands
-                if fix.get("commands"):
-                    html += """
-                        <div class="fix-commands">
-                            <strong>Commands:</strong>
-"""
-                    for cmd in fix["commands"]:
-                        safe_badge = (
-                            '<span class="safe-badge">✓ Safe</span>'
-                            if cmd.get("safe")
-                            else '<span class="unsafe-badge">⚠ Review</span>'
-                        )
-                        html += f"""
-                            <div class="command-block">
-                                <div class="command-desc">{self._escape_html(cmd.get("description", ""))} {safe_badge}</div>
-                                <pre class="command-code">{self._escape_html(cmd.get("command", ""))}</pre>
-                                <div class="command-explanation">{self._escape_html(cmd.get("explanation", ""))}</div>
-                            </div>
-"""
-                    html += """
-                        </div>
-"""
-                html += """
-                    </div>
-"""
-            html += """
-                </div>
-            </section>
-"""
-
-        # Add Verification Steps section
-        if incident_story and incident_story.get("verification_steps"):
-            html += f"""
-            <!-- Verification Steps Section -->
-            <section class="section" id="verification-steps">
-                <div class="section-header" onclick="toggleSection(this)">
-                    <div class="section-title">
-                        <span class="section-icon">✅</span>
-                        <span>Verification Steps</span>
-                    </div>
-                    <div class="section-meta">
-                        <span class="section-count">{len(incident_story["verification_steps"])}</span>
-                        <span class="section-toggle">▼</span>
-                    </div>
-                </div>
-                <div class="section-content" style="padding: 1.5rem;">
-                    <ol class="verification-steps-list">
-"""
-            for step in incident_story["verification_steps"]:
-                html += f"""
-                        <li>
-                            <strong>{self._escape_html(step.get("action", ""))}</strong>
-                            <pre class="verification-command">{self._escape_html(step.get("command", ""))}</pre>
-                            <div class="verification-expected">Expected: {self._escape_html(step.get("expected_result", ""))}</div>
-                        </li>
-"""
-            html += """
-                    </ol>
-                </div>
-            </section>
-"""
-
-        if correlations:
-            html += f"""
-            <!-- Correlations Section -->
-            <section class="section" id="correlations">
-                <div class="section-header" onclick="toggleSection(this)">
-                    <div class="section-title">
-                        <span class="section-icon">🔗</span>
-                        <span>Root Cause Analysis</span>
-                    </div>
-                    <div class="section-meta">
-                        <span class="section-count">{len(correlations)}</span>
-                        <span class="section-toggle">▼</span>
-                    </div>
-                </div>
-                <div class="section-content" style="padding: 1.5rem;">
-"""
-            for corr in correlations:
-                # Add root cause score if available
-                score_badge = ""
-                if corr.get("root_cause_score"):
-                    tier = corr.get("ranking_tier", "")
-                    tier_icon = (
-                        "🥇" if tier == "primary" else ("🥈" if tier == "secondary" else "ℹ️")
-                    )
-                    score_badge = f'<span class="score-badge {tier}">{tier_icon} Score: {corr["root_cause_score"]}</span>'
-
-                html += f"""
-                    <div class="correlation-card {corr.get("severity", "warning")}">
-                        <div class="corr-header">
-                            <div class="corr-title">🔍 {self._escape_html(corr.get("root_cause", ""))}</div>
-                            <div class="corr-badges">
-                                <span class="severity-badge {corr.get("severity", "warning")}">{corr.get("severity", "warning")}</span>
-                                {score_badge}
-                            </div>
-                        </div>
-                        <div class="corr-time">⏰ First detected: {self._escape_html(corr.get("root_cause_time", "Unknown"))}</div>
-"""
-                # Add temporal causality info
-                if corr.get("temporal_confidence"):
-                    confidence_pct = int(corr["temporal_confidence"] * 100)
-                    html += f"""
-                        <div class="corr-confidence">📊 Confidence: {confidence_pct}% (avg lag: {corr.get("avg_lag_minutes", "?")} min)</div>
-"""
-                # Add blast radius
-                blast = corr.get("blast_radius", {})
-                if blast:
-                    html += f"""
-                        <div class="corr-blast">💥 Blast radius: {blast.get("pods", 0)} pods, {blast.get("nodes", 0)} nodes, {blast.get("namespaces", 0)} namespaces ({blast.get("capacity_impact_percent", 0)}% capacity)</div>
-"""
-                html += f"""
-                        <div class="corr-impact">📊 Impact: {self._escape_html(corr.get("impact", ""))}</div>
-                        <div class="corr-recommendation">💡 Recommendation: {self._escape_html(corr.get("recommendation", ""))}</div>
-"""
-                if corr.get("aws_doc"):
-                    html += f"""
-                        <a href="{self._escape_html(corr["aws_doc"])}" class="rec-link" target="_blank">
-                            📚 View AWS Documentation →
-                        </a>
-"""
-                html += """
-                    </div>
-"""
-            html += """
-                </div>
-            </section>
-"""
-
-        # Add first issue indicator
-        first_issue = results.get("first_issue")
-        if first_issue:
-            html += f"""
-            <!-- First Issue Section -->
-            <section class="section" id="first-issue">
-                <div class="section-header" onclick="toggleSection(this)">
-                    <div class="section-title">
-                        <span class="section-icon">🎯</span>
-                        <span>Potential Root Cause</span>
-                    </div>
-                    <div class="section-meta">
-                        <span class="section-toggle">▼</span>
-                    </div>
-                </div>
-                <div class="section-content" style="padding: 1.5rem;">
-                    <div class="first-issue-card">
-                        <div class="first-issue-time">⏰ First Issue Detected: {first_issue["timestamp"]}</div>
-                        <div class="first-issue-category">📁 Category: {first_issue["category"]}</div>
-                        <div class="first-issue-summary">📝 {first_issue["summary"]}</div>
-                        <div class="first-issue-note">💡 This may be the root cause of subsequent issues</div>
-                    </div>
                 </div>
             </section>
 """

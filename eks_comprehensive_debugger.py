@@ -13678,7 +13678,7 @@ def main():
 
         if not args.quiet:
             print("=" * 70)
-            print(f"COMPREHENSIVE EKS DEBUGGER v{VERSION}")
+            print(f"EKS HEALTH CHECK DASHBOARD v{VERSION}")
             print("=" * 70)
             print(f"Profile:     {args.profile}")
             print(f"Region:      {args.region}")

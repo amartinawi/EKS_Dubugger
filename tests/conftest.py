@@ -1,4 +1,4 @@
-"""Shared fixtures for EKS Debugger tests."""
+"""Shared fixtures for EKS Health Check Dashboard tests."""
 
 import pytest
 import sys

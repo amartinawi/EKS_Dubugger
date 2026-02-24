@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidelines for AI coding agents working in this EKS Debugger codebase.
+Guidelines for AI coding agents working in the EKS Health Check Dashboard codebase.
 
 ## Project Overview
 

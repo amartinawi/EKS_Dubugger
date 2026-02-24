@@ -7683,6 +7683,94 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         """Extract node name from pod details if available"""
         return pod_details.get("node") or pod_details.get("nodeName")
 
+    def _check_eks_cluster_upgrade(self) -> dict | None:
+        """Check for recent EKS cluster upgrades via AWS API.
+
+        Uses EKS list_updates and describe_update APIs to detect:
+        - Cluster version upgrades
+        - Addon updates
+        - Node group updates
+
+        Returns:
+            Dict with upgrade info if detected, None otherwise
+        """
+        try:
+            eks_client = self.session.client("eks")
+
+            # List recent updates
+            success, updates = self.safe_api_call(
+                eks_client.list_updates,
+                name=self.cluster_name,
+            )
+
+            if not success or not updates.get("updateIds"):
+                return None
+
+            upgrade_info = None
+            recent_updates = []
+
+            # Check recent updates (limit to last 10)
+            for update_id in updates.get("updateIds", [])[:10]:
+                success, update = self.safe_api_call(
+                    eks_client.describe_update,
+                    name=self.cluster_name,
+                    updateId=update_id,
+                )
+
+                if not success:
+                    continue
+
+                update_type = update.get("type", "")
+                status = update.get("status", "")
+                created_at = update.get("createdAt")
+
+                # Check if within our date range
+                if created_at:
+                    if self.start_date <= created_at.replace(tzinfo=timezone.utc) <= self.end_date:
+                        recent_updates.append(
+                            {
+                                "type": update_type,
+                                "status": status,
+                                "created_at": str(created_at),
+                                "id": update_id,
+                            }
+                        )
+
+            # Detect upgrade patterns
+            version_updates = [u for u in recent_updates if u["type"] == "VERSION_UPDATE"]
+            addon_updates = [u for u in recent_updates if u["type"] == "ADDON_UPDATE"]
+            nodegroup_updates = [u for u in recent_updates if u["type"] == "NODEGROUP_UPDATE"]
+
+            if version_updates:
+                upgrade_info = {
+                    "upgrade_type": "Cluster version upgrade",
+                    "updates": version_updates,
+                    "total_updates": len(recent_updates),
+                }
+            elif len(addon_updates) >= 2:
+                upgrade_info = {
+                    "upgrade_type": "Multiple addon updates",
+                    "updates": addon_updates,
+                    "total_updates": len(recent_updates),
+                }
+            elif len(nodegroup_updates) >= 2:
+                upgrade_info = {
+                    "upgrade_type": "Node group updates",
+                    "updates": nodegroup_updates,
+                    "total_updates": len(recent_updates),
+                }
+            elif len(recent_updates) >= 3:
+                upgrade_info = {
+                    "upgrade_type": "Cluster maintenance activity",
+                    "updates": recent_updates[:5],
+                    "total_updates": len(recent_updates),
+                }
+
+            return upgrade_info
+
+        except Exception:
+            return None
+
     def correlate_findings(self):
         """
         Smart correlation of findings across data sources.
@@ -8001,6 +8089,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         # Correlation Rule 8: Cluster Upgrade Detection
+        # First check AWS EKS API for confirmed upgrades
+        aws_upgrade_info = self._check_eks_cluster_upgrade()
+
         upgrade_indicators = []
         upgrade_keywords = [
             "upgrade",
@@ -8061,42 +8152,64 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
         ]
 
-        # If we have multiple indicators, correlate as upgrade
+        # If we have AWS API confirmation, use that (highest confidence)
+        # Otherwise, correlate based on event patterns
         total_indicators = len(upgrade_indicators) + len(node_ready_events) + len(ds_restarts)
-        if total_indicators >= 3 or (len(node_ready_events) >= 2 and len(ds_restarts) >= 1):
-            upgrade_times = []
-            for ind in upgrade_indicators:
-                if ind.get("timestamp"):
-                    upgrade_times.append(ind["timestamp"])
-            for f in node_ready_events:
-                ts = self._extract_timestamp(f.get("details", {}))
-                if ts:
-                    upgrade_times.append(ts)
 
-            first_upgrade = min(upgrade_times) if upgrade_times else None
+        if (
+            aws_upgrade_info
+            or total_indicators >= 3
+            or (len(node_ready_events) >= 2 and len(ds_restarts) >= 1)
+        ):
+            # Prefer AWS API data if available
+            if aws_upgrade_info:
+                upgrade_type = aws_upgrade_info.get("upgrade_type", "Cluster upgrade")
+                first_upgrade = aws_upgrade_info.get("updates", [{}])[0].get(
+                    "created_at", "Unknown"
+                )
+                aws_updates = aws_upgrade_info.get("updates", [])
+                correlation_severity = "info"
+                impact_msg = f"Confirmed via AWS API: {upgrade_type} detected. {aws_upgrade_info.get('total_updates', 0)} updates in date range."
+            else:
+                # Fallback to event-based detection
+                upgrade_times = []
+                for ind in upgrade_indicators:
+                    if ind.get("timestamp"):
+                        upgrade_times.append(ind["timestamp"])
+                for f in node_ready_events:
+                    ts = self._extract_timestamp(f.get("details", {}))
+                    if ts:
+                        upgrade_times.append(ts)
 
-            # Determine upgrade type
-            upgrade_type = "Cluster upgrade"
-            if any("node" in ind["summary"].lower() for ind in upgrade_indicators):
-                upgrade_type = "Node group upgrade"
-            elif any("addon" in ind["category"] for ind in upgrade_indicators):
-                upgrade_type = "EKS addon upgrade"
+                first_upgrade = min(upgrade_times) if upgrade_times else "Unknown"
+
+                # Determine upgrade type
+                upgrade_type = "Cluster upgrade"
+                if any("node" in ind["summary"].lower() for ind in upgrade_indicators):
+                    upgrade_type = "Node group upgrade"
+                elif any("addon" in ind.get("category", "") for ind in upgrade_indicators):
+                    upgrade_type = "EKS addon upgrade"
+                aws_updates = []
+                correlation_severity = "info"
+                impact_msg = f"Findings are likely due to cluster upgrade activity. {total_indicators} upgrade-related events detected."
 
             correlations.append(
                 {
                     "correlation_type": "cluster_upgrade",
-                    "severity": "info",
+                    "severity": correlation_severity,
                     "root_cause": f"{upgrade_type} in progress or recently completed",
                     "root_cause_time": str(first_upgrade) if first_upgrade else "Unknown",
                     "affected_components": {
+                        "aws_api_confirmed": aws_upgrade_info is not None,
                         "upgrade_indicators_count": total_indicators,
                         "node_events": len(node_ready_events),
                         "daemonset_restarts": len(ds_restarts),
+                        "aws_updates": aws_updates[:5] if aws_updates else [],
                         "categories_affected": list(
                             set(ind["category"] for ind in upgrade_indicators)
                         ),
                     },
-                    "impact": f"Findings are likely due to cluster upgrade activity. {total_indicators} upgrade-related events detected.",
+                    "impact": impact_msg,
                     "recommendation": "Review findings in context of ongoing upgrade. Most issues should resolve automatically. Monitor cluster health post-upgrade.",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/update-cluster.html",
                 }

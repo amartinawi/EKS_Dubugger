@@ -8000,6 +8000,108 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 }
             )
 
+        # Correlation Rule 8: Cluster Upgrade Detection
+        upgrade_indicators = []
+        upgrade_keywords = [
+            "upgrade",
+            "updating",
+            "version",
+            "rolling update",
+            "node update",
+            "platform version",
+        ]
+        upgrade_event_types = [
+            "NodeReady",
+            "NodeNotReady",
+            "Rebooted",
+            "Starting",
+            "Started",
+        ]
+
+        # Check for upgrade-related events in findings
+        for category, findings_list in self.findings.items():
+            for finding in findings_list:
+                summary = finding.get("summary", "").lower()
+                details_str = str(finding.get("details", {})).lower()
+
+                # Check for upgrade keywords
+                if any(kw in summary or kw in details_str for kw in upgrade_keywords):
+                    upgrade_indicators.append(
+                        {
+                            "category": category,
+                            "summary": finding.get("summary", ""),
+                            "timestamp": self._extract_timestamp(finding.get("details", {})),
+                        }
+                    )
+
+                # Check for mass node/pod restarts (common during upgrades)
+                if any(et in summary for et in upgrade_event_types):
+                    upgrade_indicators.append(
+                        {
+                            "category": category,
+                            "summary": finding.get("summary", ""),
+                            "timestamp": self._extract_timestamp(finding.get("details", {})),
+                        }
+                    )
+
+        # Check for patterns indicating upgrade: multiple node events in short time
+        node_ready_events = [
+            f
+            for f in self.findings.get("node_issues", [])
+            if "ready" in f.get("summary", "").lower() or "reboot" in f.get("summary", "").lower()
+        ]
+
+        # Check for DaemonSet restarts (common during upgrades)
+        ds_restarts = [
+            f
+            for f in self.findings.get("pod_errors", [])
+            if any(
+                ds in f.get("summary", "").lower()
+                for ds in ["aws-node", "coredns", "kube-proxy", "vpc-cni"]
+            )
+        ]
+
+        # If we have multiple indicators, correlate as upgrade
+        total_indicators = len(upgrade_indicators) + len(node_ready_events) + len(ds_restarts)
+        if total_indicators >= 3 or (len(node_ready_events) >= 2 and len(ds_restarts) >= 1):
+            upgrade_times = []
+            for ind in upgrade_indicators:
+                if ind.get("timestamp"):
+                    upgrade_times.append(ind["timestamp"])
+            for f in node_ready_events:
+                ts = self._extract_timestamp(f.get("details", {}))
+                if ts:
+                    upgrade_times.append(ts)
+
+            first_upgrade = min(upgrade_times) if upgrade_times else None
+
+            # Determine upgrade type
+            upgrade_type = "Cluster upgrade"
+            if any("node" in ind["summary"].lower() for ind in upgrade_indicators):
+                upgrade_type = "Node group upgrade"
+            elif any("addon" in ind["category"] for ind in upgrade_indicators):
+                upgrade_type = "EKS addon upgrade"
+
+            correlations.append(
+                {
+                    "correlation_type": "cluster_upgrade",
+                    "severity": "info",
+                    "root_cause": f"{upgrade_type} in progress or recently completed",
+                    "root_cause_time": str(first_upgrade) if first_upgrade else "Unknown",
+                    "affected_components": {
+                        "upgrade_indicators_count": total_indicators,
+                        "node_events": len(node_ready_events),
+                        "daemonset_restarts": len(ds_restarts),
+                        "categories_affected": list(
+                            set(ind["category"] for ind in upgrade_indicators)
+                        ),
+                    },
+                    "impact": f"Findings are likely due to cluster upgrade activity. {total_indicators} upgrade-related events detected.",
+                    "recommendation": "Review findings in context of ongoing upgrade. Most issues should resolve automatically. Monitor cluster health post-upgrade.",
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/update-cluster.html",
+                }
+            )
+
         # Store correlations
         if correlations:
             self.correlations = correlations

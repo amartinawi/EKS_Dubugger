@@ -7709,9 +7709,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             upgrade_info = None
             recent_updates = []
 
-            # Check recent updates (limit to last 10)
-            for update_id in updates.get("updateIds", [])[:10]:
-                success, update = self.safe_api_call(
+            # Check recent updates (limit to last 20)
+            for update_id in updates.get("updateIds", [])[:20]:
+                success, response = self.safe_api_call(
                     eks_client.describe_update,
                     name=self.cluster_name,
                     updateId=update_id,
@@ -7720,13 +7720,29 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 if not success:
                     continue
 
+                # Data is inside 'update' key
+                update = response.get("update", response)
                 update_type = update.get("type", "")
                 status = update.get("status", "")
                 created_at = update.get("createdAt")
 
                 # Check if within our date range
                 if created_at:
-                    if self.start_date <= created_at.replace(tzinfo=timezone.utc) <= self.end_date:
+                    # Handle various timestamp formats
+                    if isinstance(created_at, str):
+                        # Parse ISO format with timezone
+                        try:
+                            from dateutil import parser
+
+                            created_at_dt = parser.parse(created_at)
+                        except Exception:
+                            continue
+                    else:
+                        created_at_dt = created_at
+                        if created_at_dt.tzinfo is None:
+                            created_at_dt = created_at_dt.replace(tzinfo=timezone.utc)
+
+                    if self.start_date <= created_at_dt <= self.end_date:
                         recent_updates.append(
                             {
                                 "type": update_type,
@@ -7737,9 +7753,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         )
 
             # Detect upgrade patterns
-            version_updates = [u for u in recent_updates if u["type"] == "VERSION_UPDATE"]
-            addon_updates = [u for u in recent_updates if u["type"] == "ADDON_UPDATE"]
-            nodegroup_updates = [u for u in recent_updates if u["type"] == "NODEGROUP_UPDATE"]
+            version_updates = [u for u in recent_updates if u["type"] == "VersionUpdate"]
+            addon_updates = [u for u in recent_updates if "ADDON" in u["type"].upper()]
+            nodegroup_updates = [u for u in recent_updates if "NODEGROUP" in u["type"].upper()]
 
             if version_updates:
                 upgrade_info = {

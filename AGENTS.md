@@ -10,7 +10,7 @@ Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file
 **Lines of Code:** ~13,700  
 **Analysis Methods:** 56  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)  
-**Unit Tests:** 124 tests
+**Unit Tests:** 158 tests
 
 ## Quick Commands
 

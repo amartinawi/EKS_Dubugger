@@ -4106,7 +4106,7 @@ class HTMLOutputFormatter(OutputFormatter):
             <!-- Header -->
             <header class="page-header" id="summary">
                 <div class="header-content">
-                    <h1 class="header-title">🔍 EKS Cluster Analysis Report</h1>
+                    <h1 class="header-title">🔍 EKS Cluster Health Check</h1>
                     <p class="header-subtitle">Comprehensive diagnostic analysis powered by AWS best practices</p>
                     
                     <div class="header-meta">

@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eks-comprehensive-debugger"
-version = "3.0.0"
+version = "3.5.0"
 description = "Production-grade diagnostic tool for Amazon EKS cluster troubleshooting"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 authors = [
     {name = "EKS Debugger Contributors"}
 ]
-keywords = ["aws", "eks", "kubernetes", "debugging", "troubleshooting", "k8s"]
+keywords = ["aws", "eks", "kubernetes", "debugging", "troubleshooting", "k8s", "devops"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
@@ -22,13 +22,14 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: System :: Monitoring",
     "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
 ]
 dependencies = [
     "boto3>=1.26.0",
@@ -39,9 +40,14 @@ dependencies = [
 [project.optional-dependencies]
 yaml = ["pyyaml>=6.0"]
 dev = [
-    "pytest>=7.0",
-    "ruff>=0.1.0",
-    "mypy>=1.0",
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+all = [
+    "eks-comprehensive-debugger[yaml,dev]",
 ]
 
 [project.scripts]
@@ -57,19 +63,70 @@ Issues = "https://github.com/your-org/eks-comprehensive-debugger/issues"
 py-modules = ["eks_comprehensive_debugger"]
 
 [tool.ruff]
-line-length = 100
-target-version = "py38"
+line-length = 120
+target-version = "py310"
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "*.egg-info",
+    ".mypy_cache",
+    ".pytest_cache",
+]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
-ignore = ["E501", "SIM102", "B904"]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # Pyflakes
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "TCH",    # flake8-type-checking
+    "PTH",    # flake8-use-pathlib
+    "RUF",    # Ruff-specific rules
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "SIM102", # nested if statements
+    "B904",   # raise without from inside except
+    "PTH123", # use pathlib for open
+    "TCH001", # runtime-import
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["eks_comprehensive_debugger"]
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
+strict = false
 ignore_missing_imports = true
 warn_return_any = false
 warn_unused_ignores = true
+show_error_codes = true
+pretty = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v"
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+source = ["eks_comprehensive_debugger"]
+branch = true
+omit = [
+    "tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]

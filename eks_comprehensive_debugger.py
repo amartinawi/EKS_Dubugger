@@ -3028,6 +3028,65 @@ class HTMLOutputFormatter(OutputFormatter):
             color: #d97706;
         }}
         
+        /* Info Box */
+        .info-box {{
+            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+            border: 1px solid #bae6fd;
+            border-radius: 12px;
+            margin-bottom: 1.5rem;
+            overflow: hidden;
+        }}
+        
+        .info-box-header {{
+            background: #0ea5e9;
+            color: white;
+            padding: 0.75rem 1rem;
+            font-weight: 600;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }}
+        
+        .info-box-content {{
+            padding: 1rem;
+        }}
+        
+        .finding-type-legend {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }}
+        
+        .legend-item {{
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }}
+        
+        .legend-badge {{
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }}
+        
+        .legend-badge.historical {{
+            background: #ede9fe;
+            color: #7c3aed;
+        }}
+        
+        .legend-badge.current {{
+            background: #fef3c7;
+            color: #d97706;
+        }}
+        
+        .legend-desc {{
+            font-size: 0.85rem;
+            color: #475569;
+        }}
+        
         /* Executive Summary Section */
         .executive-summary {{
             background: white;
@@ -4175,7 +4234,7 @@ class HTMLOutputFormatter(OutputFormatter):
             <div class="sidebar-header">
                 <div class="sidebar-logo">
                     <span>🔍</span>
-                    <span>EKS Debugger</span>
+                    <span>EKS Cluster Health Check</span>
                 </div>
             </div>
             <nav class="sidebar-nav">
@@ -4249,7 +4308,7 @@ class HTMLOutputFormatter(OutputFormatter):
                         </div>
                         <div class="meta-item">
                             <div class="meta-label">Time Range</div>
-                            <div class="meta-value">{metadata["date_range"]["start"].split("T")[0]} to {metadata["date_range"]["end"].split("T")[0]}</div>
+                            <div class="meta-value">{metadata["date_range"]["start"].replace("T", " ")[:16]} to {metadata["date_range"]["end"].replace("T", " ")[:16]}</div>
                         </div>
                     </div>
                 </div>
@@ -4303,7 +4362,7 @@ class HTMLOutputFormatter(OutputFormatter):
                         <span class="finding-type-title">Historical Events</span>
                     </div>
                     <div class="finding-type-count">{summary.get("historical_event_count", 0)}</div>
-                    <div class="finding-type-desc">Within date range ({metadata["date_range"]["start"].split("T")[0]} to {metadata["date_range"]["end"].split("T")[0]})</div>
+                    <div class="finding-type-desc">Within date range ({metadata["date_range"]["start"].replace("T", " ")[:16]} to {metadata["date_range"]["end"].replace("T", " ")[:16]})</div>
                     <div class="finding-type-critical">🔴 {summary.get("historical_event_critical", 0)} critical</div>
                 </div>
                 <div class="finding-type-card current">
@@ -4379,6 +4438,27 @@ class HTMLOutputFormatter(OutputFormatter):
                     </div>
                 </div>
                 <div class="section-content">
+                    <div class="info-box">
+                        <div class="info-box-header">
+                            <span>ℹ️</span> Understanding Finding Types
+                        </div>
+                        <div class="info-box-content">
+                            <div class="finding-type-legend">
+                                <div class="legend-item">
+                                    <span class="legend-badge historical">📅 Historical</span>
+                                    <span class="legend-desc">Events that occurred within the scan window ("""
+                + metadata["date_range"]["start"].replace("T", " ")[:16]
+                + """ to """
+                + metadata["date_range"]["end"].replace("T", " ")[:16]
+                + """)</span>
+                                </div>
+                                <div class="legend-item">
+                                    <span class="legend-badge current">🔄 Current</span>
+                                    <span class="legend-desc">Current cluster state (not filtered by date range)</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
 """
             )
 

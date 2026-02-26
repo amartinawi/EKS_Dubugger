@@ -167,6 +167,7 @@ import time
 import html
 import threading
 import uuid
+import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as date_parser
@@ -177,6 +178,25 @@ import hashlib
 import os
 import json as json_module
 import pytz
+
+import logging
+
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from dateutil import parser as date_parser
+from typing import Optional, Any, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+import hashlib
+import os
+import json as json_module
+
+import pytz
+
+# Configure module-level logger
+logger = logging.getLogger(__name__)
+
+logger.setLevel(logging.INFO)
 
 VERSION = "3.5.0"
 DEFAULT_LOOKBACK_HOURS = 24
@@ -397,7 +417,7 @@ class IncrementalCache:
             except Exception:
                 os.close(fd)
                 raise
-        except (OSError, json_module.JSONEncodeError):
+        except (OSError, TypeError):
             return False
 
     def compute_delta(self, current: dict, previous: dict | None) -> dict:
@@ -870,36 +890,64 @@ class InsufficientPermissionsError(EKSDebuggerError):
 
 
 class ProgressTracker:
-    """Track progress of analysis steps"""
+    """Track progress of analysis steps with console and file output."""
 
-    def __init__(self, verbose=False, quiet=False):
+    def __init__(self, verbose=False, quiet=False, log_level=None):
         self.verbose = verbose
         self.quiet = quiet
         self.steps_completed = 0
         self.total_steps = 0
+        self.log_level = log_level
+        self._configure_logging()
+
+    def _configure_logging(self):
+        """Configure logging based on settings."""
+        if self.log_level:
+            logger.setLevel(self.log_level)
+        elif self.verbose:
+            logger.setLevel(logging.DEBUG)
+        else:
+            logger.setLevel(logging.INFO)
 
     def set_total_steps(self, total):
         self.total_steps = total
 
     def step(self, message):
-        """Show progress for current step"""
+        """Show progress for current step."""
+        self.steps_completed += 1
+        prefix = f"[{self.steps_completed}/{self.total_steps}]" if self.total_steps > 0 else ""
+
+        # Always log to logger
+        logger.info(f"{prefix} {message}")
+
+        # Also print to console if not quiet
         if not self.quiet:
-            self.steps_completed += 1
-            prefix = f"[{self.steps_completed}/{self.total_steps}]" if self.total_steps > 0 else ""
             print(f"{prefix} {message}")
 
     def info(self, message):
-        """Show info message"""
+        """Show info message."""
+        # Always log to logger
+        logger.info(message)
+
+        # Also print to console if verbose and not quiet
         if self.verbose and not self.quiet:
             print(f"ℹ️  {message}")
 
     def warning(self, message):
-        """Show warning message"""
+        """Show warning message."""
+        # Always log to logger
+        logger.warning(message)
+
+        # Also print to console if not quiet
         if not self.quiet:
             print(f"⚠️  {message}")
 
     def error(self, message):
-        """Show error message"""
+        """Show error message."""
+        # Always log to logger
+        logger.error(message)
+
+        # Also print to stderr for visibility
         print(f"✗ {message}", file=sys.stderr)
 
 

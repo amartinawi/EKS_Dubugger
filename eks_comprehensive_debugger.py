@@ -160,15 +160,17 @@ import argparse
 import boto3
 import json
 import re
+import shlex
 import subprocess
 import sys
 import time
 import html
 import threading
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as date_parser
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import hashlib
@@ -951,8 +953,6 @@ class LLMJSONOutputFormatter(OutputFormatter):
 
     def format(self, results):
         """Format results as LLM-ready JSON with finding type classification"""
-        import uuid
-
         metadata = results["metadata"]
         summary = results["summary"]
         findings = results.get("findings", {})
@@ -5295,8 +5295,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             return False, "kubectl not found in PATH"
 
     def get_kubectl_output(
-        self, cmd, timeout=DEFAULT_TIMEOUT, required=False, use_cache: bool = True
-    ):
+        self,
+        cmd: str,
+        timeout: int = DEFAULT_TIMEOUT,
+        required: bool = False,
+        use_cache: bool = True,
+    ) -> str | None:
         """Run kubectl command with error handling and optional caching.
 
         Uses shell=False for security. Handles shell fallback patterns (||)
@@ -5311,8 +5315,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Returns:
             Command output string or None on failure
         """
-        import shlex
-
         # Add context flag if custom context is set
         # Must add it BEFORE any || fallback patterns
         if self.kube_context:
@@ -5396,7 +5398,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         return output
 
-    def safe_api_call(self, func, *args, use_cache: bool = True, **kwargs):
+    def safe_api_call(
+        self, func: Callable, *args, use_cache: bool = True, **kwargs
+    ) -> tuple[bool, Any]:
         """
         Safely call AWS API with retry logic and optional caching.
 
@@ -5406,7 +5410,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             use_cache: Whether to use caching (default: True)
             **kwargs: Keyword arguments for the function
 
-        Returns: (success: bool, result: Any)
+        Returns:
+            Tuple of (success: bool, result: Any). On success, result is the API response.
+            On failure, result is an error message string.
         """
         cache_key = ""
         if use_cache and self.enable_cache:

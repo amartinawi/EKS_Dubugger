@@ -164,10 +164,11 @@ import subprocess
 import sys
 import time
 import html
+import threading
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as date_parser
-from typing import Optional
+from typing import Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import hashlib
@@ -196,7 +197,7 @@ class PerformanceTracker:
 
     def __init__(self):
         self._timings: dict[str, list[float]] = {}
-        self._lock = __import__("threading").Lock()
+        self._lock = threading.Lock()
 
     def record(self, method_name: str, duration: float) -> None:
         """Record execution time for a method."""
@@ -233,7 +234,7 @@ class APICache:
     def __init__(self, ttl_seconds: int = API_CACHE_TTL_SECONDS):
         self._cache: dict = {}
         self._ttl = ttl_seconds
-        self._lock = __import__("threading").Lock()
+        self._lock = threading.Lock()
 
     def get(self, key: str) -> Optional[tuple]:
         with self._lock:
@@ -5012,10 +5013,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "node_info": None,  # kubectl get nodes output
             "pod_info": None,  # kubectl get pods output
         }
-        self._shared_data_lock = __import__("threading").Lock()
+        self._shared_data_lock = threading.Lock()
 
         # Thread-safe findings collection
-        self._findings_lock = __import__("threading").Lock()
+        self._findings_lock = threading.Lock()
 
         # Performance tracking for analysis methods
         self._perf_tracker = PerformanceTracker()

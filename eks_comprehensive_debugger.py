@@ -353,18 +353,33 @@ class IncrementalCache:
         self.cache_file = os.path.join(CACHE_DIR, f"{self.cache_key}.json")
         os.makedirs(CACHE_DIR, exist_ok=True)
 
-    def load_previous(self) -> Optional[dict]:
+    def load_previous(self) -> dict | None:
+        """Load previous analysis results from cache.
+
+        Returns:
+            Previous results dict if cache exists and is < 24 hours old, else None
+        """
         if os.path.exists(self.cache_file):
             try:
                 with open(self.cache_file, "r") as f:
                     data = json_module.load(f)
                     if time.time() - data.get("timestamp", 0) < 86400:
                         return data.get("results")
-            except (json_module.JSONDecodeError, KeyError):
+            except (json_module.JSONDecodeError, KeyError, OSError):
                 pass
         return None
 
-    def save(self, results: dict) -> None:
+    def save(self, results: dict) -> bool:
+        """Save current results to cache file.
+
+        Uses secure file permissions (0o600) to prevent credential leakage.
+
+        Args:
+            results: Analysis results dict to cache
+
+        Returns:
+            True if save succeeded, False otherwise
+        """
         try:
             fd = os.open(self.cache_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
@@ -378,13 +393,14 @@ class IncrementalCache:
                         f,
                         default=str,
                     )
+                return True
             except Exception:
                 os.close(fd)
                 raise
-        except Exception:
-            pass
+        except (OSError, json_module.JSONEncodeError):
+            return False
 
-    def compute_delta(self, current: dict, previous: Optional[dict]) -> dict:
+    def compute_delta(self, current: dict, previous: dict | None) -> dict:
         if not previous:
             return {"is_first_run": True, "new_issues": 0, "resolved_issues": 0}
         current_summaries = set()

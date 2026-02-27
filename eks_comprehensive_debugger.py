@@ -1282,9 +1282,7 @@ class ExecutiveSummaryGenerator:
 
         # Sort by severity (critical first), then by timestamp
         severity_order = {"critical": 0, "warning": 1, "info": 2}
-        all_findings.sort(
-            key=lambda x: (severity_order.get(x["severity"], 2), x["timestamp"] or "")
-        )
+        all_findings.sort(key=lambda x: (severity_order.get(x["severity"], 2), x["timestamp"] or ""))
 
         return all_findings[:limit]
 
@@ -1567,9 +1565,7 @@ class ExecutiveSummaryGenerator:
             "has_external_impact": total_offline > 0 or len(dns_failures) > 0,
         }
 
-    def _prioritize_actions(
-        self, recommendations: list, findings: dict, correlations: list
-    ) -> list:
+    def _prioritize_actions(self, recommendations: list, findings: dict, correlations: list) -> list:
         """Prioritize recommended actions"""
         actions = []
 
@@ -1608,9 +1604,7 @@ class ExecutiveSummaryGenerator:
 
         return actions[:10]  # Top 10 actions
 
-    def _generate_correlation_narrative(
-        self, correlations: list, first_issue: Optional[dict], findings: dict
-    ) -> dict:
+    def _generate_correlation_narrative(self, correlations: list, first_issue: Optional[dict], findings: dict) -> dict:
         """
         Generate a human-readable narrative from correlations (Phase 3 - #5).
 
@@ -1642,48 +1636,38 @@ class ExecutiveSummaryGenerator:
                 if "node" in impact.lower():
                     # Try to extract details
                     narrative_parts.append(
-                        f"📊 **Memory/Disk Pressure Cascade**: {root_cause}. "
-                        f"This triggered a cascade where {impact}."
+                        f"📊 **Memory/Disk Pressure Cascade**: {root_cause}. This triggered a cascade where {impact}."
                     )
                     short_summary = f"Node pressure caused cascading failures"
 
             elif corr_type == "cni_cascade":
                 narrative_parts.append(
-                    f"🔌 **CNI Cascade**: {root_cause}. "
-                    f"Network connectivity issues followed: {impact}."
+                    f"🔌 **CNI Cascade**: {root_cause}. Network connectivity issues followed: {impact}."
                 )
                 short_summary = "VPC CNI issues caused network failures"
 
             elif corr_type == "oom_pattern":
-                narrative_parts.append(
-                    f"💾 **OOM Pattern**: {root_cause}. Memory exhaustion led to: {impact}."
-                )
+                narrative_parts.append(f"💾 **OOM Pattern**: {root_cause}. Memory exhaustion led to: {impact}.")
                 short_summary = "OOM kills indicate memory issues"
 
             elif corr_type == "control_plane_impact":
                 narrative_parts.append(
-                    f"⚙️ **Control Plane Impact**: {root_cause}. "
-                    f"Control plane instability affected: {impact}."
+                    f"⚙️ **Control Plane Impact**: {root_cause}. Control plane instability affected: {impact}."
                 )
                 short_summary = "Control plane issues impacting workloads"
 
             elif corr_type == "image_pull_pattern":
-                narrative_parts.append(
-                    f"📦 **Image Pull Issues**: {root_cause}. Container startup failures: {impact}."
-                )
+                narrative_parts.append(f"📦 **Image Pull Issues**: {root_cause}. Container startup failures: {impact}.")
                 short_summary = "Image pull failures detected"
 
             elif corr_type == "scheduling_pattern":
                 narrative_parts.append(
-                    f"📋 **Scheduling Issues**: {root_cause}. "
-                    f"Pods could not be scheduled: {impact}."
+                    f"📋 **Scheduling Issues**: {root_cause}. Pods could not be scheduled: {impact}."
                 )
                 short_summary = "Scheduling failures detected"
 
             elif corr_type == "dns_pattern":
-                narrative_parts.append(
-                    f"🔍 **DNS Issues**: {root_cause}. Service discovery problems: {impact}."
-                )
+                narrative_parts.append(f"🔍 **DNS Issues**: {root_cause}. Service discovery problems: {impact}.")
                 short_summary = "DNS resolution issues detected"
 
             else:
@@ -1714,9 +1698,7 @@ class ExecutiveSummaryGenerator:
                     f"The issues appear interconnected, suggesting a common root cause."
                 )
             else:
-                overall_summary = (
-                    short_summary if short_summary else "A single correlation pattern was detected."
-                )
+                overall_summary = short_summary if short_summary else "A single correlation pattern was detected."
 
             return {
                 "has_narrative": True,
@@ -1957,9 +1939,7 @@ class ExecutiveSummaryGenerator:
         # Add healthy checks count from summary
         healthy_checks_count = summary.get("healthy_checks", 0)
         if healthy_checks_count > len(healthy):
-            healthy.append(
-                {"name": "Health Checks", "message": f"{healthy_checks_count} checks passed"}
-            )
+            healthy.append({"name": "Health Checks", "message": f"{healthy_checks_count} checks passed"})
 
         return healthy[:6]  # Limit to 6 items
 
@@ -1988,19 +1968,13 @@ class ExecutiveSummaryGenerator:
             if not items:
                 continue
 
-            critical = sum(
-                1 for item in items if item.get("details", {}).get("severity") == "critical"
-            )
-            warning = sum(
-                1 for item in items if item.get("details", {}).get("severity") == "warning"
-            )
+            critical = sum(1 for item in items if item.get("details", {}).get("severity") == "critical")
+            warning = sum(1 for item in items if item.get("details", {}).get("severity") == "warning")
 
             breakdown.append(
                 {
                     "category": category,
-                    "display_name": category_names.get(
-                        category, category.replace("_", " ").title()
-                    ),
+                    "display_name": category_names.get(category, category.replace("_", " ").title()),
                     "count": len(items),
                     "critical": critical,
                     "warning": warning,
@@ -2185,9 +2159,7 @@ class HTMLOutputFormatter(OutputFormatter):
                 if finding.get("node"):
                     meta_parts.append(f"node: {finding['node']}")
                 meta_str = (
-                    " | ".join(meta_parts)
-                    if meta_parts
-                    else finding.get("category", "").replace("_", " ").title()
+                    " | ".join(meta_parts) if meta_parts else finding.get("category", "").replace("_", " ").title()
                 )
                 escaped_summary = self._escape_html(finding.get("summary", "Unknown"))
                 escaped_meta = self._escape_html(meta_str)
@@ -2482,11 +2454,7 @@ class HTMLOutputFormatter(OutputFormatter):
             for cat in categories[:8]:
                 width = (cat.get("count", 0) / max_count * 100) if max_count > 0 else 0
                 fill_class = (
-                    "critical"
-                    if cat.get("critical", 0) > 0
-                    else "warning"
-                    if cat.get("warning", 0) > 0
-                    else ""
+                    "critical" if cat.get("critical", 0) > 0 else "warning" if cat.get("warning", 0) > 0 else ""
                 )
                 html += f"""
                             <div class="category-bar">
@@ -2515,9 +2483,7 @@ class HTMLOutputFormatter(OutputFormatter):
         incident_story = results.get("incident_story", {})
         first_issue = results.get("first_issue")
 
-        has_story = incident_story and (
-            incident_story.get("timeline") or incident_story.get("summary")
-        )
+        has_story = incident_story and (incident_story.get("timeline") or incident_story.get("summary"))
         has_correlations = correlations or first_issue
 
         if not (has_story or has_correlations):
@@ -2572,11 +2538,7 @@ class HTMLOutputFormatter(OutputFormatter):
 """
             for event in incident_story["timeline"][:12]:
                 sev = event.get("severity", "info")
-                sev_color = (
-                    "#ef4444"
-                    if sev == "critical"
-                    else ("#f59e0b" if sev == "warning" else "#6b7280")
-                )
+                sev_color = "#ef4444" if sev == "critical" else ("#f59e0b" if sev == "warning" else "#6b7280")
                 html += f"""
                         <div style="margin-bottom: 0.75rem; position: relative;">
                             <div style="position: absolute; left: -1.35rem; width: 0.5rem; height: 0.5rem; background: {sev_color}; border-radius: 50%;"></div>
@@ -2687,19 +2649,9 @@ class HTMLOutputFormatter(OutputFormatter):
         correlations = results.get("correlations", [])
         first_issue = results.get("first_issue")
 
-        severity_class = (
-            "critical"
-            if summary["critical"] > 0
-            else ("warning" if summary["warning"] > 0 else "healthy")
-        )
-        severity_text = (
-            "CRITICAL"
-            if summary["critical"] > 0
-            else ("WARNING" if summary["warning"] > 0 else "HEALTHY")
-        )
-        severity_icon = (
-            "🔴" if summary["critical"] > 0 else ("⚠️" if summary["warning"] > 0 else "✅")
-        )
+        severity_class = "critical" if summary["critical"] > 0 else ("warning" if summary["warning"] > 0 else "healthy")
+        severity_text = "CRITICAL" if summary["critical"] > 0 else ("WARNING" if summary["warning"] > 0 else "HEALTHY")
+        severity_icon = "🔴" if summary["critical"] > 0 else ("⚠️" if summary["warning"] > 0 else "✅")
 
         category_info = {
             "memory_pressure": {
@@ -4372,7 +4324,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             <div class="meta-value">{metadata["analysis_date"].split("T")[0]}</div>
                         </div>
                         <div class="meta-item">
-                            <div class="meta-label">Time Range</div>
+                            <div class="meta-label">Time Range ({metadata.get("timezone", "UTC")})</div>
                             <div class="meta-value">{metadata["date_range"]["start"].replace("T", " ")[:16]} to {metadata["date_range"]["end"].replace("T", " ")[:16]}</div>
                         </div>
                     </div>
@@ -4529,15 +4481,11 @@ class HTMLOutputFormatter(OutputFormatter):
 
             for cat, items in findings.items():
                 if items:
-                    cat_info = category_info.get(
-                        cat, {"icon": "📋", "source": "Auto-detected", "color": "#666"}
-                    )
+                    cat_info = category_info.get(cat, {"icon": "📋", "source": "Auto-detected", "color": "#666"})
                     cat_title = cat.replace("_", " ").title()
 
                     for idx, item in enumerate(items):
-                        item_severity = self._classify_severity(
-                            item.get("summary", ""), item.get("details", {})
-                        )
+                        item_severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
                         source_badge = self._get_source_icon(item.get("details", {}))
                         finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
                         finding_id = f"{cat}-{idx}"
@@ -4570,9 +4518,7 @@ class HTMLOutputFormatter(OutputFormatter):
                         if item.get("details"):
                             for key, value in item["details"].items():
                                 escaped_key = self._escape_html(key)
-                                escaped_value = self._escape_html(
-                                    str(value) if value is not None else ""
-                                )
+                                escaped_value = self._escape_html(str(value) if value is not None else "")
                                 html += f"""
                                 <div class="detail-item">
                                     <div class="detail-label">{escaped_key}</div>
@@ -4596,14 +4542,11 @@ class HTMLOutputFormatter(OutputFormatter):
 
         for cat, items in findings.items():
             if items:
-                cat_info = category_info.get(
-                    cat, {"icon": "📋", "source": "Auto-detected", "color": "#666"}
-                )
+                cat_info = category_info.get(cat, {"icon": "📋", "source": "Auto-detected", "color": "#666"})
                 cat_title = cat.replace("_", " ").title()
 
                 severities = [
-                    self._classify_severity(item.get("summary", ""), item.get("details", {}))
-                    for item in items
+                    self._classify_severity(item.get("summary", ""), item.get("details", {})) for item in items
                 ]
                 critical_count = severities.count("critical")
                 warning_count = severities.count("warning")
@@ -4624,9 +4567,7 @@ class HTMLOutputFormatter(OutputFormatter):
                 <div class="section-content">
 '''
                 for idx, item in enumerate(items[:50]):
-                    item_severity = self._classify_severity(
-                        item.get("summary", ""), item.get("details", {})
-                    )
+                    item_severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
                     source_badge = self._get_source_icon(item.get("details", {}))
                     finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
                     escaped_summary2 = self._escape_html(item.get("summary", "N/A"))
@@ -4648,9 +4589,7 @@ class HTMLOutputFormatter(OutputFormatter):
                     if item.get("details"):
                         for key, value in item["details"].items():
                             escaped_key2 = self._escape_html(key)
-                            escaped_value2 = self._escape_html(
-                                str(value) if value is not None else ""
-                            )
+                            escaped_value2 = self._escape_html(str(value) if value is not None else "")
                             html += f"""
                                 <div class="detail-item">
                                     <div class="detail-label">{escaped_key2}</div>
@@ -5016,9 +4955,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.profile = profile
         self.region = region
         self.cluster_name = cluster_name
-        self.start_date = start_date or (
-            datetime.now(timezone.utc) - timedelta(hours=DEFAULT_LOOKBACK_HOURS)
-        )
+        self.start_date = start_date or (datetime.now(timezone.utc) - timedelta(hours=DEFAULT_LOOKBACK_HOURS))
         self.end_date = end_date or datetime.now(timezone.utc)
         self.namespace = namespace
         self.progress = progress or ProgressTracker()
@@ -5119,9 +5056,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             # If cluster name provided, validate it exists
             if self.cluster_name:
                 if self.cluster_name not in clusters:
-                    raise ClusterNotFoundError(
-                        f"Cluster '{self.cluster_name}' not found in {self.region}"
-                    )
+                    raise ClusterNotFoundError(f"Cluster '{self.cluster_name}' not found in {self.region}")
                 self.progress.info(f"Using cluster: {self.cluster_name}")
                 return self.cluster_name
 
@@ -5142,9 +5077,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                         status_icon = "✓" if status == "ACTIVE" else "⚠️"
                         print(f"  {idx}. {cluster}")
-                        print(
-                            f"     {status_icon} Status: {status} | Version: {version} | Created: {created}"
-                        )
+                        print(f"     {status_icon} Status: {status} | Version: {version} | Created: {created}")
                     except Exception:
                         print(f"  {idx}. {cluster} (details unavailable)")
 
@@ -5462,9 +5395,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         return output
 
-    def safe_api_call(
-        self, func: Callable, *args, use_cache: bool = True, **kwargs
-    ) -> tuple[bool, Any]:
+    def safe_api_call(self, func: Callable, *args, use_cache: bool = True, **kwargs) -> tuple[bool, Any]:
         """
         Safely call AWS API with retry logic and optional caching.
 
@@ -5480,9 +5411,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         """
         cache_key = ""
         if use_cache and self.enable_cache:
-            cache_key = APICache.make_key(
-                func.__name__ if hasattr(func, "__name__") else str(func), *args, **kwargs
-            )
+            cache_key = APICache.make_key(func.__name__ if hasattr(func, "__name__") else str(func), *args, **kwargs)
             cached = self._api_cache.get(cache_key)
             if cached is not None:
                 return cached
@@ -5635,9 +5564,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
     def _build_kubectl_events_cmd(self, reason: str) -> str:
         """Build kubectl events command with namespace handling."""
         if self.namespace:
-            return (
-                f"kubectl get events -n {self.namespace} --field-selector reason={reason} -o json"
-            )
+            return f"kubectl get events -n {self.namespace} --field-selector reason={reason} -o json"
         return f"kubectl get events --all-namespaces --field-selector reason={reason} -o json"
 
     def _get_filtered_events(self, reason: str) -> Optional[dict]:
@@ -5796,9 +5723,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 else:
                     self._add_finding_dict("pod_errors", finding)
 
-            self.progress.info(
-                f"Found {len(events.get('items', []))} eviction events in date range"
-            )
+            self.progress.info(f"Found {len(events.get('items', []))} eviction events in date range")
 
         except Exception as e:
             self.errors.append({"step": "analyze_pod_evictions", "message": str(e)})
@@ -5977,9 +5902,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 output = self.safe_kubectl_call(cmd)
                 if output:
                     events = json.loads(output)
-                    events = self.filter_kubectl_events_by_date(
-                        events, self.start_date, self.end_date
-                    )
+                    events = self.filter_kubectl_events_by_date(events, self.start_date, self.end_date)
                     for event in events.get("items", []):
                         node = event.get("involvedObject", {}).get("name", "Unknown")
                         message = event.get("message", "")
@@ -6128,9 +6051,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 datapoints = sorted(response.get("Datapoints", []), key=lambda x: x["Timestamp"])
 
                 if not datapoints:
-                    self.progress.info(
-                        f"No data for {metric['display']} (Container Insights may not be enabled)"
-                    )
+                    self.progress.info(f"No data for {metric['display']} (Container Insights may not be enabled)")
                     continue
 
                 # Check for threshold violations
@@ -6140,9 +6061,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     timestamp = dp["Timestamp"]
 
                     if metric["threshold"] and max_val >= metric["critical"]:
-                        category = (
-                            "memory_pressure" if "memory" in metric["name"] else "disk_pressure"
-                        )
+                        category = "memory_pressure" if "memory" in metric["name"] else "disk_pressure"
                         self._add_finding_dict(
                             category,
                             {
@@ -6256,9 +6175,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "summary": f"Log agent DaemonSet {ds_name} not healthy: {ready}/{desired} ready",
                                         "details": {
                                             "daemonset": ds_name,
-                                            "namespace": ds.get("metadata", {}).get(
-                                                "namespace", "unknown"
-                                            ),
+                                            "namespace": ds.get("metadata", {}).get("namespace", "unknown"),
                                             "desired": desired,
                                             "ready": ready,
                                             "severity": "warning",
@@ -6317,12 +6234,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     for dep in deployments.get("items", []):
                         dep_name = dep.get("metadata", {}).get("name", "")
                         if "cloudwatch" in dep_name.lower() and "agent" in dep_name.lower():
-                            containers = (
-                                dep.get("spec", {})
-                                .get("template", {})
-                                .get("spec", {})
-                                .get("containers", [])
-                            )
+                            containers = dep.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
                             for container in containers:
                                 env_vars = container.get("env", [])
                                 for env in env_vars:
@@ -6425,9 +6337,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             response = self._get_cached_log_group(log_group)
 
             if not response or not response.get("logGroups"):
-                self.progress.info(
-                    f"Control plane logging not enabled for cluster {self.cluster_name}"
-                )
+                self.progress.info(f"Control plane logging not enabled for cluster {self.cluster_name}")
                 return
 
             success, streams_response = self.safe_api_call(
@@ -6467,16 +6377,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         continue
 
                     is_benign = any(
-                        re.search(pattern, message, re.IGNORECASE)
-                        for pattern in CONTROL_PLANE_BENIGN_PATTERNS
+                        re.search(pattern, message, re.IGNORECASE) for pattern in CONTROL_PLANE_BENIGN_PATTERNS
                     )
 
                     if is_benign:
                         continue
 
-                    is_critical = any(
-                        pattern in message_lower for pattern in CONTROL_PLANE_ERROR_PATTERNS
-                    )
+                    is_critical = any(pattern in message_lower for pattern in CONTROL_PLANE_ERROR_PATTERNS)
 
                     if message.startswith("E") and len(message) > 1 and message[1].isdigit():
                         severity = "critical"
@@ -6575,9 +6482,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     },
                 )
 
-            self.progress.info(
-                f"Found {len(events.get('items', []))} scheduling failures in date range"
-            )
+            self.progress.info(f"Found {len(events.get('items', []))} scheduling failures in date range")
 
         except Exception as e:
             self.errors.append({"step": "analyze_pod_scheduling_failures", "message": str(e)})
@@ -6604,9 +6509,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             ]
 
             for reason in network_event_reasons:
-                cmd = (
-                    f"kubectl get events --all-namespaces --field-selector reason={reason} -o json"
-                )
+                cmd = f"kubectl get events --all-namespaces --field-selector reason={reason} -o json"
                 if self.namespace:
                     cmd = f"kubectl get events -n {self.namespace} --field-selector reason={reason} -o json"
 
@@ -6756,9 +6659,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if phase != "Bound":
                         storage_class = pvc["spec"].get("storageClassName", "N/A")
-                        requested_storage = pvc["spec"]["resources"]["requests"].get(
-                            "storage", "N/A"
-                        )
+                        requested_storage = pvc["spec"]["resources"]["requests"].get("storage", "N/A")
 
                         diagnostic_steps = [
                             f"kubectl describe pvc {pvc_name} -n {namespace}",
@@ -6909,9 +6810,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 if output:
                     events = json.loads(output)
-                    events = self.filter_kubectl_events_by_date(
-                        events, self.start_date, self.end_date
-                    )
+                    events = self.filter_kubectl_events_by_date(events, self.start_date, self.end_date)
 
                     for event in events.get("items", []):
                         pvc_name = event["involvedObject"].get("name", "Unknown")
@@ -6943,9 +6842,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 if output:
                     events = json.loads(output)
-                    events = self.filter_kubectl_events_by_date(
-                        events, self.start_date, self.end_date
-                    )
+                    events = self.filter_kubectl_events_by_date(events, self.start_date, self.end_date)
 
                     for event in events.get("items", []):
                         pvc_name = event["involvedObject"].get("name", "Unknown")
@@ -6993,9 +6890,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             image_pull_reasons = ["Failed", "BackOff", "ErrImagePull"]
 
             for reason in image_pull_reasons:
-                cmd = (
-                    f"kubectl get events --all-namespaces --field-selector reason={reason} -o json"
-                )
+                cmd = f"kubectl get events --all-namespaces --field-selector reason={reason} -o json"
                 if self.namespace:
                     cmd = f"kubectl get events -n {self.namespace} --field-selector reason={reason} -o json"
 
@@ -7012,11 +6907,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     message = event.get("message", "")
 
                     # Filter for image-related errors
-                    if (
-                        "image" in message.lower()
-                        or "pull" in message.lower()
-                        or "registry" in message.lower()
-                    ):
+                    if "image" in message.lower() or "pull" in message.lower() or "registry" in message.lower():
                         pod = event["involvedObject"].get("name", "Unknown")
                         namespace = event["metadata"]["namespace"]
                         timestamp = event.get("lastTimestamp", event.get("eventTime", "Unknown"))
@@ -7026,15 +6917,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         if "not found" in message.lower() or "404" in message:
                             failure_category = "image not found"
                         elif (
-                            "unauthorized" in message.lower()
-                            or "401" in message
-                            or "authentication" in message.lower()
+                            "unauthorized" in message.lower() or "401" in message or "authentication" in message.lower()
                         ):
                             failure_category = "authentication failed"
-                        elif (
-                            "rate limit" in message.lower()
-                            or "too many requests" in message.lower()
-                        ):
+                        elif "rate limit" in message.lower() or "too many requests" in message.lower():
                             failure_category = "registry rate limiting"
                         elif "timeout" in message.lower():
                             failure_category = "registry timeout"
@@ -7073,9 +6959,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Checking EKS addon health...")
 
         try:
-            success, response = self.safe_api_call(
-                self.eks_client.list_addons, clusterName=self.cluster_name
-            )
+            success, response = self.safe_api_call(self.eks_client.list_addons, clusterName=self.cluster_name)
 
             if not success:
                 self.progress.warning(f"Failed to list addons: {response}")
@@ -7111,9 +6995,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "addon": addon_name,
                                 "status": status,
                                 "version": addon.get("addonVersion", "N/A"),
-                                "health_issues": [
-                                    issue.get("message", "N/A") for issue in health_issues
-                                ],
+                                "health_issues": [issue.get("message", "N/A") for issue in health_issues],
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
                         },
@@ -7160,26 +7042,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     try:
                         # Simple numeric comparison (won't handle all cases perfectly)
                         if (
-                            str(hard_limit)
-                            .replace("Gi", "")
-                            .replace("Mi", "")
-                            .replace("m", "")
-                            .isdigit()
-                            and str(used_amount)
-                            .replace("Gi", "")
-                            .replace("Mi", "")
-                            .replace("m", "")
-                            .isdigit()
+                            str(hard_limit).replace("Gi", "").replace("Mi", "").replace("m", "").isdigit()
+                            and str(used_amount).replace("Gi", "").replace("Mi", "").replace("m", "").isdigit()
                         ):
-                            hard_num = float(
-                                str(hard_limit).replace("Gi", "").replace("Mi", "").replace("m", "")
-                            )
-                            used_num = float(
-                                str(used_amount)
-                                .replace("Gi", "")
-                                .replace("Mi", "")
-                                .replace("m", "")
-                            )
+                            hard_num = float(str(hard_limit).replace("Gi", "").replace("Mi", "").replace("m", ""))
+                            used_num = float(str(used_amount).replace("Gi", "").replace("Mi", "").replace("m", ""))
 
                             if used_num >= (hard_num * 0.9):
                                 self._add_finding_dict(
@@ -7255,13 +7122,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "reason": reason,
                                         "restart_count": restart_count,
                                         "message": message[:200] if message else "N/A",
-                                        "root_causes": EKS_ISSUE_PATTERNS["pod_issues"][
-                                            "CrashLoopBackOff"
-                                        ]["root_causes"],
+                                        "root_causes": EKS_ISSUE_PATTERNS["pod_issues"]["CrashLoopBackOff"][
+                                            "root_causes"
+                                        ],
                                         "severity": "critical",
-                                        "aws_doc": EKS_ISSUE_PATTERNS["pod_issues"][
-                                            "CrashLoopBackOff"
-                                        ]["aws_doc"],
+                                        "aws_doc": EKS_ISSUE_PATTERNS["pod_issues"]["CrashLoopBackOff"]["aws_doc"],
                                         "finding_type": FindingType.CURRENT_STATE,
                                     },
                                 },
@@ -7277,13 +7142,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "container": container_name,
                                         "reason": reason,
                                         "message": message[:200] if message else "N/A",
-                                        "root_causes": EKS_ISSUE_PATTERNS["pod_issues"][
-                                            "ImagePullBackOff"
-                                        ]["root_causes"],
+                                        "root_causes": EKS_ISSUE_PATTERNS["pod_issues"]["ImagePullBackOff"][
+                                            "root_causes"
+                                        ],
                                         "severity": "critical",
-                                        "aws_doc": EKS_ISSUE_PATTERNS["pod_issues"][
-                                            "ImagePullBackOff"
-                                        ]["aws_doc"],
+                                        "aws_doc": EKS_ISSUE_PATTERNS["pod_issues"]["ImagePullBackOff"]["aws_doc"],
                                         "finding_type": FindingType.CURRENT_STATE,
                                     },
                                 },
@@ -7299,13 +7162,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "container": container_name,
                                         "reason": reason,
                                         "message": message[:200] if message else "N/A",
-                                        "root_causes": EKS_ISSUE_PATTERNS["pod_issues"][
-                                            "CreateContainerConfigError"
-                                        ]["root_causes"],
+                                        "root_causes": EKS_ISSUE_PATTERNS["pod_issues"]["CreateContainerConfigError"][
+                                            "root_causes"
+                                        ],
                                         "severity": "critical",
-                                        "aws_doc": EKS_ISSUE_PATTERNS["pod_issues"][
-                                            "CreateContainerConfigError"
-                                        ]["aws_doc"],
+                                        "aws_doc": EKS_ISSUE_PATTERNS["pod_issues"]["CreateContainerConfigError"][
+                                            "aws_doc"
+                                        ],
                                         "finding_type": FindingType.CURRENT_STATE,
                                     },
                                 },
@@ -7439,9 +7302,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         ]
                                     )
                                 elif exit_code == 126:
-                                    diagnostic_steps.append(
-                                        "Command permission denied or not executable"
-                                    )
+                                    diagnostic_steps.append("Command permission denied or not executable")
                                 elif exit_code == 127:
                                     diagnostic_steps.append("Command not found")
 
@@ -7533,13 +7394,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "desired": desired,
                                 "current": current,
                                 "ready": ready,
-                                "root_causes": EKS_ISSUE_PATTERNS["network_issues"]["CNINotReady"][
-                                    "root_causes"
-                                ],
+                                "root_causes": EKS_ISSUE_PATTERNS["network_issues"]["CNINotReady"]["root_causes"],
                                 "severity": "critical",
-                                "aws_doc": EKS_ISSUE_PATTERNS["network_issues"]["CNINotReady"][
-                                    "aws_doc"
-                                ],
+                                "aws_doc": EKS_ISSUE_PATTERNS["network_issues"]["CNINotReady"]["aws_doc"],
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
                         },
@@ -7553,9 +7410,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 events = json.loads(output)
                 events = self.filter_kubectl_events_by_date(events, self.start_date, self.end_date)
 
-                ip_exhaustion_patterns = EKS_ISSUE_PATTERNS["network_issues"]["IPExhaustion"][
-                    "detection"
-                ]["patterns"]
+                ip_exhaustion_patterns = EKS_ISSUE_PATTERNS["network_issues"]["IPExhaustion"]["detection"]["patterns"]
 
                 for event in events.get("items", []):
                     message = event.get("message", "").lower()
@@ -7569,13 +7424,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "namespace": involved.get("namespace", "unknown"),
                                     "object": involved.get("name", "unknown"),
                                     "message": event.get("message", "N/A")[:200],
-                                    "root_causes": EKS_ISSUE_PATTERNS["network_issues"][
-                                        "IPExhaustion"
-                                    ]["root_causes"],
+                                    "root_causes": EKS_ISSUE_PATTERNS["network_issues"]["IPExhaustion"]["root_causes"],
                                     "severity": "critical",
-                                    "aws_doc": EKS_ISSUE_PATTERNS["network_issues"]["IPExhaustion"][
-                                        "aws_doc"
-                                    ],
+                                    "aws_doc": EKS_ISSUE_PATTERNS["network_issues"]["IPExhaustion"]["aws_doc"],
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             },
@@ -7655,13 +7506,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "object": involved.get("name", "unknown"),
                                     "reason": reason,
                                     "message": event.get("message", "N/A")[:200],
-                                    "root_causes": EKS_ISSUE_PATTERNS["network_issues"][
-                                        "DNSResolutionFailure"
-                                    ]["root_causes"],
+                                    "root_causes": EKS_ISSUE_PATTERNS["network_issues"]["DNSResolutionFailure"][
+                                        "root_causes"
+                                    ],
                                     "severity": "warning",
-                                    "aws_doc": EKS_ISSUE_PATTERNS["network_issues"][
-                                        "DNSResolutionFailure"
-                                    ]["aws_doc"],
+                                    "aws_doc": EKS_ISSUE_PATTERNS["network_issues"]["DNSResolutionFailure"]["aws_doc"],
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             },
@@ -7734,13 +7583,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "object": involved.get("name", "unknown"),
                                     "reason": event.get("reason", "N/A"),
                                     "message": event.get("message", "N/A")[:200],
-                                    "root_causes": EKS_ISSUE_PATTERNS["iam_issues"]["AccessDenied"][
-                                        "root_causes"
-                                    ],
+                                    "root_causes": EKS_ISSUE_PATTERNS["iam_issues"]["AccessDenied"]["root_causes"],
                                     "severity": "critical",
-                                    "aws_doc": EKS_ISSUE_PATTERNS["iam_issues"]["AccessDenied"][
-                                        "aws_doc"
-                                    ],
+                                    "aws_doc": EKS_ISSUE_PATTERNS["iam_issues"]["AccessDenied"]["aws_doc"],
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                 },
                             },
@@ -7752,9 +7597,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 success, response = self.safe_api_call(
                     cloudtrail_client.lookup_events,
-                    LookupAttributes=[
-                        {"AttributeKey": "EventName", "AttributeValue": "AssumeRole"}
-                    ],
+                    LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "AssumeRole"}],
                     StartTime=self.start_date,
                     EndTime=self.end_date,
                     MaxResults=50,
@@ -7792,12 +7635,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "role_arn": role_arn,
                                                 "username": username,
                                                 "error_code": error_code,
-                                                "error_message": error_message[:300]
-                                                if error_message
-                                                else "N/A",
-                                                "event_time": str(
-                                                    event.get("EventTime", "Unknown")
-                                                ),
+                                                "error_message": error_message[:300] if error_message else "N/A",
+                                                "event_time": str(event.get("EventTime", "Unknown")),
                                                 "severity": "critical",
                                                 "root_causes": [
                                                     "IAM role trust policy does not allow OIDC provider",
@@ -7852,9 +7691,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "event_name": "AssumeRoleForPodIdentity",
                                             "username": username,
                                             "error_code": error_code,
-                                            "error_message": ct_data.get("errorMessage", "N/A")[
-                                                :300
-                                            ],
+                                            "error_message": ct_data.get("errorMessage", "N/A")[:300],
                                             "event_time": str(event.get("EventTime", "Unknown")),
                                             "severity": "critical",
                                             "root_causes": [
@@ -8101,8 +7938,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             network_failures = [
                 f
                 for f in self.findings["network_issues"]
-                if "NetworkNotReady" in f.get("summary", "")
-                or "network" in f.get("summary", "").lower()
+                if "NetworkNotReady" in f.get("summary", "") or "network" in f.get("summary", "").lower()
             ]
 
             if cni_issues and network_failures:
@@ -8168,9 +8004,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         # Correlation Rule 4: Control Plane Errors → API issues
         if self.findings["control_plane_issues"]:
             critical_cp = [
-                f
-                for f in self.findings["control_plane_issues"]
-                if f.get("details", {}).get("severity") == "critical"
+                f for f in self.findings["control_plane_issues"] if f.get("details", {}).get("severity") == "critical"
             ]
 
             if critical_cp:
@@ -8207,16 +8041,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             ecr_failures = [
                 f
                 for f in image_failures
-                if "ecr" in str(f.get("details", {})).lower()
-                or ".ecr." in str(f.get("details", {})).lower()
+                if "ecr" in str(f.get("details", {})).lower() or ".ecr." in str(f.get("details", {})).lower()
             ]
             auth_failures = [
                 f
                 for f in image_failures
-                if any(
-                    p in str(f.get("details", {})).lower()
-                    for p in ["auth", "credential", "unauthorized", "denied"]
-                )
+                if any(p in str(f.get("details", {})).lower() for p in ["auth", "credential", "unauthorized", "denied"])
             ]
 
             root_cause = "Image pull issues detected"
@@ -8253,12 +8083,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         # Correlation Rule 6: Scheduling Failures → Resource constraints
         if self.findings["scheduling_failures"]:
             sched_failures = self.findings["scheduling_failures"]
-            resource_failures = [
-                f for f in sched_failures if "insufficient" in f.get("summary", "").lower()
-            ]
-            affinity_failures = [
-                f for f in sched_failures if "affinity" in f.get("summary", "").lower()
-            ]
+            resource_failures = [f for f in sched_failures if "insufficient" in f.get("summary", "").lower()]
+            affinity_failures = [f for f in sched_failures if "affinity" in f.get("summary", "").lower()]
 
             root_cause = "Pod scheduling constraints"
             if resource_failures:
@@ -8380,21 +8206,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         ds_restarts = [
             f
             for f in self.findings.get("pod_errors", [])
-            if any(
-                ds in f.get("summary", "").lower()
-                for ds in ["aws-node", "coredns", "kube-proxy", "vpc-cni"]
-            )
+            if any(ds in f.get("summary", "").lower() for ds in ["aws-node", "coredns", "kube-proxy", "vpc-cni"])
         ]
 
         # If we have AWS API confirmation, use that (highest confidence)
         # Otherwise, correlate based on event patterns
         total_indicators = len(upgrade_indicators) + len(node_ready_events) + len(ds_restarts)
 
-        if (
-            aws_upgrade_info
-            or total_indicators >= 3
-            or (len(node_ready_events) >= 2 and len(ds_restarts) >= 1)
-        ):
+        if aws_upgrade_info or total_indicators >= 3 or (len(node_ready_events) >= 2 and len(ds_restarts) >= 1):
             # Count findings by severity
             total_findings = sum(len(v) for v in self.findings.values())
             critical_findings = sum(
@@ -8435,9 +8254,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             # Prefer AWS API data if available
             if aws_upgrade_info:
                 upgrade_type = aws_upgrade_info.get("upgrade_type", "Cluster upgrade")
-                first_upgrade = aws_upgrade_info.get("updates", [{}])[0].get(
-                    "created_at", "Unknown"
-                )
+                first_upgrade = aws_upgrade_info.get("updates", [{}])[0].get("created_at", "Unknown")
                 aws_updates = aws_upgrade_info.get("updates", [])
                 correlation_severity = "info"
                 impact_msg = (
@@ -8501,16 +8318,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         pvc_pending = [
             f
             for f in self.findings.get("pvc_issues", [])
-            if "pending" in f.get("summary", "").lower()
-            or "ProvisioningFailed" in f.get("summary", "")
+            if "pending" in f.get("summary", "").lower() or "ProvisioningFailed" in f.get("summary", "")
         ]
         storage_related_pods = [
             f
             for f in self.findings.get("pod_errors", [])
-            if any(
-                kw in f.get("summary", "").lower()
-                for kw in ["containercreating", "mount", "volume", "attach"]
-            )
+            if any(kw in f.get("summary", "").lower() for kw in ["containercreating", "mount", "volume", "attach"])
         ]
         if pvc_pending and storage_related_pods:
             pvc_times = [self._extract_timestamp(f.get("details", {})) for f in pvc_pending]
@@ -8620,21 +8433,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         cert_issues = self.findings.get("node_issues", []) + [
             f
             for f in self.findings.get("control_plane_issues", [])
-            if any(
-                kw in f.get("summary", "").lower() for kw in ["cert", "tls", "x509", "certificate"]
-            )
+            if any(kw in f.get("summary", "").lower() for kw in ["cert", "tls", "x509", "certificate"])
         ]
         webhook_failures = [
             f
             for f in self.findings.get("control_plane_issues", [])
-            if "webhook" in f.get("summary", "").lower()
-            or "admission" in f.get("summary", "").lower()
+            if "webhook" in f.get("summary", "").lower() or "admission" in f.get("summary", "").lower()
         ]
         deployment_failures = [
             f
             for f in self.findings.get("pod_errors", [])
-            if "rollout" in f.get("summary", "").lower()
-            or "deployment" in f.get("summary", "").lower()
+            if "rollout" in f.get("summary", "").lower() or "deployment" in f.get("summary", "").lower()
         ]
         if cert_issues and (webhook_failures or deployment_failures):
             cert_times = [self._extract_timestamp(f.get("details", {})) for f in cert_issues]
@@ -8846,9 +8655,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         # Count affected resources in subsequent events
         affected_pods = sum(1 for e in subsequent_events if "pod" in e["category"])
         affected_nodes = sum(1 for e in subsequent_events if "node" in e["category"])
-        affected_services = sum(
-            1 for e in subsequent_events if "service" in e["category"] or "dns" in e["category"]
-        )
+        affected_services = sum(1 for e in subsequent_events if "service" in e["category"] or "dns" in e["category"])
 
         if category in ["oom_killed", "memory_pressure"]:
             return f"Potential impact: {affected_pods} pods may experience restart issues"
@@ -8879,9 +8686,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "control_plane_issues": "Control plane stress - cluster stability concern",
         }
 
-        return significance_map.get(
-            category, f"{category.replace('_', ' ')} - requires investigation"
-        )
+        return significance_map.get(category, f"{category.replace('_', ' ')} - requires investigation")
 
     def _generate_automated_fixes(self) -> list:
         """Generate copy-pasteable fix commands based on findings."""
@@ -8956,9 +8761,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         # Node pressure fixes
-        pressure_findings = self.findings.get("memory_pressure", []) + self.findings.get(
-            "disk_pressure", []
-        )
+        pressure_findings = self.findings.get("memory_pressure", []) + self.findings.get("disk_pressure", [])
         if pressure_findings:
             affected_nodes = set()
             for f in pressure_findings:
@@ -8998,10 +8801,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # CrashLoopBackOff fixes
         crash_findings = [
-            f
-            for cat in ["pod_errors"]
-            for f in self.findings.get(cat, [])
-            if "crash" in f.get("summary", "").lower()
+            f for cat in ["pod_errors"] for f in self.findings.get(cat, []) if "crash" in f.get("summary", "").lower()
         ]
         if crash_findings:
             fixes.append(
@@ -9198,9 +8998,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         ("storage_cascade", "scheduling_pattern", "Storage issues prevented pod scheduling"),
     ]
 
-    def _score_temporal_causality(
-        self, cause_events: list, effect_events: list, max_lag_minutes: int = 30
-    ) -> dict:
+    def _score_temporal_causality(self, cause_events: list, effect_events: list, max_lag_minutes: int = 30) -> dict:
         """Score how likely cause preceded effect within a time window.
 
         Args:
@@ -9245,9 +9043,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 )
 
         confidence = len(causal_pairs) / len(effect_events) if effect_events else 0
-        avg_lag = (
-            sum(p["lag_minutes"] for p in causal_pairs) / len(causal_pairs) if causal_pairs else 0
-        )
+        avg_lag = sum(p["lag_minutes"] for p in causal_pairs) / len(causal_pairs) if causal_pairs else 0
 
         return {
             "confidence": round(confidence, 2),
@@ -9433,9 +9229,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 score += 5
 
             corr["root_cause_score"] = round(score, 1)
-            corr["ranking_tier"] = (
-                "primary" if score >= 70 else "secondary" if score >= 40 else "contextual"
-            )
+            corr["ranking_tier"] = "primary" if score >= 70 else "secondary" if score >= 40 else "contextual"
 
         return sorted(correlations, key=lambda x: x.get("root_cause_score", 0), reverse=True)
 
@@ -9473,9 +9267,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     if any(p in str(f.get("details", {})).lower() for p in ["cni", "aws-node"])
                 ]
                 effect_events = [
-                    f
-                    for f in self.findings.get("network_issues", [])
-                    if "NetworkNotReady" in f.get("summary", "")
+                    f for f in self.findings.get("network_issues", []) if "NetworkNotReady" in f.get("summary", "")
                 ]
 
                 causality = self._score_temporal_causality(cause_events, effect_events)
@@ -9771,9 +9563,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Analyzing EKS node group health...")
 
         try:
-            success, response = self.safe_api_call(
-                self.eks_client.list_nodegroups, clusterName=self.cluster_name
-            )
+            success, response = self.safe_api_call(self.eks_client.list_nodegroups, clusterName=self.cluster_name)
 
             if not success:
                 self.progress.warning("Could not list node groups")
@@ -9809,9 +9599,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "scaling_config": ng.get("scalingConfig", {}),
                                 "instance_types": ng.get("instanceTypes", []),
                                 "health_issues": issue_messages,
-                                "severity": "critical"
-                                if status in ["DEGRADED", "UNHEALTHY"]
-                                else "warning",
+                                "severity": "critical" if status in ["DEGRADED", "UNHEALTHY"] else "warning",
                                 "aws_doc": "https://repost.aws/knowledge-center/eks-node-group-degraded",
                                 "finding_type": FindingType.CURRENT_STATE,
                             },
@@ -9947,12 +9735,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "message": event.get("message", "N/A")[:200],
                                 "timestamp": event.get("lastTimestamp", "Unknown"),
                                 "severity": "critical",
-                                "root_causes": EKS_ISSUE_PATTERNS["storage_issues"][
-                                    "VolumeAttachmentFailed"
-                                ]["root_causes"],
-                                "aws_doc": EKS_ISSUE_PATTERNS["storage_issues"][
-                                    "VolumeAttachmentFailed"
-                                ]["aws_doc"],
+                                "root_causes": EKS_ISSUE_PATTERNS["storage_issues"]["VolumeAttachmentFailed"][
+                                    "root_causes"
+                                ],
+                                "aws_doc": EKS_ISSUE_PATTERNS["storage_issues"]["VolumeAttachmentFailed"]["aws_doc"],
                                 "finding_type": FindingType.HISTORICAL_EVENT,
                             },
                         },
@@ -10191,10 +9977,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     conditions = status.get("conditions", [])
 
                     for condition in conditions:
-                        if (
-                            condition.get("type") == "AbleToScale"
-                            and condition.get("status") != "True"
-                        ):
+                        if condition.get("type") == "AbleToScale" and condition.get("status") != "True":
                             self._add_finding_dict(
                                 "pod_errors",
                                 {
@@ -10216,10 +9999,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 },
                             )
 
-                        if (
-                            condition.get("type") == "ScalingActive"
-                            and condition.get("status") != "True"
-                        ):
+                        if condition.get("type") == "ScalingActive" and condition.get("status") != "True":
                             self._add_finding_dict(
                                 "pod_errors",
                                 {
@@ -10457,9 +10237,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     instance_ids.append(provider_id.split("/")[-1])
 
             if instance_ids:
-                success, response = self.safe_api_call(
-                    ec2_client.describe_instances, InstanceIds=instance_ids[:10]
-                )
+                success, response = self.safe_api_call(ec2_client.describe_instances, InstanceIds=instance_ids[:10])
 
                 if success and response:
                     for reservation in response.get("Reservations", []):
@@ -10469,9 +10247,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 subnet_ids.add(subnet_id)
 
             for subnet_id in subnet_ids:
-                success, response = self.safe_api_call(
-                    ec2_client.describe_subnets, SubnetIds=[subnet_id]
-                )
+                success, response = self.safe_api_call(ec2_client.describe_subnets, SubnetIds=[subnet_id])
 
                 if success and response:
                     for subnet in response.get("Subnets", []):
@@ -10486,9 +10262,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "summary": f"Subnet {subnet_id} has very few IPs available ({available_ips})",
                                     "details": {
                                         "subnet_id": subnet_id,
-                                        "availability_zone": subnet.get(
-                                            "AvailabilityZone", "Unknown"
-                                        ),
+                                        "availability_zone": subnet.get("AvailabilityZone", "Unknown"),
                                         "available_ips": available_ips,
                                         "total_ips": total_ips,
                                         "cidr": cidr,
@@ -10511,9 +10285,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "summary": f"Subnet {subnet_id} running low on IPs ({available_ips} available)",
                                     "details": {
                                         "subnet_id": subnet_id,
-                                        "availability_zone": subnet.get(
-                                            "AvailabilityZone", "Unknown"
-                                        ),
+                                        "availability_zone": subnet.get("AvailabilityZone", "Unknown"),
                                         "available_ips": available_ips,
                                         "severity": "warning",
                                         "finding_type": FindingType.CURRENT_STATE,
@@ -10578,10 +10350,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if status.get("conditions"):
                         for condition in status["conditions"]:
-                            if (
-                                condition.get("type") == "Ready"
-                                and condition.get("status") != "True"
-                            ):
+                            if condition.get("type") == "Ready" and condition.get("status") != "True":
                                 self._add_finding_dict(
                                     "addon_issues",
                                     {
@@ -10755,9 +10524,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 if output and "not found" not in output.lower():
                     events = json.loads(output)
-                    events = self.filter_kubectl_events_by_date(
-                        events, self.start_date, self.end_date
-                    )
+                    events = self.filter_kubectl_events_by_date(events, self.start_date, self.end_date)
 
                     for event in events.get("items", []):
                         message = event.get("message", "").lower()
@@ -10813,16 +10580,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 if labels.get("kubernetes.io/os") == "windows":
                     conditions = node.get("status", {}).get("conditions", [])
-                    ready_condition = next(
-                        (c for c in conditions if c.get("type") == "Ready"), None
-                    )
+                    ready_condition = next((c for c in conditions if c.get("type") == "Ready"), None)
 
                     windows_nodes.append(
                         {
                             "name": node_name,
-                            "ready": ready_condition.get("status") == "True"
-                            if ready_condition
-                            else False,
+                            "ready": ready_condition.get("status") == "True" if ready_condition else False,
                             "runtime": labels.get("node.kubernetes.io/windows-build", "Unknown"),
                         }
                     )
@@ -10855,9 +10618,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 if output and "not found" not in output.lower():
                     events = json.loads(output)
-                    events = self.filter_kubectl_events_by_date(
-                        events, self.start_date, self.end_date
-                    )
+                    events = self.filter_kubectl_events_by_date(events, self.start_date, self.end_date)
 
                     for event in events.get("items", []):
                         message = event.get("message", "").lower()
@@ -10935,10 +10696,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     }
                                 )
 
-                has_outbound = any(
-                    rule.get("IpProtocol") != "-1" or rule.get("IpRanges")
-                    for rule in outbound_rules
-                )
+                has_outbound = any(rule.get("IpProtocol") != "-1" or rule.get("IpRanges") for rule in outbound_rules)
                 all_outbound = any(
                     rule.get("IpProtocol") == "-1"
                     and any(ip.get("CidrIp") == "0.0.0.0/0" for ip in rule.get("IpRanges", []))
@@ -10953,9 +10711,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     events_data = json.loads(output)
                     import re
 
-                    sg_pattern = re.compile(
-                        r"security.*group|timeout.*connection|connection.*refused", re.IGNORECASE
-                    )
+                    sg_pattern = re.compile(r"security.*group|timeout.*connection|connection.*refused", re.IGNORECASE)
                     for event in events_data.get("items", []):
                         message = event.get("message", "")
                         if sg_pattern.search(message):
@@ -10999,9 +10755,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Analyzing Fargate profile health...")
 
         try:
-            success, response = self.safe_api_call(
-                self.eks_client.list_fargate_profiles, clusterName=self.cluster_name
-            )
+            success, response = self.safe_api_call(self.eks_client.list_fargate_profiles, clusterName=self.cluster_name)
 
             if not success:
                 self.progress.info("No Fargate profiles found")
@@ -11095,9 +10849,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             # Check control plane logs for API server latency patterns
             log_group = f"/aws/eks/{self.cluster_name}/cluster"
 
-            success, response = self.safe_api_call(
-                self.logs_client.describe_log_groups, logGroupNamePrefix=log_group
-            )
+            success, response = self.safe_api_call(self.logs_client.describe_log_groups, logGroupNamePrefix=log_group)
 
             if not success or not response.get("logGroups"):
                 self.progress.info("Control plane logging not enabled for API latency analysis")
@@ -11152,17 +10904,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     for pattern_info in latency_patterns:
                         if pattern_info["pattern"].lower() in message_lower:
                             is_rate_limit = (
-                                "throttl" in message_lower
-                                or "429" in message_lower
-                                or "too many" in message_lower
+                                "throttl" in message_lower or "429" in message_lower or "too many" in message_lower
                             )
 
                             if is_rate_limit:
                                 rate_limit_detected = True
 
-                            timestamp = datetime.fromtimestamp(
-                                event["timestamp"] / 1000, tz=timezone.utc
-                            )
+                            timestamp = datetime.fromtimestamp(event["timestamp"] / 1000, tz=timezone.utc)
 
                             self._add_finding_dict(
                                 "control_plane_issues",
@@ -11172,9 +10920,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "log_stream": stream_name,
                                         "timestamp": str(timestamp),
                                         "message": message[:300],
-                                        "issue_type": "rate_limiting"
-                                        if is_rate_limit
-                                        else "latency",
+                                        "issue_type": "rate_limiting" if is_rate_limit else "latency",
                                         "severity": "critical" if is_rate_limit else "warning",
                                         "finding_type": FindingType.HISTORICAL_EVENT,
                                         "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
@@ -11218,12 +10964,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     "metric": "apiserver_request_duration_seconds",
                                                     "max_latency": f"{max_latency:.2f}s",
                                                     "average_latency": f"{dp.get('Average', 0):.2f}s",
-                                                    "timestamp": str(
-                                                        dp.get("Timestamp", "Unknown")
-                                                    ),
-                                                    "severity": "critical"
-                                                    if max_latency > 5.0
-                                                    else "warning",
+                                                    "timestamp": str(dp.get("Timestamp", "Unknown")),
+                                                    "severity": "critical" if max_latency > 5.0 else "warning",
                                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                                 },
                                             },
@@ -11258,9 +11000,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             log_group = f"/aws/eks/{self.cluster_name}/cluster"
 
-            success, response = self.safe_api_call(
-                self.logs_client.describe_log_groups, logGroupNamePrefix=log_group
-            )
+            success, response = self.safe_api_call(self.logs_client.describe_log_groups, logGroupNamePrefix=log_group)
 
             if not success or not response.get("logGroups"):
                 self.progress.info("Control plane logging not enabled for rate limiting analysis")
@@ -11333,9 +11073,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     for pattern_info in rate_limit_patterns:
                         if pattern_info["pattern"].lower() in message_lower:
-                            timestamp = datetime.fromtimestamp(
-                                event["timestamp"] / 1000, tz=timezone.utc
-                            )
+                            timestamp = datetime.fromtimestamp(event["timestamp"] / 1000, tz=timezone.utc)
 
                             user_agent = "unknown"
                             if "userAgent" in message:
@@ -11368,9 +11106,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self._add_finding_dict("control_plane_issues", finding)
 
             if throttled_agents:
-                top_throttled = sorted(throttled_agents.items(), key=lambda x: x[1], reverse=True)[
-                    :5
-                ]
+                top_throttled = sorted(throttled_agents.items(), key=lambda x: x[1], reverse=True)[:5]
 
                 summary_agents = ", ".join([f"{agent}: {count}" for agent, count in top_throttled])
 
@@ -11440,9 +11176,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             log_group = f"/aws/eks/{self.cluster_name}/cluster"
             etcd_quota_exceeded = False
 
-            success, response = self.safe_api_call(
-                self.logs_client.describe_log_groups, logGroupNamePrefix=log_group
-            )
+            success, response = self.safe_api_call(self.logs_client.describe_log_groups, logGroupNamePrefix=log_group)
 
             if not success or not response.get("logGroups"):
                 return
@@ -11558,9 +11292,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     for pattern_info in etcd_patterns:
                         if pattern_info["pattern"].lower() in message_lower:
-                            timestamp = datetime.fromtimestamp(
-                                event["timestamp"] / 1000, tz=timezone.utc
-                            )
+                            timestamp = datetime.fromtimestamp(event["timestamp"] / 1000, tz=timezone.utc)
 
                             if pattern_info.get("is_quota"):
                                 etcd_quota_exceeded = True
@@ -11581,9 +11313,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             }
 
                             if pattern_info.get("diagnostic_steps"):
-                                finding_details["diagnostic_steps"] = pattern_info[
-                                    "diagnostic_steps"
-                                ]
+                                finding_details["diagnostic_steps"] = pattern_info["diagnostic_steps"]
 
                             if pattern_info.get("is_quota"):
                                 finding_details["impact"] = (
@@ -11715,9 +11445,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         try:
             log_group = f"/aws/eks/{self.cluster_name}/cluster"
 
-            success, response = self.safe_api_call(
-                self.logs_client.describe_log_groups, logGroupNamePrefix=log_group
-            )
+            success, response = self.safe_api_call(self.logs_client.describe_log_groups, logGroupNamePrefix=log_group)
 
             if not success or not response.get("logGroups"):
                 return
@@ -11798,9 +11526,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     for pattern_info in controller_patterns:
                         if pattern_info["pattern"].lower() in message_lower:
-                            timestamp = datetime.fromtimestamp(
-                                event["timestamp"] / 1000, tz=timezone.utc
-                            )
+                            timestamp = datetime.fromtimestamp(event["timestamp"] / 1000, tz=timezone.utc)
 
                             self._add_finding_dict(
                                 "control_plane_issues",
@@ -11892,10 +11618,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     message = event.get("message", "").lower()
                     reason = event.get("reason", "")
 
-                    if (
-                        any(p in message for p in webhook_error_patterns)
-                        or "webhook" in reason.lower()
-                    ):
+                    if any(p in message for p in webhook_error_patterns) or "webhook" in reason.lower():
                         involved = event.get("involvedObject", {})
                         self._add_finding_dict(
                             "control_plane_issues",
@@ -12267,9 +11990,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     },
                 )
 
-            self.progress.info(
-                f"Pause image analysis completed ({len(pause_image_issues)} issues found)"
-            )
+            self.progress.info(f"Pause image analysis completed ({len(pause_image_issues)} issues found)")
 
         except Exception as e:
             self.errors.append({"step": "analyze_pause_image_issues", "message": str(e)})
@@ -12410,9 +12131,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "updated": updated_replicas,
                                         "ready": ready_replicas,
                                         "available": available_replicas,
-                                        "severity": "critical"
-                                        if "Deadline" in cond_reason
-                                        else "warning",
+                                        "severity": "critical" if "Deadline" in cond_reason else "warning",
                                         "finding_type": FindingType.CURRENT_STATE,
                                         "root_causes": [
                                             "New pods failing to start",
@@ -12692,9 +12411,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         },
                     )
 
-            self.progress.info(
-                f"NetworkPolicy analysis completed ({len(netpols.get('items', []))} policies)"
-            )
+            self.progress.info(f"NetworkPolicy analysis completed ({len(netpols.get('items', []))} policies)")
 
         except Exception as e:
             self.errors.append({"step": "analyze_network_policies", "message": str(e)})
@@ -12811,18 +12528,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "details": {
                                                     "metric": metric_name,
                                                     "value": value,
-                                                    "load_balancer": dimensions.get(
-                                                        "LoadBalancer", "Unknown"
-                                                    ),
-                                                    "target_group": dimensions.get(
-                                                        "TargetGroup", "Unknown"
-                                                    ),
-                                                    "timestamp": str(
-                                                        dp.get("Timestamp", "Unknown")
-                                                    ),
-                                                    "severity": "critical"
-                                                    if "5XX" in metric_name
-                                                    else "warning",
+                                                    "load_balancer": dimensions.get("LoadBalancer", "Unknown"),
+                                                    "target_group": dimensions.get("TargetGroup", "Unknown"),
+                                                    "timestamp": str(dp.get("Timestamp", "Unknown")),
+                                                    "severity": "critical" if "5XX" in metric_name else "warning",
                                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                                     "root_causes": [
                                                         "Backend pods unhealthy",
@@ -13009,9 +12718,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             if output and "not found" not in output.lower():
                 output_lower = output.lower()
-                if "conntrack" in output_lower and (
-                    "error" in output_lower or "fail" in output_lower
-                ):
+                if "conntrack" in output_lower and ("error" in output_lower or "fail" in output_lower):
                     self._add_finding_dict(
                         "network_issues",
                         {
@@ -13067,9 +12774,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "details": {
                                                     "metric": "pod_network_rx_bytes",
                                                     "max_rx_bytes": max_rx,
-                                                    "timestamp": str(
-                                                        dp.get("Timestamp", "Unknown")
-                                                    ),
+                                                    "timestamp": str(dp.get("Timestamp", "Unknown")),
                                                     "severity": "warning",
                                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                                     "recommendation": "Monitor conntrack table usage on nodes",
@@ -13242,10 +12947,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     conditions = status.get("conditions", [])
 
                     for condition in conditions:
-                        if (
-                            condition.get("type") == "Established"
-                            and condition.get("status") != "True"
-                        ):
+                        if condition.get("type") == "Established" and condition.get("status") != "True":
                             self._add_finding_dict(
                                 "addon_issues",
                                 {
@@ -13315,9 +13017,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 violations = []
 
                                 # Check for PSA violations
-                                containers = spec.get("containers", []) + spec.get(
-                                    "initContainers", []
-                                )
+                                containers = spec.get("containers", []) + spec.get("initContainers", [])
 
                                 for container in containers:
                                     security_context = container.get("securityContext", {})
@@ -13325,9 +13025,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     # Check for privileged containers
                                     if security_context.get("privileged", False):
                                         if enforce in ["restricted", "baseline"]:
-                                            violations.append(
-                                                f"Container {container.get('name')} is privileged"
-                                            )
+                                            violations.append(f"Container {container.get('name')} is privileged")
 
                                     # Check for allowPrivilegeEscalation
                                     if security_context.get("allowPrivilegeEscalation", True):
@@ -13339,9 +13037,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     # Check for running as root
                                     if security_context.get("runAsNonRoot", False) is False:
                                         if enforce == "restricted":
-                                            violations.append(
-                                                f"Container {container.get('name')} may run as root"
-                                            )
+                                            violations.append(f"Container {container.get('name')} may run as root")
 
                                     # Check for capabilities
                                     caps = security_context.get("capabilities", {})
@@ -13374,9 +13070,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     security_context = container.get("securityContext", {})
                                     seccomp = security_context.get("seccompProfile", {})
                                     if not seccomp and enforce == "restricted":
-                                        violations.append(
-                                            f"Container {container.get('name')} missing seccomp profile"
-                                        )
+                                        violations.append(f"Container {container.get('name')} missing seccomp profile")
 
                                 if violations:
                                     self._add_finding_dict(
@@ -13388,9 +13082,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "namespace": ns_name,
                                                 "psa_level": enforce,
                                                 "violations": violations[:5],
-                                                "severity": "warning"
-                                                if enforce == "warn"
-                                                else "info",
+                                                "severity": "warning" if enforce == "warn" else "info",
                                                 "finding_type": FindingType.CURRENT_STATE,
                                                 "root_causes": [
                                                     "Missing security context configuration",
@@ -13447,9 +13139,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             },
                         )
 
-            self.progress.info(
-                f"PSA analysis completed ({len(namespaces_with_psa)} namespaces with PSA)"
-            )
+            self.progress.info(f"PSA analysis completed ({len(namespaces_with_psa)} namespaces with PSA)")
 
         except Exception as e:
             self.errors.append({"step": "analyze_psa_violations", "message": str(e)})
@@ -13586,9 +13276,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             if cm_name and f"{ns}/{cm_name}" not in existing_configmaps:
                                 # Only report if not already found in events
                                 already_reported = any(
-                                    c["name"] == cm_name
-                                    and c["namespace"] == ns
-                                    and c["pod"] == pod_name
+                                    c["name"] == cm_name and c["namespace"] == ns and c["pod"] == pod_name
                                     for c in missing_configmaps
                                 )
                                 if not already_reported:
@@ -13616,9 +13304,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             secret_name = volume["secret"].get("secretName", "")
                             if secret_name and f"{ns}/{secret_name}" not in existing_secrets:
                                 already_reported = any(
-                                    s["name"] == secret_name
-                                    and s["namespace"] == ns
-                                    and s["pod"] == pod_name
+                                    s["name"] == secret_name and s["namespace"] == ns and s["pod"] == pod_name
                                     for s in missing_secrets
                                 )
                                 if not already_reported:
@@ -13783,9 +13469,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "average": avg_val,
                                             "threshold": threshold,
                                             "timestamp": str(dp.get("Timestamp", "Unknown")),
-                                            "severity": "critical"
-                                            if max_val > threshold * 1.5
-                                            else "warning",
+                                            "severity": "critical" if max_val > threshold * 1.5 else "warning",
                                             "finding_type": FindingType.HISTORICAL_EVENT,
                                             "root_causes": [
                                                 "Too many concurrent API requests",
@@ -13815,9 +13499,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         try:
             log_group = f"/aws/eks/{self.cluster_name}/cluster"
 
-            success, response = self.safe_api_call(
-                self.logs_client.describe_log_groups, logGroupNamePrefix=log_group
-            )
+            success, response = self.safe_api_call(self.logs_client.describe_log_groups, logGroupNamePrefix=log_group)
 
             if not success or not response.get("logGroups"):
                 return
@@ -13889,9 +13571,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     for pattern_info in scheduler_patterns:
                         if pattern_info["pattern"].lower() in message_lower:
-                            timestamp = datetime.fromtimestamp(
-                                event["timestamp"] / 1000, tz=timezone.utc
-                            )
+                            timestamp = datetime.fromtimestamp(event["timestamp"] / 1000, tz=timezone.utc)
 
                             self._add_finding_dict(
                                 "scheduling_failures",
@@ -13952,9 +13632,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                     "details": {
                                                         "result": result,
                                                         "count": value,
-                                                        "timestamp": str(
-                                                            dp.get("Timestamp", "Unknown")
-                                                        ),
+                                                        "timestamp": str(dp.get("Timestamp", "Unknown")),
                                                         "severity": "warning",
                                                         "finding_type": FindingType.HISTORICAL_EVENT,
                                                     },
@@ -14274,8 +13952,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "errors": self.errors,
             "performance": {
                 "slowest_methods": [
-                    {"method": m, "total_time_seconds": round(t, 2)}
-                    for m, t in self._perf_tracker.get_slowest(10)
+                    {"method": m, "total_time_seconds": round(t, 2)} for m, t in self._perf_tracker.get_slowest(10)
                 ],
                 "cache_stats": {
                     "log_groups_cached": len(self._shared_data["log_groups"]),
@@ -14286,14 +13963,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # Compute delta if incremental analysis is enabled
         if self.enable_incremental and self._incremental_cache:
-            self.delta_report = self._incremental_cache.compute_delta(
-                results, self._previous_results
-            )
+            self.delta_report = self._incremental_cache.compute_delta(results, self._previous_results)
             results["delta"] = self.delta_report
             if not self.delta_report.get("is_first_run"):
                 self.progress.info(
-                    f"Delta: {self.delta_report['new_issues']} new, "
-                    f"{self.delta_report['resolved_issues']} resolved"
+                    f"Delta: {self.delta_report['new_issues']} new, {self.delta_report['resolved_issues']} resolved"
                 )
             self._incremental_cache.save(results)
 
@@ -14340,13 +14014,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 if not success:
                     with errors_lock:
                         self.errors.append({"step": method_name, "message": error})
-                    self.progress.warning(
-                        f"[{completed}/{total}] {method_name} failed: {error} ({duration:.1f}s)"
-                    )
+                    self.progress.warning(f"[{completed}/{total}] {method_name} failed: {error} ({duration:.1f}s)")
                 else:
-                    self.progress.info(
-                        f"[{completed}/{total}] {method_name} completed ({duration:.1f}s)"
-                    )
+                    self.progress.info(f"[{completed}/{total}] {method_name} completed ({duration:.1f}s)")
 
         # Log performance summary
         slowest = self._perf_tracker.get_slowest(5)
@@ -14367,9 +14037,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         for cat, items in self.findings.items():
             for item in items:
                 severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
-                finding_type = item.get("details", {}).get(
-                    "finding_type", FindingType.CURRENT_STATE
-                )
+                finding_type = item.get("details", {}).get("finding_type", FindingType.CURRENT_STATE)
 
                 if severity == "critical":
                     critical += 1
@@ -14901,9 +14569,7 @@ Environment Variables:
 
     # Verbosity options
     verbosity_group = parser.add_mutually_exclusive_group()
-    verbosity_group.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable verbose/debug output"
-    )
+    verbosity_group.add_argument("-v", "--verbose", action="store_true", help="Enable verbose/debug output")
     verbosity_group.add_argument(
         "-q",
         "--quiet",
@@ -14949,9 +14615,7 @@ def parse_flexible_date(date_str, tz_name="UTC"):
             else:
                 raise ValueError(f"Unknown time unit: {unit}")
         except (ValueError, IndexError) as e:
-            raise DateValidationError(
-                f"Invalid relative date format: {date_str}. Use '-2h' or '-3d'"
-            )
+            raise DateValidationError(f"Invalid relative date format: {date_str}. Use '-2h' or '-3d'")
 
     # Parse ISO 8601 or date-only format
     try:
@@ -14964,9 +14628,7 @@ def parse_flexible_date(date_str, tz_name="UTC"):
         # Convert to UTC
         return dt.astimezone(timezone.utc)
     except Exception as e:
-        raise DateValidationError(
-            f"Invalid date format: {date_str}. Use ISO 8601 (2026-02-15T10:00:00Z) or YYYY-MM-DD"
-        )
+        raise DateValidationError(f"Invalid date format: {date_str}. Use ISO 8601 (2026-02-15T10:00:00Z) or YYYY-MM-DD")
 
 
 def validate_aws_profile(profile: str, progress) -> None:

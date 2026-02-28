@@ -371,7 +371,7 @@ class IncrementalCache:
     def __init__(self, cluster_name: str, region: str):
         self.cache_key = f"{cluster_name}-{region}"
         self.cache_file = os.path.join(CACHE_DIR, f"{self.cache_key}.json")
-        os.makedirs(CACHE_DIR, exist_ok=True)
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
 
     def load_previous(self) -> dict | None:
         """Load previous analysis results from cache.
@@ -402,21 +402,17 @@ class IncrementalCache:
         """
         try:
             fd = os.open(self.cache_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            try:
-                with os.fdopen(fd, "w") as f:
-                    json_module.dump(
-                        {
-                            "timestamp": time.time(),
-                            "cluster": self.cache_key,
-                            "results": results,
-                        },
-                        f,
-                        default=str,
-                    )
-                return True
-            except Exception:
-                os.close(fd)
-                raise
+            with os.fdopen(fd, "w") as f:
+                json_module.dump(
+                    {
+                        "timestamp": time.time(),
+                        "cluster": self.cache_key,
+                        "results": results,
+                    },
+                    f,
+                    default=str,
+                )
+            return True
         except (OSError, TypeError):
             return False
 
@@ -10292,7 +10288,58 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 }
             )
 
-        # Correlation Rule 8: Cluster Upgrade Detection
+        # Correlation Rule 8: Subnet Exhaustion → Scheduling/CNI Failures
+        subnet_exhaustion = [
+            f
+            for f in self.findings.get("network_issues", [])
+            if "subnet" in f.get("summary", "").lower() and "ip" in f.get("summary", "").lower()
+        ]
+        if subnet_exhaustion:
+            exhausted_subnets = set()
+            for f in subnet_exhaustion:
+                subnet_id = f.get("details", {}).get("subnet_id")
+                if subnet_id:
+                    exhausted_subnets.add(subnet_id)
+
+            cni_failures = [
+                f
+                for f in self.findings.get("network_issues", [])
+                if any(p in str(f.get("details", {})).lower() for p in ["cni", "ipamd", "aws-node"])
+            ]
+
+            ip_scheduling_failures = [
+                f
+                for f in self.findings.get("scheduling_failures", [])
+                if "ip" in f.get("summary", "").lower() or "address" in f.get("summary", "").lower()
+            ]
+
+            if cni_failures or ip_scheduling_failures:
+                subnet_times = []
+                for f in subnet_exhaustion:
+                    ts = self._extract_timestamp(f.get("details", {}))
+                    if ts:
+                        subnet_times.append(ts)
+
+                first_exhaustion = min(subnet_times) if subnet_times else None
+
+                correlations.append(
+                    {
+                        "correlation_type": "subnet_exhaustion_cascade",
+                        "severity": "critical",
+                        "root_cause": f"Subnet IP exhaustion on {len(exhausted_subnets)} subnet(s)",
+                        "root_cause_time": str(first_exhaustion) if first_exhaustion else "Unknown",
+                        "affected_components": {
+                            "exhausted_subnets": list(exhausted_subnets),
+                            "cni_failures": len(cni_failures),
+                            "ip_scheduling_failures": len(ip_scheduling_failures),
+                        },
+                        "impact": f"Subnet IP exhaustion causing {len(cni_failures)} CNI failures and {len(ip_scheduling_failures)} scheduling failures",
+                        "recommendation": "Add secondary CIDR blocks, create new subnets, or reduce pod density per node",
+                        "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-cluster-ip-address-issues",
+                    }
+                )
+
+        # Correlation Rule 9: Cluster Upgrade Detection
         # First check AWS EKS API for confirmed upgrades
         aws_upgrade_info = self._check_eks_cluster_upgrade()
 
@@ -12044,9 +12091,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         usage = quota.get("UsageMetric", {})
 
                         if quota_value > 0:
-                            quota_issues = self.findings.setdefault("quota_issues", [])
-
-                            quota_issues.append(
+                            self._add_finding_dict(
+                                "quota_issues",
                                 {
                                     "summary": f"Service Quota check: {quota_check['quota_name']}",
                                     "details": {
@@ -12057,7 +12103,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "severity": "info",
                                         "finding_type": FindingType.CURRENT_STATE,
                                     },
-                                }
+                                },
                             )
 
                 except Exception:
@@ -16988,12 +17034,8 @@ def output_results(results, cluster_name: str, timezone_name: str = "UTC", outpu
     try:
         html_output = html_formatter.format(results)
         fd = os.open(html_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(html_output)
-        except Exception:
-            os.close(fd)
-            raise
+        with os.fdopen(fd, "w") as f:
+            f.write(html_output)
         print(f"✓ HTML Report:     {html_file}")
     except Exception as e:
         print(f"✗ Failed to write HTML report: {e}", file=sys.stderr)
@@ -17002,12 +17044,8 @@ def output_results(results, cluster_name: str, timezone_name: str = "UTC", outpu
     try:
         json_output = llm_formatter.format(results)
         fd = os.open(json_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(json_output)
-        except Exception:
-            os.close(fd)
-            raise
+        with os.fdopen(fd, "w") as f:
+            f.write(json_output)
         print(f"✓ LLM JSON Report: {json_file}")
     except Exception as e:
         print(f"✗ Failed to write JSON report: {e}", file=sys.stderr)

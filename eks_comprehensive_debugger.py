@@ -475,13 +475,18 @@ def validate_input(name: str, value: str) -> str:
         The validated value (unchanged if valid)
 
     Raises:
-        InputValidationError: If the value contains unsafe characters
+        InputValidationError: If the value contains unsafe characters or exceeds max length
     """
     if not value:
         return value
 
     if name not in INPUT_VALIDATION_PATTERNS:
         raise InputValidationError(f"Unknown parameter: {name}")
+
+    # Max length check to prevent memory/log flooding
+    MAX_INPUT_LENGTH = 256
+    if len(value) > MAX_INPUT_LENGTH:
+        raise InputValidationError(f"Invalid {name}: exceeds maximum length of {MAX_INPUT_LENGTH} characters")
 
     pattern = INPUT_VALIDATION_PATTERNS[name]
     if not pattern.match(value):
@@ -490,6 +495,13 @@ def validate_input(name: str, value: str) -> str:
         )
 
     return value
+
+
+# Pre-compiled regex patterns for severity classification (performance optimization)
+_CRITICAL_PATTERN = re.compile(r"\b(?:oom|killed|crash(?:ed)?|critical|(?<!shut)down|unhealthy)\b")
+_WARNING_PATTERN = re.compile(r"\b(?:warning|warn|degraded|pressure|evicted|pending|timeout|error|failed?)\b")
+_INFO_PATTERN = re.compile(r"\b(?:info|notice|fallback)\b|network not ready")
+_COMPOUND_CRITICAL = ("oomkilled", "crashloopbackoff", "imagepullbackoff")
 
 
 def classify_severity(summary_text: str, details: Optional[dict] = None) -> str:
@@ -513,21 +525,16 @@ def classify_severity(summary_text: str, details: Optional[dict] = None) -> str:
     summary_lower = summary_text.lower()
 
     # Check for compound words first (common Kubernetes terms)
-    compound_critical = ["oomkilled", "crashloopbackoff", "imagepullbackoff"]
-    for compound in compound_critical:
+    for compound in _COMPOUND_CRITICAL:
         if compound in summary_lower:
             return "critical"
 
-    # Word-boundary patterns for single words
-    critical_pattern = re.compile(r"\b(?:oom|killed|crash(?:ed)?|critical|(?<!shut)down|unhealthy)\b")
-    warning_pattern = re.compile(r"\b(?:warning|warn|degraded|pressure|evicted|pending|timeout|error|failed?)\b")
-    info_pattern = re.compile(r"\b(?:info|notice|fallback)\b|network not ready")
-
-    if critical_pattern.search(summary_lower):
+    # Use pre-compiled patterns for performance
+    if _CRITICAL_PATTERN.search(summary_lower):
         return "critical"
-    if warning_pattern.search(summary_lower):
+    if _WARNING_PATTERN.search(summary_lower):
         return "warning"
-    if info_pattern.search(summary_lower):
+    if _INFO_PATTERN.search(summary_lower):
         return "info"
 
     return "info"
@@ -1874,7 +1881,7 @@ class ExecutiveSummaryGenerator:
         pods = set()
         nodes = set()
         namespace_counts: dict[str, int] = {}
-        services_offline = 0
+        services_offline = set()  # Track unique service names
 
         for category, items in findings.items():
             for item in items:
@@ -1887,11 +1894,14 @@ class ExecutiveSummaryGenerator:
                     ns = details["namespace"]
                     namespace_counts[ns] = namespace_counts.get(ns, 0) + 1
 
-        # Count services with no endpoints (offline services)
+        # Count unique services with no endpoints (offline services)
         for item in findings.get("network_issues", []):
             details = item.get("details", {})
             if "no endpoints" in item.get("summary", "").lower():
-                services_offline += 1
+                # Track by service name to avoid counting duplicates
+                svc_name = details.get("service") or details.get("name") or item.get("summary", "")
+                if svc_name:
+                    services_offline.add(svc_name)
 
         # Sort namespaces by issue count
         top_namespaces = sorted(namespace_counts.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -1900,7 +1910,7 @@ class ExecutiveSummaryGenerator:
             "pods_affected": len(pods),
             "nodes_affected": len(nodes),
             "namespaces_affected": len(namespace_counts),
-            "services_offline": services_offline,
+            "services_offline": len(services_offline),
             "pod_list": sorted(list(pods))[:10],
             "node_list": sorted(list(nodes))[:10],
             "namespace_list": sorted(list(namespace_counts.keys())),
@@ -2038,6 +2048,13 @@ class HTMLOutputFormatter(OutputFormatter):
         if value is None:
             return ""
 
+        if isinstance(value, dict):
+            items_html = "".join(
+                f'<li><span class="detail-key">{self._escape_html(str(k))}</span>: '
+                f'<span class="detail-value">{self._escape_html(str(v))}</span></li>'
+                for k, v in value.items()
+            )
+            return f'<ul class="detail-list dict-list">{items_html}</ul>'
         if isinstance(value, list):
             if not value:
                 return ""
@@ -2050,6 +2067,15 @@ class HTMLOutputFormatter(OutputFormatter):
                     f'<a href="{self._escape_html(value)}" '
                     f'class="detail-link" target="_blank" rel="noopener">'
                     f"{self._escape_html(value)}</a>"
+                )
+            import re
+
+            if "http://" in value or "https://" in value:
+                escaped = self._escape_html(value)
+                return re.sub(
+                    r"(https?://[^\s<]+)",
+                    r'<a href="\1" class="detail-link" target="_blank" rel="noopener">\1</a>',
+                    escaped,
                 )
 
         return self._escape_html(str(value))
@@ -2567,7 +2593,7 @@ class HTMLOutputFormatter(OutputFormatter):
 
         html = """
             <!-- Unified What Happened Section -->
-            <section class="section" id="what-happened">
+            <section class="section" id="what-happened" role="region" aria-label="What happened timeline">
                 <div class="section-header" onclick="toggleSection(this)">
                     <div class="section-title">
                         <span class="section-icon">📖</span>
@@ -2735,7 +2761,7 @@ class HTMLOutputFormatter(OutputFormatter):
 
         html = """
             <!-- Cluster Statistics Section -->
-            <section class="section" id="cluster-statistics">
+            <section class="section" id="cluster-statistics" role="region" aria-label="Cluster statistics">
                 <div class="section-header" onclick="toggleSection(this)">
                     <div class="section-title">
                         <span class="section-icon">📊</span>
@@ -3071,7 +3097,12 @@ class HTMLOutputFormatter(OutputFormatter):
                 "color": "#a29bfe",
             },
             "addon_issues": {"icon": "🔌", "title": "Addon Issues", "source": "EKS API", "color": "#55a3ff"},
-            "quota_issues": {"icon": "📊", "title": "Quota Issues", "source": "Service Quotas API", "color": "#e17055"},
+            "quota_issues": {
+                "icon": "📊",
+                "title": "Service Quota Issues",
+                "source": "Service Quotas API",
+                "color": "#e17055",
+            },
         }
 
         html = f"""<!DOCTYPE html>
@@ -3562,6 +3593,29 @@ class HTMLOutputFormatter(OutputFormatter):
             color: var(--text);
         }}
         
+        [data-theme="dark"] .diagnostic-steps code {{
+            background: var(--bg-details);
+            color: #818cf8;
+        }}
+        
+        [data-theme="dark"] .diagnostic-command {{
+            background: var(--bg-details);
+            color: #818cf8;
+        }}
+        
+        [data-theme="dark"] .resource-stat {{
+            background: var(--bg-card);
+        }}
+        
+        [data-theme="dark"] .error-type-item {{
+            background: var(--bg-card);
+        }}
+        
+        [data-theme="dark"] .error-type-count {{
+            background: var(--bg-details);
+            color: var(--text);
+        }}
+        
         [data-theme="dark"] .action-item {{
             background: var(--bg-details);
             border-color: var(--border);
@@ -3620,7 +3674,13 @@ class HTMLOutputFormatter(OutputFormatter):
         }}
         
         [data-theme="dark"] .finding-item:hover {{
+            background: var(--bg-details);
             border-color: var(--primary);
+        }}
+        
+        [data-theme="dark"] .finding-details {{
+            background: var(--bg-details);
+            border: 1px solid var(--border);
         }}
         
         [data-theme="dark"] .recommendation-card:hover {{
@@ -3666,6 +3726,55 @@ class HTMLOutputFormatter(OutputFormatter):
         [data-theme="dark"] .severity-filter.info.active {{
             background: var(--info);
             border-color: var(--info);
+        }}
+        
+        [data-theme="dark"] .severity-badge.critical {{
+            background: rgba(248, 113, 113, 0.2);
+            color: #f87171;
+        }}
+        
+        [data-theme="dark"] .severity-badge.warning {{
+            background: rgba(251, 191, 36, 0.2);
+            color: #fbbf24;
+        }}
+        
+        [data-theme="dark"] .severity-badge.info {{
+            background: rgba(34, 211, 238, 0.2);
+            color: #22d3ee;
+        }}
+        
+        [data-theme="dark"] .section-header:hover {{
+            background: var(--bg-details);
+        }}
+        
+        [data-theme="dark"] .detail-box {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .detail-box-sm {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .action-priority.high {{
+            background: rgba(248, 113, 113, 0.2);
+            color: #f87171;
+        }}
+        
+        [data-theme="dark"] .action-priority.medium {{
+            background: rgba(251, 191, 36, 0.2);
+            color: #fbbf24;
+        }}
+        
+        [data-theme="dark"] .action-priority.low {{
+            background: rgba(52, 211, 153, 0.2);
+            color: #34d399;
+        }}
+        
+        [data-theme="dark"] .source-badge.cw-logs {{
+            background: rgba(251, 191, 36, 0.2);
+            color: #fbbf24;
         }}
         
         /* Executive Summary Dark Mode */
@@ -4066,6 +4175,18 @@ class HTMLOutputFormatter(OutputFormatter):
             transform: translateY(-50%);
         }}
         
+        .search-count {{
+            position: absolute;
+            right: 0.75rem;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            background: var(--bg-details);
+            padding: 0.125rem 0.5rem;
+            border-radius: 10px;
+        }}
+        
         .toolbar-btn {{
             padding: 0.75rem 1.25rem;
             border: 2px solid var(--border);
@@ -4376,13 +4497,6 @@ class HTMLOutputFormatter(OutputFormatter):
             margin: 0;
             color: var(--text-secondary);
             font-size: 0.9rem;
-        }}
-        
-        .summary-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 1.5rem;
         }}
         
         .summary-block {{
@@ -5495,6 +5609,21 @@ class HTMLOutputFormatter(OutputFormatter):
             word-break: break-all;
         }}
         
+        .diagnostic-command {{
+            background: white;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.8rem;
+            color: #1e40af;
+            word-break: break-all;
+        }}
+        
+        .diagnostic-instruction {{
+            color: var(--text);
+            font-size: 0.85rem;
+        }}
+        
         /* Correlation Cards */
         .correlation-card {{
             background: white;
@@ -5733,6 +5862,17 @@ class HTMLOutputFormatter(OutputFormatter):
             .main-content {{ margin-left: 0; }}
         }}
         
+        @media (max-width: 768px) {{
+            .header-meta {{ flex-direction: column; gap: 0.75rem; }}
+            .summary-grid {{ grid-template-columns: 1fr 1fr; }}
+            .finding-badges {{ flex-direction: column; align-items: flex-start; }}
+            .detail-grid {{ grid-template-columns: 1fr; }}
+            .toolbar {{ flex-wrap: wrap; }}
+            .severity-filters {{ flex-wrap: wrap; }}
+            .recommendation-card {{ padding: 1rem; }}
+            .section-content {{ padding: 0.75rem; }}
+        }}
+        
         .muted-text {{
             color: var(--text-secondary);
             font-size: 0.9rem;
@@ -5772,7 +5912,7 @@ class HTMLOutputFormatter(OutputFormatter):
     
     <div class="app-container">
         <!-- Sidebar Navigation -->
-        <aside class="sidebar">
+        <aside class="sidebar" role="navigation" aria-label="Main navigation">
             <div class="sidebar-header">
                 <div class="sidebar-logo">
                     <span>🔍</span>
@@ -5834,7 +5974,7 @@ class HTMLOutputFormatter(OutputFormatter):
         </aside>
 
         <!-- Main Content -->
-        <main class="main-content">
+        <main class="main-content" role="main">
             <!-- Header -->
             <header class="page-header" id="summary">
                 <div class="header-content">
@@ -5863,11 +6003,12 @@ class HTMLOutputFormatter(OutputFormatter):
             </header>
 
             <!-- Toolbar -->
-            <div class="toolbar">
+            <div class="toolbar" role="toolbar" aria-label="Report controls">
                 <div class="search-box">
-                    <input type="text" id="searchInput" placeholder="Search findings..." onkeyup="filterFindings()">
+                    <input type="text" id="searchInput" placeholder="Search findings..." onkeyup="filterFindings()" aria-label="Search findings">
+                    <span id="searchCount" class="search-count" style="display:none;"></span>
                 </div>
-                <div class="severity-filters">
+                <div class="severity-filters" role="group" aria-label="Filter by severity">
                     <button class="severity-filter active" data-filter="all" onclick="filterBySeverity('all', this)">All</button>
                     <button class="severity-filter critical" data-filter="critical" onclick="filterBySeverity('critical', this)">🔴 Critical</button>
                     <button class="severity-filter warning" data-filter="warning" onclick="filterBySeverity('warning', this)">⚠️ Warning</button>
@@ -5876,6 +6017,7 @@ class HTMLOutputFormatter(OutputFormatter):
                 <button class="toolbar-btn" onclick="expandAll()">📂 Expand All</button>
                 <button class="toolbar-btn" onclick="collapseAll()">📁 Collapse All</button>
                 <button class="toolbar-btn" onclick="showAllFindingsModal()">📋 View All</button>
+                <button class="toolbar-btn" onclick="exportFindingsCSV()">📥 Export CSV</button>
                 <button class="toolbar-btn" onclick="window.print()">🖨️ Print</button>
             </div>
 
@@ -5985,7 +6127,7 @@ class HTMLOutputFormatter(OutputFormatter):
             html += (
                 """
             <!-- All Findings Section -->
-            <section class="section" id="all-findings">
+            <section class="section" id="all-findings" role="region" aria-label="All findings">
                 <div class="section-header" onclick="toggleSection(this)">
                     <div class="section-title">
                         <span class="section-icon">📋</span>
@@ -6205,7 +6347,7 @@ class HTMLOutputFormatter(OutputFormatter):
             html += (
                 """
             <!-- Recommendations Section -->
-            <section class="section" id="recommendations">
+            <section class="section" id="recommendations" role="region" aria-label="Recommendations">
                 <div class="section-header" onclick="toggleSection(this)">
                     <div class="section-title">
                         <span class="section-icon">💡</span>
@@ -6320,7 +6462,17 @@ class HTMLOutputFormatter(OutputFormatter):
 """
                     for step in diagnostic_steps:
                         escaped_step = self._escape_html(str(step))
-                        html += f'                                <li><code>{escaped_step}</code> <button class="copy-btn" onclick="copyToClipboard(this.previousElementSibling.textContent, this)" title="Copy command">📋</button></li>\n'
+                        is_command = (
+                            escaped_step.startswith("Run:")
+                            or escaped_step.startswith("kubectl ")
+                            or escaped_step.startswith("aws ")
+                            or escaped_step.startswith("docker ")
+                            or escaped_step.startswith("helm ")
+                        )
+                        if is_command:
+                            html += f'                                <li><code class="diagnostic-command">{escaped_step}</code> <button class="copy-btn" onclick="copyToClipboard(this.previousElementSibling.textContent, this)" title="Copy command">📋</button></li>\n'
+                        else:
+                            html += f'                                <li><span class="diagnostic-instruction">{escaped_step}</span></li>\n'
                     html += """                            </ol>
                         </div>
 """
@@ -6359,10 +6511,12 @@ class HTMLOutputFormatter(OutputFormatter):
                 <div class="section-content" style="padding: 1.5rem;">
 """
             for error in errors:
+                escaped_step = self._escape_html(error.get("step", "Unknown"))
+                escaped_msg = self._escape_html(error.get("message", "Unknown error"))
                 html += f"""
                     <div class="error-item">
-                        <div class="error-step">{error["step"]}</div>
-                        <div class="error-msg">{error["message"]}</div>
+                        <div class="error-step">{escaped_step}</div>
+                        <div class="error-msg">{escaped_msg}</div>
                     </div>
 """
             html += """
@@ -6394,11 +6548,14 @@ class HTMLOutputFormatter(OutputFormatter):
         )
 
         for finding in all_findings_json:
+            escaped_category = self._escape_html(finding.get("category", ""))
+            escaped_summary = self._escape_html(finding.get("summary", ""))
+            escaped_severity = self._escape_html(finding.get("severity", "info"))
             html += f"""
-                <div class="finding-item" data-severity="{finding["severity"]}">
+                <div class="finding-item" data-severity="{escaped_severity}">
                     <div class="finding-header">
-                        <div class="finding-summary"><strong>{finding["category"]}:</strong> {finding["summary"]}</div>
-                        <span class="severity-badge {finding["severity"]}">{finding["severity"]}</span>
+                        <div class="finding-summary"><strong>{escaped_category}:</strong> {escaped_summary}</div>
+                        <span class="severity-badge {escaped_severity}">{escaped_severity}</span>
                     </div>
                 </div>
 """
@@ -6437,10 +6594,42 @@ class HTMLOutputFormatter(OutputFormatter):
         
         function filterFindings() {
             const query = document.getElementById('searchInput').value.toLowerCase();
+            const searchCount = document.getElementById('searchCount');
+            let visibleCount = 0;
+            const totalCount = document.querySelectorAll('.finding-item').length;
+            
             document.querySelectorAll('.finding-item').forEach(item => {
                 const text = item.textContent.toLowerCase();
-                item.style.display = text.includes(query) ? 'block' : 'none';
+                const visible = text.includes(query);
+                item.style.display = visible ? 'block' : 'none';
+                if (visible) visibleCount++;
             });
+            
+            if (query.length > 0) {{
+                searchCount.textContent = visibleCount + '/' + totalCount;
+                searchCount.style.display = 'block';
+            }} else {{
+                searchCount.style.display = 'none';
+            }}
+        }
+        
+        function exportFindingsCSV() {
+            const rows = [['Category', 'Severity', 'Summary', 'Details', 'Timestamp']];
+            document.querySelectorAll('.finding-item').forEach(item => {
+                const category = item.closest('.section')?.querySelector('.section-title span:last-child')?.textContent?.trim() || '';
+                const severity = item.getAttribute('data-severity') || '';
+                const summary = item.querySelector('.finding-summary')?.textContent?.trim() || '';
+                const details = item.querySelector('.finding-details')?.textContent?.trim() || '';
+                const timestamp = item.querySelector('.finding-time')?.textContent?.trim() || '';
+                rows.push([category, severity, summary, details.replace(/\\n/g, ' '), timestamp]);
+            });
+            
+            const csv = rows.map(row => row.map(cell => '"' + cell.replace(/"/g, '""') + '"').join(',')).join('\\n');
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = 'eks-findings-' + new Date().toISOString().slice(0,10) + '.csv';
+            link.click();
         }
         
         let currentSeverityFilter = 'all';
@@ -6520,6 +6709,11 @@ class HTMLOutputFormatter(OutputFormatter):
         function closeModal() {
             document.getElementById('allFindingsModal').classList.remove('active');
         }
+        
+        // Close modal on Escape key
+        document.addEventListener('keydown', function(e) {{
+            if (e.key === 'Escape') closeModal();
+        }});
         
         function toggleSidebar() {
             const sidebar = document.querySelector('.sidebar');
@@ -6721,6 +6915,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "pvc_issues": [],
             "dns_issues": [],
             "addon_issues": [],
+            "quota_issues": [],
         }
 
         self.errors = []
@@ -6743,6 +6938,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # Thread-safe findings collection
         self._findings_lock = threading.Lock()
+        self._errors_lock = threading.Lock()  # Protect self.errors in parallel execution
 
         # Performance tracking for analysis methods
         self._perf_tracker = PerformanceTracker()
@@ -7482,7 +7678,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         except Exception as e:
-            self.errors.append({"step": "collect_cluster_statistics", "message": str(e)})
+            self._add_error("collect_cluster_statistics", str(e))
             self.progress.warning(f"Cluster statistics collection failed: {e}")
 
         return statistics
@@ -7617,6 +7813,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         """
         Safely call AWS API with retry logic and optional caching.
 
+        Uses exponential backoff with jitter for throttling resilience.
+
         Args:
             func: The API function to call
             *args: Positional arguments for the function
@@ -7627,6 +7825,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             Tuple of (success: bool, result: Any). On success, result is the API response.
             On failure, result is an error message string.
         """
+        import random
+
         cache_key = ""
         if use_cache and self.enable_cache:
             cache_key = APICache.make_key(func.__name__ if hasattr(func, "__name__") else str(func), *args, **kwargs)
@@ -7635,7 +7835,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 return cached
 
         max_retries = 3
-        retry_delay = 1
+        base_delay = 0.5  # Base delay in seconds
+        max_delay = 30.0  # Maximum delay cap
         last_error = None
 
         for attempt in range(max_retries):
@@ -7648,8 +7849,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             except Exception as e:
                 last_error = e
                 if attempt < max_retries - 1:
+                    # Exponential backoff with jitter: (2^attempt * base_delay) + random jitter
+                    delay = min(base_delay * (2**attempt), max_delay)
+                    jitter = random.uniform(0, delay * 0.1)  # 10% jitter
+                    total_delay = delay + jitter
+
+                    # Check for throttling - use longer delay
+                    error_str = str(e).lower()
+                    if "throttl" in error_str or "rate" in error_str or "limit" in error_str:
+                        total_delay *= 2  # Double delay for throttling
+
                     self.progress.info(f"Retry {attempt + 1}/{max_retries} after error: {e}")
-                    time.sleep(retry_delay * (attempt + 1))
+                    time.sleep(total_delay)
 
         return False, str(last_error) if last_error else "Max retries exceeded"
 
@@ -7850,6 +8061,16 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         """Classify finding severity based on content (delegates to module-level function)."""
         return classify_severity(summary_text, details)
 
+    def _add_error(self, step: str, message: str) -> None:
+        """Add an error to self.errors in a thread-safe manner.
+
+        Args:
+            step: Name of the analysis step that failed
+            message: Error message describing the failure
+        """
+        with self._errors_lock:
+            self.errors.append({"step": step, "message": message})
+
     # === Analysis Methods ===
     #
     # EXCEPTION HANDLING PHILOSOPHY (v3.5.0):
@@ -7868,7 +8089,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
     #     self.errors.append({"step": "method_name", "message": f"Unexpected response structure: {e}"})
     # except Exception as e:
     #     # Fallback for unknown issues
-    #     self.errors.append({"step": "method_name", "message": str(e)})
+    #     self._add_error("method_name", str(e))
     #
     # Known exception sources:
     #   - json.loads() → json.JSONDecodeError (malformed kubectl/AWS responses)
@@ -7944,7 +8165,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"Found {len(events.get('items', []))} eviction events in date range")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_pod_evictions", "message": str(e)})
+            self._add_error("analyze_pod_evictions", str(e))
             self.progress.warning(f"Pod eviction analysis failed: {e}")
 
     def analyze_node_conditions(self):
@@ -8151,7 +8372,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"Analyzed {len(nodes_data.get('items', []))} nodes")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_node_conditions", "message": str(e)})
+            self._add_error("analyze_node_conditions", str(e))
             self.progress.warning(f"Node condition analysis failed: {e}")
 
     def check_oom_events(self):
@@ -8204,7 +8425,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"Found {len(events.get('items', []))} OOM events in date range")
 
         except Exception as e:
-            self.errors.append({"step": "check_oom_events", "message": str(e)})
+            self._add_error("check_oom_events", str(e))
             self.progress.warning(f"OOM event check failed: {e}")
 
     def check_container_insights_metrics(self):
@@ -8296,12 +8517,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         )
 
             except Exception as e:
-                self.errors.append(
-                    {
-                        "step": f"check_container_insights_metrics_{metric['name']}",
-                        "message": str(e),
-                    }
-                )
+                self._add_error(f"check_container_insights_metrics_{metric['name']}", str(e))
 
     def analyze_cloudwatch_logging_health(self):
         """
@@ -8528,7 +8744,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"CloudWatch logging health: {', '.join(health_status)}")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_cloudwatch_logging_health", "message": str(e)})
+            self._add_error("analyze_cloudwatch_logging_health", str(e))
             self.progress.warning(f"CloudWatch logging health check failed: {e}")
 
     # === NEW: Comprehensive Analysis Methods ===
@@ -8630,7 +8846,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Control plane log analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_control_plane_logs", "message": str(e)})
+            self._add_error("analyze_control_plane_logs", str(e))
             self.progress.warning(f"Control plane log analysis failed: {e}")
 
     def analyze_pod_scheduling_failures(self):
@@ -8703,7 +8919,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"Found {len(events.get('items', []))} scheduling failures in date range")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_pod_scheduling_failures", "message": str(e)})
+            self._add_error("analyze_pod_scheduling_failures", str(e))
             self.progress.warning(f"Scheduling failure analysis failed: {e}")
 
     def analyze_network_issues(self):
@@ -8787,7 +9003,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Network issue analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_network_issues", "message": str(e)})
+            self._add_error("analyze_network_issues", str(e))
             self.progress.warning(f"Network issue analysis failed: {e}")
 
     def analyze_rbac_issues(self):
@@ -8844,7 +9060,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("RBAC analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_rbac_issues", "message": str(e)})
+            self._add_error("analyze_rbac_issues", str(e))
             self.progress.warning(f"RBAC analysis failed: {e}")
 
     def analyze_pvc_issues(self):
@@ -9114,7 +9330,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("PVC/PV analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_pvc_issues", "message": str(e)})
+            self._add_error("analyze_pvc_issues", str(e))
             self.progress.warning(f"PVC analysis failed: {e}")
 
     def analyze_image_pull_failures(self):
@@ -9187,7 +9403,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Image pull failure analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_image_pull_failures", "message": str(e)})
+            self._add_error("analyze_image_pull_failures", str(e))
             self.progress.warning(f"Image pull failure analysis failed: {e}")
 
     def check_eks_addons(self):
@@ -9248,7 +9464,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"Checked {len(addons)} EKS addons")
 
         except Exception as e:
-            self.errors.append({"step": "check_eks_addons", "message": str(e)})
+            self._add_error("check_eks_addons", str(e))
             self.progress.warning(f"EKS addon check failed: {e}")
 
     def analyze_resource_quotas(self):
@@ -9315,7 +9531,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Resource quota analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_resource_quotas", "message": str(e)})
+            self._add_error("analyze_resource_quotas", str(e))
             self.progress.warning(f"Resource quota analysis failed: {e}")
 
     def analyze_pod_health_deep(self):
@@ -9606,7 +9822,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Deep pod health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_pod_health_deep", "message": str(e)})
+            self._add_error("analyze_pod_health_deep", str(e))
             self.progress.warning(f"Deep pod health analysis failed: {e}")
 
     def analyze_vpc_cni_health(self):
@@ -9679,7 +9895,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("VPC CNI health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_vpc_cni_health", "message": str(e)})
+            self._add_error("analyze_vpc_cni_health", str(e))
             self.progress.warning(f"VPC CNI health analysis failed: {e}")
 
     def analyze_coredns_health(self):
@@ -9763,7 +9979,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("CoreDNS health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_coredns_health", "message": str(e)})
+            self._add_error("analyze_coredns_health", str(e))
             self.progress.warning(f"CoreDNS health analysis failed: {e}")
 
     def analyze_iam_pod_identity(self):
@@ -9955,7 +10171,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("IAM and Pod Identity analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_iam_pod_identity", "message": str(e)})
+            self._add_error("analyze_iam_pod_identity", str(e))
             self.progress.warning(f"IAM and Pod Identity analysis failed: {e}")
 
     def _extract_timestamp(self, details):
@@ -11689,7 +11905,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("CPU throttling analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_cpu_throttling", "message": str(e)})
+            self._add_error("analyze_cpu_throttling", str(e))
             self.progress.warning(f"CPU throttling analysis failed: {e}")
 
     def analyze_service_health(self):
@@ -11856,7 +12072,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Service health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_service_health", "message": str(e)})
+            self._add_error("analyze_service_health", str(e))
             self.progress.warning(f"Service health analysis failed: {e}")
 
     def analyze_eks_nodegroup_health(self):
@@ -11918,7 +12134,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"Checked {len(nodegroups)} EKS node groups")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_eks_nodegroup_health", "message": str(e)})
+            self._add_error("analyze_eks_nodegroup_health", str(e))
             self.progress.warning(f"EKS node group analysis failed: {e}")
 
     def analyze_probe_failures(self):
@@ -11979,7 +12195,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"Found {len(events.get('items', []))} probe failure events")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_probe_failures", "message": str(e)})
+            self._add_error("analyze_probe_failures", str(e))
             self.progress.warning(f"Probe failure analysis failed: {e}")
 
     def analyze_ebs_csi_health(self):
@@ -12056,7 +12272,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("EBS CSI driver analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_ebs_csi_health", "message": str(e)})
+            self._add_error("analyze_ebs_csi_health", str(e))
             self.progress.warning(f"EBS CSI driver analysis failed: {e}")
 
     def analyze_service_quotas(self):
@@ -12216,7 +12432,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Service Quotas analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_service_quotas", "message": str(e)})
+            self._add_error("analyze_service_quotas", str(e))
             self.progress.warning(f"Service Quotas analysis failed: {e}")
 
     def analyze_cluster_autoscaler(self):
@@ -12313,7 +12529,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Cluster Autoscaler analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_cluster_autoscaler", "message": str(e)})
+            self._add_error("analyze_cluster_autoscaler", str(e))
             self.progress.warning(f"Cluster Autoscaler analysis failed: {e}")
 
     def analyze_hpa_vpa(self):
@@ -12404,7 +12620,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("HPA/VPA analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_hpa_vpa", "message": str(e)})
+            self._add_error("analyze_hpa_vpa", str(e))
             self.progress.warning(f"HPA/VPA analysis failed: {e}")
 
     def analyze_certificate_expiry(self):
@@ -12481,7 +12697,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Certificate expiration analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_certificate_expiry", "message": str(e)})
+            self._add_error("analyze_certificate_expiry", str(e))
             self.progress.warning(f"Certificate expiration analysis failed: {e}")
 
     def analyze_aws_lb_controller(self):
@@ -12568,7 +12784,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("AWS Load Balancer Controller analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_aws_lb_controller", "message": str(e)})
+            self._add_error("analyze_aws_lb_controller", str(e))
             self.progress.warning(f"AWS LB Controller analysis failed: {e}")
 
     def analyze_subnet_health(self):
@@ -12656,7 +12872,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Subnet health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_subnet_health", "message": str(e)})
+            self._add_error("analyze_subnet_health", str(e))
             self.progress.warning(f"Subnet health analysis failed: {e}")
 
     def analyze_karpenter(self):
@@ -12728,7 +12944,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Karpenter health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_karpenter", "message": str(e)})
+            self._add_error("analyze_karpenter", str(e))
             self.progress.warning(f"Karpenter health analysis failed: {e}")
 
     def analyze_efs_csi_health(self):
@@ -12798,7 +13014,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("EFS CSI driver analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_efs_csi_health", "message": str(e)})
+            self._add_error("analyze_efs_csi_health", str(e))
             self.progress.warning(f"EFS CSI driver analysis failed: {e}")
 
     def analyze_gpu_scheduling(self):
@@ -12909,7 +13125,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("GPU scheduling analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_gpu_scheduling", "message": str(e)})
+            self._add_error("analyze_gpu_scheduling", str(e))
             self.progress.warning(f"GPU scheduling analysis failed: {e}")
 
     def analyze_windows_nodes(self):
@@ -13002,7 +13218,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Windows node analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_windows_nodes", "message": str(e)})
+            self._add_error("analyze_windows_nodes", str(e))
             self.progress.warning(f"Windows node analysis failed: {e}")
 
     def analyze_security_groups(self):
@@ -13104,7 +13320,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Security group analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_security_groups", "message": str(e)})
+            self._add_error("analyze_security_groups", str(e))
             self.progress.warning(f"Security group analysis failed: {e}")
 
     def analyze_fargate_health(self):
@@ -13192,7 +13408,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"Fargate profile analysis completed ({len(profiles)} profiles)")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_fargate_health", "message": str(e)})
+            self._add_error("analyze_fargate_health", str(e))
             self.progress.warning(f"Fargate health analysis failed: {e}")
 
     def analyze_apiserver_latency(self):
@@ -13336,7 +13552,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("API Server latency analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_apiserver_latency", "message": str(e)})
+            self._add_error("analyze_apiserver_latency", str(e))
             self.progress.warning(f"API Server latency analysis failed: {e}")
 
     def analyze_apiserver_rate_limiting(self):
@@ -13516,7 +13732,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("API Server rate limiting analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_apiserver_rate_limiting", "message": str(e)})
+            self._add_error("analyze_apiserver_rate_limiting", str(e))
             self.progress.warning(f"API Server rate limiting analysis failed: {e}")
 
     def analyze_etcd_health(self):
@@ -13792,7 +14008,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("etcd health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_etcd_health", "message": str(e)})
+            self._add_error("analyze_etcd_health", str(e))
             self.progress.warning(f"etcd health analysis failed: {e}")
 
     def analyze_controller_manager(self):
@@ -13913,7 +14129,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Controller Manager analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_controller_manager", "message": str(e)})
+            self._add_error("analyze_controller_manager", str(e))
             self.progress.warning(f"Controller Manager analysis failed: {e}")
 
     def analyze_admission_webhooks(self):
@@ -14006,7 +14222,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Admission webhook analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_admission_webhooks", "message": str(e)})
+            self._add_error("analyze_admission_webhooks", str(e))
             self.progress.warning(f"Admission webhook analysis failed: {e}")
 
     def analyze_pleg_health(self):
@@ -14089,7 +14305,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("PLEG health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_pleg_health", "message": str(e)})
+            self._add_error("analyze_pleg_health", str(e))
             self.progress.warning(f"PLEG health analysis failed: {e}")
 
     def analyze_container_runtime(self):
@@ -14179,7 +14395,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Container Runtime analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_container_runtime", "message": str(e)})
+            self._add_error("analyze_container_runtime", str(e))
             self.progress.warning(f"Container Runtime analysis failed: {e}")
 
     def analyze_pause_image_issues(self):
@@ -14353,7 +14569,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"Pause image analysis completed ({len(pause_image_issues)} issues found)")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_pause_image_issues", "message": str(e)})
+            self._add_error("analyze_pause_image_issues", str(e))
             self.progress.warning(f"Pause image analysis failed: {e}")
 
     def analyze_pods_terminating(self):
@@ -14434,7 +14650,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Stuck Terminating pods analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_pods_terminating", "message": str(e)})
+            self._add_error("analyze_pods_terminating", str(e))
             self.progress.warning(f"Stuck Terminating pods analysis failed: {e}")
 
     def analyze_deployment_rollouts(self):
@@ -14543,7 +14759,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Deployment rollout analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_deployment_rollouts", "message": str(e)})
+            self._add_error("analyze_deployment_rollouts", str(e))
             self.progress.warning(f"Deployment rollout analysis failed: {e}")
 
     def analyze_jobs_cronjobs(self):
@@ -14681,7 +14897,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Jobs/CronJobs analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_jobs_cronjobs", "message": str(e)})
+            self._add_error("analyze_jobs_cronjobs", str(e))
             self.progress.warning(f"Jobs/CronJobs analysis failed: {e}")
 
     def analyze_network_policies(self):
@@ -14774,7 +14990,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"NetworkPolicy analysis completed ({len(netpols.get('items', []))} policies)")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_network_policies", "message": str(e)})
+            self._add_error("analyze_network_policies", str(e))
             self.progress.warning(f"NetworkPolicy analysis failed: {e}")
 
     def analyze_alb_health(self):
@@ -14910,7 +15126,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("ALB health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_alb_health", "message": str(e)})
+            self._add_error("analyze_alb_health", str(e))
             self.progress.warning(f"ALB health analysis failed: {e}")
 
     def analyze_statefulset_issues(self):
@@ -15010,7 +15226,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("StatefulSet analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_statefulset_issues", "message": str(e)})
+            self._add_error("analyze_statefulset_issues", str(e))
             self.progress.warning(f"StatefulSet analysis failed: {e}")
 
     def analyze_conntrack_health(self):
@@ -15148,7 +15364,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Conntrack health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_conntrack_health", "message": str(e)})
+            self._add_error("analyze_conntrack_health", str(e))
             self.progress.warning(f"Conntrack health analysis failed: {e}")
 
     def analyze_custom_controllers(self):
@@ -15324,7 +15540,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Custom controller analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_custom_controllers", "message": str(e)})
+            self._add_error("analyze_custom_controllers", str(e))
             self.progress.warning(f"Custom controller analysis failed: {e}")
 
     def analyze_psa_violations(self):
@@ -15502,7 +15718,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info(f"PSA analysis completed ({len(namespaces_with_psa)} namespaces with PSA)")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_psa_violations", "message": str(e)})
+            self._add_error("analyze_psa_violations", str(e))
             self.progress.warning(f"PSA analysis failed: {e}")
 
     def analyze_missing_config_resources(self):
@@ -15769,7 +15985,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         except Exception as e:
-            self.errors.append({"step": "analyze_missing_config_resources", "message": str(e)})
+            self._add_error("analyze_missing_config_resources", str(e))
             self.progress.warning(f"ConfigMap/Secret analysis failed: {e}")
 
     def analyze_apiserver_inflight(self):
@@ -15846,7 +16062,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("API Server inflight analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_apiserver_inflight", "message": str(e)})
+            self._add_error("analyze_apiserver_inflight", str(e))
             self.progress.warning(f"API Server inflight analysis failed: {e}")
 
     def analyze_scheduler_health(self):
@@ -16004,7 +16220,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.progress.info("Scheduler health analysis completed")
 
         except Exception as e:
-            self.errors.append({"step": "analyze_scheduler_health", "message": str(e)})
+            self._add_error("analyze_scheduler_health", str(e))
             self.progress.warning(f"Scheduler health analysis failed: {e}")
 
     def analyze_limits_requests(self):
@@ -16145,7 +16361,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         except Exception as e:
-            self.errors.append({"step": "analyze_limits_requests", "message": str(e)})
+            self._add_error("analyze_limits_requests", str(e))
             self.progress.warning(f"Resource limits analysis failed: {e}")
 
     # === Orchestration ===
@@ -16351,11 +16567,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     def _run_analysis_parallel(self, analysis_methods: list) -> None:
         """Run analysis methods in parallel using ThreadPoolExecutor with performance tracking."""
-        import threading
-
-        findings_lock = threading.Lock()
-        errors_lock = threading.Lock()
-        timeline_lock = threading.Lock()
+        # Thread safety is handled by instance locks: self._findings_lock, self._errors_lock
 
         def safe_method_wrapper(method):
             start_time = time.time()
@@ -16380,8 +16592,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self._perf_tracker.record(method_name, duration)
 
                 if not success:
-                    with errors_lock:
-                        self.errors.append({"step": method_name, "message": error})
+                    self._add_error(method_name, error or "Unknown error")
                     self.progress.warning(f"[{completed}/{total}] {method_name} failed: {error} ({duration:.1f}s)")
                 else:
                     self.progress.info(f"[{completed}/{total}] {method_name} completed ({duration:.1f}s)")

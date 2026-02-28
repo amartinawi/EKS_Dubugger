@@ -8878,26 +8878,52 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             "Check Events section for provisioning failure reason",
                         ]
 
+                        # Check for missing StorageClass (likely root cause of Pending)
+                        storage_class_missing = storage_class == "N/A" or not storage_class
+
                         if phase == "Pending":
-                            diagnostic_steps.extend(
-                                [
-                                    "Verify StorageClass exists: kubectl get storageclass",
-                                    "Check EBS CSI driver: kubectl get pods -n kube-system -l app=ebs-csi-controller",
-                                    "Verify AZ constraints match available nodes",
-                                ]
-                            )
+                            if storage_class_missing:
+                                # Missing StorageClass is likely the root cause
+                                diagnostic_steps.extend(
+                                    [
+                                        "⚠️ ROOT CAUSE: No StorageClass specified or default StorageClass missing",
+                                        "Fix: Add storageClassName to PVC spec, or create a default StorageClass",
+                                        "Check: kubectl get storageclass",
+                                        "Check: kubectl get storageclass -o jsonpath='{.items[?(@.metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class==\"true\")].metadata.name}'",
+                                    ]
+                                )
+                            else:
+                                diagnostic_steps.extend(
+                                    [
+                                        "Verify StorageClass exists: kubectl get storageclass",
+                                        "Check EBS CSI driver: kubectl get pods -n kube-system -l app=ebs-csi-controller",
+                                        "Verify AZ constraints match available nodes",
+                                    ]
+                                )
+
+                        # Determine severity based on phase and storage class status
+                        if storage_class_missing and phase == "Pending":
+                            severity = "critical"
+                            summary_suffix = " — likely cause: missing StorageClass"
+                        elif phase == "Pending":
+                            severity = "warning"
+                            summary_suffix = ""
+                        else:
+                            severity = "critical"
+                            summary_suffix = ""
 
                         self._add_finding_dict(
                             "pvc_issues",
                             {
-                                "summary": f"PVC {namespace}/{pvc_name} is not Bound (status: {phase})",
+                                "summary": f"PVC {namespace}/{pvc_name} is not Bound (status: {phase}){summary_suffix}",
                                 "details": {
                                     "pvc": pvc_name,
                                     "namespace": namespace,
                                     "status": phase,
                                     "storage_class": storage_class,
+                                    "storage_class_missing": storage_class_missing,
                                     "requested_storage": requested_storage,
-                                    "severity": "warning" if phase == "Pending" else "critical",
+                                    "severity": severity,
                                     "diagnostic_steps": diagnostic_steps,
                                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html",
                                     "finding_type": FindingType.CURRENT_STATE,
@@ -13020,7 +13046,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         "sg_id": sg_id,
                                         "sg_name": sg_name,
                                         "issue": "Allows all inbound traffic from anywhere (0.0.0.0/0)",
-                                        "severity": "warning",
+                                        "severity": "critical",
                                     }
                                 )
 

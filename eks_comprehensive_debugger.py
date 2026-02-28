@@ -6085,9 +6085,39 @@ class HTMLOutputFormatter(OutputFormatter):
 
         html += """
             <!-- Category Sections -->
-"""
+ """
 
-        for cat, items in findings.items():
+        # Define category priority order (more actionable/blocking issues first)
+        category_priority = {
+            "pod_errors": 1,
+            "oom_killed": 2,
+            "node_issues": 3,
+            "memory_pressure": 4,
+            "disk_pressure": 5,
+            "network_issues": 6,
+            "pvc_issues": 7,  # Blocking issues before informational
+            "scheduling_failures": 8,
+            "control_plane_issues": 9,
+            "image_pull_failures": 10,
+            "dns_issues": 11,
+            "rbac_issues": 12,
+            "addon_issues": 13,
+            "resource_quota_exceeded": 14,  # Informational/best-practice last
+            "quota_issues": 15,
+        }
+
+        def category_sort_key(item):
+            cat, items = item
+            if not items:
+                return (1, 99, cat)  # Empty items go last
+            # Sort by: critical count desc, priority order, then name
+            critical_count = sum(
+                1 for i in items if self._classify_severity(i.get("summary", ""), i.get("details", {})) == "critical"
+            )
+            priority = category_priority.get(cat, 99)
+            return (0 if critical_count > 0 else 1, priority, cat)
+
+        for cat, items in sorted(findings.items(), key=category_sort_key):
             if items:
                 cat_info = category_info.get(
                     cat,

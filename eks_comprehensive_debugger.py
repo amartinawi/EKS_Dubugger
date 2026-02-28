@@ -515,36 +515,23 @@ def classify_severity(summary_text: str, details: Optional[dict] = None) -> str:
 
     summary_lower = summary_text.lower()
 
-    critical_keywords = [
-        "oom",
-        "killed",
-        "crash",
-        "critical",
-        "down",
-        "unhealthy",
-    ]
-    warning_keywords = [
-        "warning",
-        "warn",
-        "degraded",
-        "pressure",
-        "evicted",
-        "pending",
-        "timeout",
-        "error",
-        "failed",
-    ]
-    info_keywords = ["info", "notice", "fallback", "network not ready"]
-
-    for kw in critical_keywords:
-        if kw in summary_lower:
+    # Check for compound words first (common Kubernetes terms)
+    compound_critical = ["oomkilled", "crashloopbackoff", "imagepullbackoff"]
+    for compound in compound_critical:
+        if compound in summary_lower:
             return "critical"
-    for kw in warning_keywords:
-        if kw in summary_lower:
-            return "warning"
-    for kw in info_keywords:
-        if kw in summary_lower:
-            return "info"
+
+    # Word-boundary patterns for single words
+    critical_pattern = re.compile(r"\b(?:oom|killed|crash(?:ed)?|critical|(?<!shut)down|unhealthy)\b")
+    warning_pattern = re.compile(r"\b(?:warning|warn|degraded|pressure|evicted|pending|timeout|error|failed?)\b")
+    info_pattern = re.compile(r"\b(?:info|notice|fallback)\b|network not ready")
+
+    if critical_pattern.search(summary_lower):
+        return "critical"
+    if warning_pattern.search(summary_lower):
+        return "warning"
+    if info_pattern.search(summary_lower):
+        return "info"
 
     return "info"
 
@@ -2024,6 +2011,72 @@ class HTMLOutputFormatter(OutputFormatter):
         else:
             return '<span class="finding-type-badge current" title="Current cluster state (not filtered by date)">🔄 Current</span>'
 
+    def _render_detail_value(self, key: str, value) -> str:
+        """Render a detail value with proper formatting for lists, URLs, etc.
+
+        Args:
+            key: The detail key (used to skip internal fields like finding_type)
+            value: The value to render (can be list, str, or any type)
+
+        Returns:
+            HTML string for the rendered value
+        """
+        if key == "finding_type":
+            return ""
+
+        if value is None:
+            return ""
+
+        if isinstance(value, list):
+            if not value:
+                return ""
+            items_html = "".join(f"<li>{self._escape_html(str(v))}</li>" for v in value)
+            return f'<ul class="detail-list">{items_html}</ul>'
+
+        if isinstance(value, str):
+            if value.startswith("http://") or value.startswith("https://"):
+                return (
+                    f'<a href="{self._escape_html(value)}" '
+                    f'class="detail-link" target="_blank" rel="noopener">'
+                    f"{self._escape_html(value)}</a>"
+                )
+
+        return self._escape_html(str(value))
+
+    def _markdown_to_html(self, text: str) -> str:
+        """Convert basic markdown to HTML for report display.
+
+        Handles:
+        - **bold** → <strong>bold</strong>
+        - Double newlines → paragraph breaks
+        - Single newlines → <br>
+        - URLs → clickable links
+        """
+        if not text:
+            return ""
+
+        escaped = self._escape_html(text)
+
+        import re
+
+        escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+
+        escaped = re.sub(
+            r"(https?://[^\s<]+)",
+            r'<a href="\1" class="detail-link" target="_blank" rel="noopener">\1</a>',
+            escaped,
+        )
+
+        paragraphs = escaped.split("\n\n")
+        html_parts = []
+        for p in paragraphs:
+            p = p.replace("\n", "<br>\n")
+            p = p.strip()
+            if p:
+                html_parts.append(f"<p>{p}</p>")
+
+        return "\n".join(html_parts)
+
     def _generate_executive_summary_html(self, exec_summary: dict) -> str:
         """Generate HTML for the Executive Summary section with Phase 1 & 2 enhancements"""
         health = exec_summary.get("health_status", {})
@@ -2147,7 +2200,7 @@ class HTMLOutputFormatter(OutputFormatter):
         """
 
         if not key_findings:
-            html += """<p style='color: var(--text-secondary); font-size: 0.9rem;'>No critical issues detected</p>"""
+            html += """<p class="muted-text">No critical issues detected</p>"""
         else:
             for finding in key_findings[:5]:
                 severity_class = finding.get("severity", "info")
@@ -2265,7 +2318,7 @@ class HTMLOutputFormatter(OutputFormatter):
 
             html += f"""
                     <!-- External Service Impact -->
-                    <div class="summary-block impact-block" style="border-left: 4px solid {impact_color};">
+                    <div class="summary-block impact-block collapsible" style="border-left: 4px solid {impact_color};">
                         <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
                             <div class="summary-block-title">
                                 <span>🌐</span> Business Impact
@@ -2307,7 +2360,7 @@ class HTMLOutputFormatter(OutputFormatter):
             html += (
                 """
                     <!-- Quick Wins (Phase 3 - #2) -->
-                    <div class="summary-block quick-wins-block">
+                    <div class="summary-block quick-wins-block collapsible">
                         <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
                             <div class="summary-block-title">
                                 <span>🚀</span> Quick Wins
@@ -2400,7 +2453,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             </div>
                 """
         else:
-            html += """<p style='color: var(--text-secondary); font-size: 0.9rem;'>No priority actions identified</p>"""
+            html += """<p class="muted-text">No priority actions identified</p>"""
 
         html += """
                         </div>
@@ -2524,9 +2577,15 @@ class HTMLOutputFormatter(OutputFormatter):
 
         # Incident Summary paragraph
         if incident_story and incident_story.get("summary"):
+            summary_html = self._markdown_to_html(incident_story["summary"])
             html += f"""
-                    <div class="incident-summary" style="margin-bottom: 1.5rem;">
-                        <pre style="white-space: pre-wrap; font-family: inherit; margin: 0; background: var(--bg-pre); padding: 1rem; border-radius: 6px; color: var(--text);">{self._escape_html(incident_story["summary"])}</pre>
+                    <div class="incident-summary" style="margin-bottom: 1.5rem; background: var(--bg-details); padding: 1.25rem; border-radius: 8px; border-left: 4px solid var(--primary);">
+                        <h4 style="margin: 0 0 1rem 0; color: var(--primary); display: flex; align-items: center; gap: 0.5rem;">
+                            <span>📋</span> Incident Summary
+                        </h4>
+                        <div class="summary-content" style="font-size: 0.95rem; line-height: 1.6; color: var(--text);">
+                            {summary_html}
+                        </div>
                     </div>
 """
 
@@ -2639,6 +2698,262 @@ class HTMLOutputFormatter(OutputFormatter):
 """
         return html
 
+    def _generate_cluster_statistics_html(self, cluster_stats: dict) -> str:
+        """Generate HTML for the Cluster Statistics section."""
+        if not cluster_stats:
+            return ""
+
+        infra = cluster_stats.get("infrastructure", {})
+        workloads = cluster_stats.get("workloads", {})
+        networking = cluster_stats.get("networking", {})
+        storage = cluster_stats.get("storage", {})
+        config = cluster_stats.get("configuration", {})
+        rbac = cluster_stats.get("rbac", {})
+
+        html = """
+            <!-- Cluster Statistics Section -->
+            <section class="section" id="cluster-statistics">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <div class="section-title">
+                        <span class="section-icon">📊</span>
+                        <span>Cluster Statistics</span>
+                    </div>
+                    <div class="section-meta">
+                        <span class="section-toggle">▼</span>
+                    </div>
+                </div>
+                <div class="section-content">
+                    <div class="stats-grid">
+        """
+
+        # Infrastructure Card
+        nodes_total = infra.get("nodes", 0)
+        nodes_ready = infra.get("nodes_ready", 0)
+        nodes_not_ready = infra.get("nodes_not_ready", 0)
+        node_health_class = (
+            "healthy" if nodes_not_ready == 0 else ("warning" if nodes_not_ready < nodes_total else "critical")
+        )
+
+        html += f"""
+                        <div class="stat-card {node_health_class}">
+                            <div class="stat-header">
+                                <span class="stat-icon">🖥️</span>
+                                <span class="stat-title">Infrastructure</span>
+                            </div>
+                            <div class="stat-body">
+                                <div class="stat-row">
+                                    <span class="stat-label">Namespaces</span>
+                                    <span class="stat-value">{infra.get("namespaces", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">Nodes</span>
+                                    <span class="stat-value">{nodes_total}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">Ready / Not Ready</span>
+                                    <span class="stat-value">{nodes_ready} / {nodes_not_ready}</span>
+                                </div>
+                            </div>
+        """
+
+        kubelet_versions = infra.get("kubelet_versions", [])
+        if kubelet_versions:
+            versions_str = ", ".join(self._escape_html(v) for v in kubelet_versions[:3])
+            if len(kubelet_versions) > 3:
+                versions_str += f" (+{len(kubelet_versions) - 3} more)"
+            html += f"""
+                            <div class="stat-footer">
+                                <span class="stat-note">K8s Versions: {versions_str}</span>
+                            </div>
+        """
+
+        html += """
+                        </div>
+        """
+
+        # Workloads Card
+        pods_total = workloads.get("pods", 0)
+        pods_running = workloads.get("pods_running", 0)
+        pods_pending = workloads.get("pods_pending", 0)
+        pods_failed = workloads.get("pods_failed", 0)
+        workload_health_class = (
+            "healthy" if pods_failed == 0 and pods_pending == 0 else ("warning" if pods_failed == 0 else "critical")
+        )
+
+        html += f"""
+                        <div class="stat-card {workload_health_class}">
+                            <div class="stat-header">
+                                <span class="stat-icon">📦</span>
+                                <span class="stat-title">Workloads</span>
+                            </div>
+                            <div class="stat-body">
+                                <div class="stat-row">
+                                    <span class="stat-label">Deployments</span>
+                                    <span class="stat-value">{workloads.get("deployments", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">StatefulSets</span>
+                                    <span class="stat-value">{workloads.get("statefulsets", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">DaemonSets</span>
+                                    <span class="stat-value">{workloads.get("daemonsets", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">Jobs / CronJobs</span>
+                                    <span class="stat-value">{workloads.get("jobs", 0)} / {workloads.get("cronjobs", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">Pods (Running)</span>
+                                    <span class="stat-value">{pods_total} ({pods_running})</span>
+                                </div>
+                            </div>
+        """
+
+        if pods_pending > 0 or pods_failed > 0:
+            html += f"""
+                            <div class="stat-footer">
+                                <span class="stat-note warning">⚠️ {pods_pending} pending, {pods_failed} failed</span>
+                            </div>
+        """
+
+        html += """
+                        </div>
+        """
+
+        # Networking Card
+        endpoints_empty = networking.get("endpoints_empty", 0)
+        network_health_class = "healthy" if endpoints_empty == 0 else "warning"
+
+        html += f"""
+                        <div class="stat-card {network_health_class}">
+                            <div class="stat-header">
+                                <span class="stat-icon">🌐</span>
+                                <span class="stat-title">Networking</span>
+                            </div>
+                            <div class="stat-body">
+                                <div class="stat-row">
+                                    <span class="stat-label">Services</span>
+                                    <span class="stat-value">{networking.get("services", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">Ingresses</span>
+                                    <span class="stat-value">{networking.get("ingresses", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">NetworkPolicies</span>
+                                    <span class="stat-value">{networking.get("networkpolicies", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">Endpoints</span>
+                                    <span class="stat-value">{networking.get("endpoints", 0)}</span>
+                                </div>
+                            </div>
+        """
+
+        if endpoints_empty > 0:
+            html += f"""
+                            <div class="stat-footer">
+                                <span class="stat-note warning">⚠️ {endpoints_empty} services with no endpoints</span>
+                            </div>
+        """
+
+        html += """
+                        </div>
+        """
+
+        # Storage Card
+        pvcs_pending = storage.get("pvcs_pending", 0)
+        pvcs_lost = storage.get("pvcs_lost", 0)
+        storage_health_class = (
+            "healthy" if pvcs_pending == 0 and pvcs_lost == 0 else ("warning" if pvcs_lost == 0 else "critical")
+        )
+
+        html += f"""
+                        <div class="stat-card {storage_health_class}">
+                            <div class="stat-header">
+                                <span class="stat-icon">💾</span>
+                                <span class="stat-title">Storage</span>
+                            </div>
+                            <div class="stat-body">
+                                <div class="stat-row">
+                                    <span class="stat-label">PVCs</span>
+                                    <span class="stat-value">{storage.get("pvcs", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">PVs</span>
+                                    <span class="stat-value">{storage.get("pvs", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">StorageClasses</span>
+                                    <span class="stat-value">{storage.get("storageclasses", 0)}</span>
+                                </div>
+                            </div>
+        """
+
+        if pvcs_pending > 0 or pvcs_lost > 0:
+            html += f"""
+                            <div class="stat-footer">
+                                <span class="stat-note warning">⚠️ {pvcs_pending} pending, {pvcs_lost} lost PVCs</span>
+                            </div>
+        """
+
+        html += """
+                        </div>
+        """
+
+        # Configuration Card
+        html += f"""
+                        <div class="stat-card healthy">
+                            <div class="stat-header">
+                                <span class="stat-icon">⚙️</span>
+                                <span class="stat-title">Configuration</span>
+                            </div>
+                            <div class="stat-body">
+                                <div class="stat-row">
+                                    <span class="stat-label">ConfigMaps</span>
+                                    <span class="stat-value">{config.get("configmaps", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">Secrets</span>
+                                    <span class="stat-value">{config.get("secrets", 0)}</span>
+                                </div>
+                            </div>
+                        </div>
+        """
+
+        # RBAC Card
+        html += f"""
+                        <div class="stat-card healthy">
+                            <div class="stat-header">
+                                <span class="stat-icon">🔒</span>
+                                <span class="stat-title">RBAC</span>
+                            </div>
+                            <div class="stat-body">
+                                <div class="stat-row">
+                                    <span class="stat-label">ServiceAccounts</span>
+                                    <span class="stat-value">{rbac.get("serviceaccounts", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">Roles / RoleBindings</span>
+                                    <span class="stat-value">{rbac.get("roles", 0)} / {rbac.get("rolebindings", 0)}</span>
+                                </div>
+                                <div class="stat-row">
+                                    <span class="stat-label">ClusterRoles / Bindings</span>
+                                    <span class="stat-value">{rbac.get("clusterroles", 0)} / {rbac.get("clusterrolebindings", 0)}</span>
+                                </div>
+                            </div>
+                        </div>
+        """
+
+        html += """
+                    </div>
+                </div>
+            </section>
+        """
+
+        return html
+
     def format(self, results):
         """Format results as interactive HTML"""
         metadata = results["metadata"]
@@ -2738,9 +3053,807 @@ class HTMLOutputFormatter(OutputFormatter):
             --success: #1dd1a1;
             --bg-dark: #1a1a2e;
             --bg-card: #ffffff;
+            --bg-details: #f8fafc;
+            --bg-pre: #f1f5f9;
+            --text: #2d3748;
             --text-primary: #2d3748;
             --text-secondary: #718096;
             --border: #e2e8f0;
+        }}
+        
+        [data-theme="dark"] {{
+            --primary: #818cf8;
+            --primary-dark: #a78bfa;
+            --critical: #f87171;
+            --warning: #fbbf24;
+            --info: #22d3ee;
+            --success: #34d399;
+            --bg-dark: #0f172a;
+            --bg-card: #1e293b;
+            --bg-details: #334155;
+            --bg-pre: #1e293b;
+            --text: #e2e8f0;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --border: #475569;
+        }}
+        
+        [data-theme="dark"] body {{
+            background: #0f172a;
+        }}
+        
+        [data-theme="dark"] .summary-card {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .section {{
+            background: var(--bg-card);
+        }}
+        
+        [data-theme="dark"] .finding-item {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .detail-value {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .toolbar-btn {{
+            background: var(--bg-card);
+            border-color: var(--border);
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .severity-filter {{
+            background: var(--bg-card);
+            border-color: var(--border);
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .search-box input {{
+            background: var(--bg-card);
+            border-color: var(--border);
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .modal-content {{
+            background: var(--bg-card);
+        }}
+        
+        [data-theme="dark"] .recommendation-card {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .finding-type-card {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .finding-type-badge.historical {{
+            background: #312e81;
+            color: #a5b4fc;
+        }}
+        
+        [data-theme="dark"] .finding-type-badge.current {{
+            background: #451a03;
+            color: #fcd34d;
+        }}
+        
+        [data-theme="dark"] .summary-block {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .health-assessment {{
+            background: var(--bg-card);
+        }}
+        
+        [data-theme="dark"] .health-assessment.critical {{
+            background: linear-gradient(135deg, #450a0a 0%, #7f1d1d 100%);
+        }}
+        
+        [data-theme="dark"] .health-assessment.warning {{
+            background: linear-gradient(135deg, #451a03 0%, #78350f 100%);
+        }}
+        
+        [data-theme="dark"] .health-assessment.healthy {{
+            background: linear-gradient(135deg, #052e16 0%, #14532d 100%);
+        }}
+        
+        [data-theme="dark"] .key-finding-item {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .key-finding-summary {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .info-box {{
+            background: linear-gradient(135deg, #0c4a6e 0%, #164e63 100%);
+            border-color: #0891b2;
+        }}
+        
+        [data-theme="dark"] .info-box p {{
+            color: #e0f2fe;
+        }}
+        
+        [data-theme="dark"] .evidence-section {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .evidence-header {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .root-cause-item {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .root-cause-text {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .timeline-item {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .timeline-item .timeline-time {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .timeline-item .timeline-content {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .source-badge {{
+            background: var(--bg-details);
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .block-toggle {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .page-footer {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .page-footer p {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .page-header {{
+            background: var(--bg-card);
+        }}
+        
+        [data-theme="dark"] .nav-count {{
+            background: var(--bg-details);
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .section-meta {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .section-source {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .section-count {{
+            background: var(--bg-details);
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .copy-btn {{
+            background: var(--bg-details);
+            border-color: var(--border);
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .copy-btn:hover {{
+            background: var(--primary);
+            color: white;
+        }}
+        
+        [data-theme="dark"] .scroll-top {{
+            background: var(--bg-card);
+            border-color: var(--border);
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .scroll-top:hover {{
+            background: var(--primary);
+            color: white;
+        }}
+        
+        [data-theme="dark"] .hamburger span {{
+            background: var(--text);
+        }}
+        
+        [data-theme="dark"] .sidebar-overlay {{
+            background: rgba(0, 0, 0, 0.7);
+        }}
+        
+        [data-theme="dark"] .detail-label {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .detail-list li {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .detail-link {{
+            color: var(--primary);
+        }}
+        
+        [data-theme="dark"] .muted-text {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .category-name {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .category-count {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] pre {{
+            background: var(--bg-details);
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] code {{
+            background: var(--bg-details);
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .source-card {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .source-name {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .error-item {{
+            background: #450a0a;
+            border-color: #7f1d1d;
+        }}
+        
+        [data-theme="dark"] .error-step {{
+            color: #fca5a5;
+        }}
+        
+        [data-theme="dark"] .error-msg {{
+            color: #fecaca;
+        }}
+        
+        [data-theme="dark"] .priority-badge {{
+            background: var(--bg-details);
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .priority-badge.high {{
+            background: #7f1d1d;
+            color: #fecaca;
+        }}
+        
+        [data-theme="dark"] .priority-badge.medium {{
+            background: #78350f;
+            color: #fde68a;
+        }}
+        
+        [data-theme="dark"] .namespace-item {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .namespace-name {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .namespace-count {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .healthy-block {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .healthy-item {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .healthy-name {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .quick-win-item {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .quick-win-title {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .quick-win-solution {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .quick-win-time {{
+            background: var(--bg-details);
+            color: var(--success);
+        }}
+        
+        [data-theme="dark"] .correlation-card {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .at-a-glance {{
+            background: var(--bg-card);
+        }}
+        
+        [data-theme="dark"] .glance-stat {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .glance-label {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .glance-value {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .meta-item {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .meta-label {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .meta-value {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .header-content {{
+            background: var(--bg-card);
+        }}
+        
+        [data-theme="dark"] .header-title {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .header-subtitle {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .category-bar {{
+            background: var(--bg-details);
+        }}
+        
+        [data-theme="dark"] .story-timeline {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        /* Incident Summary Styles */
+        .incident-summary {{
+            background: linear-gradient(135deg, #f8fafc 0%, #ffffff 100%);
+            border: 1px solid var(--border);
+            border-left: 4px solid var(--primary);
+            border-radius: 12px;
+            padding: 1.25rem;
+            margin-bottom: 1.5rem;
+        }}
+        
+        .incident-summary h4 {{
+            margin: 0 0 1rem 0;
+            color: var(--primary);
+            font-size: 1.1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }}
+        
+        .summary-content {{
+            font-size: 0.95rem;
+            line-height: 1.7;
+            color: var(--text);
+        }}
+        
+        .summary-content p {{
+            margin: 0 0 0.75rem 0;
+        }}
+        
+        .summary-content p:last-child {{
+            margin-bottom: 0;
+        }}
+        
+        .summary-content strong {{
+            color: var(--text-primary);
+            font-weight: 600;
+        }}
+        
+        .summary-content a {{
+            color: var(--primary);
+            text-decoration: none;
+        }}
+        
+        .summary-content a:hover {{
+            text-decoration: underline;
+        }}
+        
+        [data-theme="dark"] .incident-summary {{
+            background: linear-gradient(135deg, var(--bg-details) 0%, var(--bg-card) 100%);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .summary-content {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .summary-content strong {{
+            color: var(--text-primary);
+        }}
+        
+        [data-theme="dark"] .diagnostic-section {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .diagnostic-header {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .action-item {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .action-text {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .stat-item {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .stat-item.critical {{
+            color: var(--critical);
+        }}
+        
+        [data-theme="dark"] .stat-item.warning {{
+            color: var(--warning);
+        }}
+        
+        [data-theme="dark"] .evidence-stats {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .evidence-examples {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .evidence-examples li {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .rec-link {{
+            color: var(--primary);
+        }}
+        
+        [data-theme="dark"] .footer-link {{
+            color: var(--primary);
+        }}
+        
+        /* Hover states for dark mode */
+        [data-theme="dark"] .nav-item:hover {{
+            background: var(--bg-details);
+        }}
+        
+        [data-theme="dark"] .nav-item.active {{
+            background: var(--bg-details);
+            border-color: var(--primary);
+        }}
+        
+        [data-theme="dark"] .toolbar-btn:hover {{
+            background: var(--primary);
+            border-color: var(--primary);
+            color: white;
+        }}
+        
+        [data-theme="dark"] .finding-item:hover {{
+            border-color: var(--primary);
+        }}
+        
+        [data-theme="dark"] .recommendation-card:hover {{
+            border-color: var(--primary);
+            box-shadow: 0 4px 12px rgba(129, 140, 248, 0.15);
+        }}
+        
+        [data-theme="dark"] .key-finding-item:hover {{
+            border-color: var(--primary);
+        }}
+        
+        [data-theme="dark"] .link:hover {{
+            color: var(--primary);
+        }}
+        
+        [data-theme="dark"] .detail-link:hover {{
+            text-decoration: underline;
+        }}
+        
+        [data-theme="dark"] .severity-filter:hover {{
+            background: var(--bg-details);
+        }}
+        
+        [data-theme="dark"] .severity-filter.active {{
+            background: var(--primary);
+            border-color: var(--primary);
+            color: white;
+        }}
+        
+        [data-theme="dark"] .severity-filter.critical:hover,
+        [data-theme="dark"] .severity-filter.critical.active {{
+            background: var(--critical);
+            border-color: var(--critical);
+        }}
+        
+        [data-theme="dark"] .severity-filter.warning:hover,
+        [data-theme="dark"] .severity-filter.warning.active {{
+            background: var(--warning);
+            border-color: var(--warning);
+        }}
+        
+        [data-theme="dark"] .severity-filter.info:hover,
+        [data-theme="dark"] .severity-filter.info.active {{
+            background: var(--info);
+            border-color: var(--info);
+        }}
+        
+        /* Executive Summary Dark Mode */
+        [data-theme="dark"] .executive-summary {{
+            background: var(--bg-card);
+        }}
+        
+        [data-theme="dark"] .executive-summary-header {{
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+        }}
+        
+        [data-theme="dark"] .executive-summary-content {{
+            background: var(--bg-card);
+        }}
+        
+        [data-theme="dark"] .health-assessment.critical {{
+            background: linear-gradient(135deg, #450a0a 0%, #7f1d1d 100%);
+            border-color: #dc2626;
+        }}
+        
+        [data-theme="dark"] .health-assessment.warning {{
+            background: linear-gradient(135deg, #451a03 0%, #78350f 100%);
+            border-color: #d97706;
+        }}
+        
+        [data-theme="dark"] .health-assessment.healthy {{
+            background: linear-gradient(135deg, #052e16 0%, #14532d 100%);
+            border-color: #16a34a;
+        }}
+        
+        [data-theme="dark"] .health-message h3 {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .health-message p {{
+            color: var(--text-secondary);
+        }}
+        
+        /* Business Impact Dark Mode */
+        [data-theme="dark"] .impact-block {{
+            background: linear-gradient(135deg, #450a0a 0%, #7f1d1d 100%) !important;
+            border-color: #991b1b;
+        }}
+        
+        [data-theme="dark"] .impact-alert {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .impact-service-item {{
+            background: var(--bg-details);
+            border: 1px solid var(--border);
+        }}
+        
+        [data-theme="dark"] .service-name {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .service-namespace {{
+            color: var(--text-secondary);
+        }}
+        
+        /* Narrative Block Dark Mode */
+        [data-theme="dark"] .narrative-block {{
+            background: linear-gradient(135deg, #2e1065 0%, #4c1d95 100%) !important;
+            border-color: #7c3aed;
+        }}
+        
+        [data-theme="dark"] .narrative-summary {{
+            color: #c4b5fd;
+            border-bottom-color: rgba(124, 58, 237, 0.3);
+        }}
+        
+        [data-theme="dark"] .narrative-details {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .narrative-details strong {{
+            color: #a78bfa;
+        }}
+        
+        /* Quick Wins Dark Mode */
+        [data-theme="dark"] .quick-wins-block {{
+            background: linear-gradient(135deg, #052e16 0%, #14532d 100%) !important;
+            border-color: #22c55e;
+        }}
+        
+        [data-theme="dark"] .quick-wins-count {{
+            background: #16a34a;
+            color: white;
+        }}
+        
+        [data-theme="dark"] .quick-win-item {{
+            background: var(--bg-card);
+            border-color: var(--border);
+            border-left-color: #22c55e;
+        }}
+        
+        [data-theme="dark"] .quick-win-header {{
+            border-bottom-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .quick-win-title {{
+            color: var(--text);
+        }}
+        
+        [data-theme="dark"] .quick-win-solution {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .quick-win-time {{
+            background: rgba(34, 197, 94, 0.2);
+            color: #4ade80;
+        }}
+        
+        [data-theme="dark"] .quick-win-affected {{
+            color: var(--text-secondary);
+        }}
+        
+        /* Most Impacted Namespaces Dark Mode */
+        [data-theme="dark"] .namespace-block {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        /* Key Findings Dark Mode */
+        [data-theme="dark"] .key-findings-block {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        /* Root Cause Dark Mode */
+        [data-theme="dark"] .root-cause-block {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        /* Priority Actions Dark Mode */
+        [data-theme="dark"] .priority-actions-block {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        /* Healthy Components Dark Mode */
+        [data-theme="dark"] .healthy-block {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        /* Category Breakdown Dark Mode */
+        [data-theme="dark"] .category-breakdown-block {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        /* Summary Block Hover Dark Mode */
+        [data-theme="dark"] .summary-block-header:hover {{
+            background: var(--bg-details);
+        }}
+        
+        /* At-a-glance Dark Mode */
+        [data-theme="dark"] .at-a-glance {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .glance-stat {{
+            background: var(--bg-details);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .glance-label {{
+            color: var(--text-secondary);
+        }}
+        
+        [data-theme="dark"] .glance-value {{
+            color: var(--text);
+        }}
+        
+        /* Finding Type Legend Dark Mode */
+        [data-theme="dark"] .finding-type-legend {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        /* Disclosure Triangle Dark Mode */
+        [data-theme="dark"] .summary-block-header {{
+            color: var(--text);
+        }}
+        
+        /* Timeline Dark Mode */
+        [data-theme="dark"] .timeline-section {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        /* Dark mode toggle button */
+        .theme-toggle {{
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            z-index: 1001;
+            background: var(--bg-card);
+            border: 2px solid var(--border);
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+            transition: all 0.3s;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }}
+        
+        .theme-toggle:hover {{
+            transform: scale(1.1);
+            border-color: var(--primary);
+        }}
+        
+        @media (max-width: 1024px) {{
+            .theme-toggle {{
+                top: 1rem;
+                right: 4rem;
+            }}
         }}
         
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -2939,6 +4052,54 @@ class HTMLOutputFormatter(OutputFormatter):
             background: var(--primary);
             color: white;
             border-color: var(--primary);
+        }}
+        
+        /* Severity Filter Buttons */
+        .severity-filters {{
+            display: flex;
+            gap: 0.5rem;
+        }}
+        .severity-filter {{
+            padding: 0.5rem 0.75rem;
+            border: 2px solid var(--border);
+            background: white;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: all 0.2s;
+        }}
+        .severity-filter:hover {{
+            transform: translateY(-1px);
+        }}
+        .severity-filter.active {{
+            color: white;
+            background: var(--primary);
+            border-color: var(--primary);
+        }}
+        .severity-filter.critical {{
+            border-color: var(--critical);
+        }}
+        .severity-filter.critical:hover,
+        .severity-filter.critical.active {{
+            background: var(--critical);
+            color: white;
+        }}
+        .severity-filter.warning {{
+            border-color: var(--warning);
+        }}
+        .severity-filter.warning:hover,
+        .severity-filter.warning.active {{
+            background: var(--warning);
+            color: white;
+        }}
+        .severity-filter.info {{
+            border-color: var(--info);
+        }}
+        .severity-filter.info:hover,
+        .severity-filter.info.active {{
+            background: var(--info);
+            color: white;
         }}
         
         /* Summary Cards */
@@ -3772,11 +4933,16 @@ class HTMLOutputFormatter(OutputFormatter):
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 1.25rem 1.5rem;
+            padding: 1rem 1.5rem;
             border-bottom: 1px solid var(--border);
             cursor: pointer;
-            transition: background 0.2s;
+            transition: all 0.2s;
         }}
+        .section-header:focus {{
+            outline: none;
+            border-color: var(--primary);
+        }}
+        .section-header[role="button" tabindex="0" aria-expanded="false"]
         
         .section-header:hover {{ background: #f8fafc; }}
         
@@ -3914,6 +5080,23 @@ class HTMLOutputFormatter(OutputFormatter):
             word-break: break-word;
         }}
         
+        .detail-list {{
+            margin: 0;
+            padding-left: 1.25rem;
+        }}
+        .detail-list li {{
+            margin-bottom: 0.25rem;
+            font-size: 0.85rem;
+        }}
+        .detail-link {{
+            color: var(--primary);
+            word-break: break-all;
+            text-decoration: none;
+        }}
+        .detail-link:hover {{
+            text-decoration: underline;
+        }}
+        
         /* View All Modal */
         .modal {{
             display: none;
@@ -4019,6 +5202,57 @@ class HTMLOutputFormatter(OutputFormatter):
         
         .rec-link:hover {{ text-decoration: underline; }}
         
+        /* Copy to clipboard */
+        .copy-btn {{
+            background: none;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 0.25rem 0.5rem;
+            cursor: pointer;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-left: 0.5rem;
+            transition: all 0.2s;
+        }}
+        .copy-btn:hover {{
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }}
+        .copy-btn.copied {{
+            background: #10b981;
+            color: white;
+            border-color: #10b981;
+        }}
+        
+        /* Scroll to top button */
+        .scroll-top {{
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: var(--primary);
+            color: white;
+            border: none;
+            cursor: pointer;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            transition: all 0.3s;
+            z-index: 1000;
+        }}
+        .scroll-top:hover {{
+            transform: translateY(-3px);
+            box-shadow: 0 6px 16px rgba(0,0,0,0.2);
+        }}
+        .scroll-top.visible {{
+            display: flex;
+        }}
+        
         /* Evidence Section */
         .evidence-section {{
             margin-top: 1rem;
@@ -4072,6 +5306,106 @@ class HTMLOutputFormatter(OutputFormatter):
             font-size: 0.85rem;
             color: var(--text-secondary);
             margin-bottom: 0.25rem;
+        }}
+        
+        /* Utility Classes for Inline Style Reduction */
+        .detail-box {{
+            background: var(--bg-details);
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }}
+        .detail-box-sm {{
+            background: var(--bg-details);
+            padding: 0.75rem;
+            border-radius: 6px;
+            margin-bottom: 0.75rem;
+        }}
+        .code-block {{
+            background: var(--bg-pre);
+            padding: 0.5rem;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-size: 0.85rem;
+            margin: 0.25rem 0;
+            color: var(--text);
+        }}
+        .code-block-lg {{
+            background: var(--bg-pre);
+            padding: 1rem;
+            border-radius: 6px;
+            white-space: pre-wrap;
+            font-family: inherit;
+            margin: 0;
+            color: var(--text);
+        }}
+        .text-secondary {{
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }}
+        .text-primary {{
+            font-weight: 600;
+            color: var(--primary);
+        }}
+        .text-success {{
+            font-weight: 600;
+            color: #22c55e;
+        }}
+        .heading-primary {{
+            margin: 1.5rem 0 0.75rem 0;
+            color: var(--primary);
+        }}
+        .clickable {{
+            cursor: pointer;
+        }}
+        .severity-badge-sm {{
+            font-size: 0.8rem;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            margin-left: 0.5rem;
+            color: white;
+        }}
+        .timeline-dot {{
+            position: absolute;
+            left: -1.35rem;
+            width: 0.5rem;
+            height: 0.5rem;
+            border-radius: 50%;
+        }}
+        .timeline-item {{
+            margin-bottom: 0.75rem;
+            position: relative;
+        }}
+        .timeline-time {{
+            font-weight: 600;
+        }}
+        .timeline-content {{
+            font-size: 0.95rem;
+            color: var(--text);
+        }}
+        .timeline-impact {{
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }}
+        .border-left-accent {{
+            border-left: 4px solid var(--primary);
+        }}
+        .border-left-accent-sm {{
+            border-left: 3px solid var(--primary);
+        }}
+        .section-spacing {{
+            padding: 1.5rem;
+        }}
+        .margin-top {{
+            margin-top: 0.5rem;
+        }}
+        .margin-top-lg {{
+            margin-top: 1rem;
+        }}
+        .flex-gap {{
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
         }}
         
         .evidence-resources, .evidence-timing, .evidence-impact {{
@@ -4208,6 +5542,89 @@ class HTMLOutputFormatter(OutputFormatter):
         .source-name {{ font-weight: 600; font-size: 0.9rem; }}
         .source-status {{ font-size: 0.75rem; color: var(--text-secondary); }}
         
+        /* Cluster Statistics Cards */
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.25rem;
+            margin-bottom: 2rem;
+        }}
+        
+        .stat-card {{
+            background: white;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            transition: box-shadow 0.2s ease, transform 0.2s ease;
+        }}
+        
+        .stat-card:hover {{
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            transform: translateY(-2px);
+        }}
+        
+        .stat-card.healthy {{ border-left: 4px solid #22c55e; }}
+        .stat-card.warning {{ border-left: 4px solid #f59e0b; }}
+        .stat-card.critical {{ border-left: 4px solid #ef4444; }}
+        
+        .stat-header {{
+            background: linear-gradient(135deg, var(--bg-details) 0%, white 100%);
+            padding: 0.75rem 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            border-bottom: 1px solid var(--border);
+        }}
+        
+        .stat-icon {{ font-size: 1.25rem; }}
+        .stat-title {{ font-weight: 600; font-size: 1rem; color: var(--text-primary); }}
+        
+        .stat-body {{ padding: 1rem; }}
+        
+        .stat-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid var(--border);
+        }}
+        
+        .stat-row:last-child {{ border-bottom: none; }}
+        
+        .stat-label {{ font-size: 0.9rem; color: var(--text-secondary); }}
+        .stat-value {{ font-weight: 600; font-size: 0.95rem; color: var(--text-primary); }}
+        
+        .stat-footer {{
+            padding: 0.75rem 1rem;
+            background: var(--bg-details);
+            border-top: 1px solid var(--border);
+        }}
+        
+        .stat-note {{
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }}
+        
+        .stat-note.warning {{ color: #f59e0b; }}
+        .stat-note.critical {{ color: #ef4444; }}
+        
+        [data-theme="dark"] .stat-card {{
+            background: var(--bg-card);
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .stat-header {{
+            background: linear-gradient(135deg, var(--bg-details) 0%, var(--bg-card) 100%);
+        }}
+        
+        [data-theme="dark"] .stat-row {{
+            border-color: var(--border);
+        }}
+        
+        [data-theme="dark"] .stat-footer {{
+            background: var(--bg-details);
+        }}
+        
         /* Errors */
         .error-item {{
             background: #fef2f2;
@@ -4231,20 +5648,89 @@ class HTMLOutputFormatter(OutputFormatter):
         .footer-link {{ color: var(--primary); text-decoration: none; font-weight: 500; }}
         .footer-link:hover {{ text-decoration: underline; }}
         
+        /* Mobile hamburger menu */
+        .hamburger {{
+            display: none;
+            position: fixed;
+            top: 1rem;
+            left: 1rem;
+            z-index: 1001;
+            background: var(--primary);
+            border: none;
+            border-radius: 8px;
+            padding: 0.75rem;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }}
+        .hamburger span {{
+            display: block;
+            width: 24px;
+            height: 2px;
+            background: white;
+            margin: 5px 0;
+            transition: all 0.3s;
+        }}
+        .hamburger.active span:nth-child(1) {{ transform: rotate(45deg) translate(5px, 5px); }}
+        .hamburger.active span:nth-child(2) {{ opacity: 0; }}
+        .hamburger.active span:nth-child(3) {{ transform: rotate(-45deg) translate(5px, -5px); }}
+        
+        .sidebar-overlay {{
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 999;
+        }}
+        .sidebar-overlay.active {{ display: block; }}
+        
         /* Responsive */
         @media (max-width: 1024px) {{
-            .sidebar {{ transform: translateX(-100%); }}
+            .hamburger {{ display: block; }}
+            .sidebar {{ transform: translateX(-100%); transition: transform 0.3s ease; }}
+            .sidebar.open {{ transform: translateX(0); }}
             .main-content {{ margin-left: 0; }}
+        }}
+        
+        .muted-text {{
+            color: var(--text-secondary);
+            font-size: 0.9rem;
         }}
         
         @media print {{
             .sidebar, .toolbar {{ display: none; }}
             .main-content {{ margin-left: 0; }}
             .section.collapsed .section-content {{ display: block; }}
+            .hamburger {{ display: none; }}
+            .severity-filters {{ display: none; }}
+            .search-box {{ display: none; }}
+            .finding-badges {{ display: none; }}
+            .finding-expand {{ display: none; }}
+            .nav-count {{ display: none; }}
+            .summary-grid {{ grid-template-columns: 1fr; }}
+            .summary-card {{ break-inside: avoid; box-shadow: 0 1px solid #ddd; }}
+            .section-header {{ break-inside: avoid; box-shadow: 0 1px solid #ddd; }}
+            .finding-item {{ break-inside: avoid; page-break-inside: avoid; margin-bottom: 0.5rem; }}
+        }}
+        @page {{
+            margin: 0.5in;
         }}
     </style>
 </head>
 <body>
+    <!-- Mobile hamburger menu -->
+    <button class="hamburger" onclick="toggleSidebar()" aria-label="Toggle navigation">
+        <span></span>
+        <span></span>
+        <span></span>
+    </button>
+    <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode" title="Toggle dark mode">
+        🌙
+    </button>
+    <div class="sidebar-overlay" onclick="toggleSidebar()"></div>
+    
     <div class="app-container">
         <!-- Sidebar Navigation -->
         <aside class="sidebar">
@@ -4264,6 +5750,9 @@ class HTMLOutputFormatter(OutputFormatter):
                 </a>
                 <a href="#sources" class="nav-item">
                     <span>📡 Data Sources</span>
+                </a>
+                <a href="#cluster-statistics" class="nav-item">
+                    <span>📊 Cluster Statistics</span>
                 </a>
                 
                 <div class="nav-section">Findings</div>
@@ -4335,6 +5824,12 @@ class HTMLOutputFormatter(OutputFormatter):
             <div class="toolbar">
                 <div class="search-box">
                     <input type="text" id="searchInput" placeholder="Search findings..." onkeyup="filterFindings()">
+                </div>
+                <div class="severity-filters">
+                    <button class="severity-filter active" data-filter="all" onclick="filterBySeverity('all', this)">All</button>
+                    <button class="severity-filter critical" data-filter="critical" onclick="filterBySeverity('critical', this)">🔴 Critical</button>
+                    <button class="severity-filter warning" data-filter="warning" onclick="filterBySeverity('warning', this)">⚠️ Warning</button>
+                    <button class="severity-filter info" data-filter="info" onclick="filterBySeverity('info', this)">ℹ️ Info</button>
                 </div>
                 <button class="toolbar-btn" onclick="expandAll()">📂 Expand All</button>
                 <button class="toolbar-btn" onclick="collapseAll()">📁 Collapse All</button>
@@ -4435,6 +5930,11 @@ class HTMLOutputFormatter(OutputFormatter):
         # What Happened section (right after Executive Summary)
         html += self._generate_what_happened_html(results)
 
+        # Cluster Statistics section
+        cluster_stats = results.get("cluster_statistics", {})
+        if cluster_stats:
+            html += self._generate_cluster_statistics_html(cluster_stats)
+
         all_findings_json = []
 
         if findings:
@@ -4503,13 +6003,13 @@ class HTMLOutputFormatter(OutputFormatter):
                         escaped_summary = self._escape_html(item.get("summary", "N/A"))
                         html += f'''
                     <div class="finding-item" data-severity="{item_severity}" data-category="{cat}">
-                        <div class="finding-header" onclick="toggleFinding(this.parentElement)">
-                            <div class="finding-summary">{escaped_summary}</div>
+                        <div class="finding-header" onclick="toggleFinding(this.parentElement)" role="button" tabindex="0" aria-expanded="true" onkeydown="if(event.key === 'Enter' || event.key === ' ') {{ toggleFinding(this.parentElement); }}">
+                        <div class="finding-summary">{escaped_summary}</div>
                             <div class="finding-badges">
                                 <span class="severity-badge {item_severity}">{item_severity}</span>
                                 {finding_type_badge}
                                 {source_badge}
-                                <span class="finding-expand">▼</span>
+                                <span class="finding-expand" role="button" aria-label="Expand">▼</span>
                             </div>
                         </div>
                         <div class="finding-details">
@@ -4517,12 +6017,13 @@ class HTMLOutputFormatter(OutputFormatter):
 '''
                         if item.get("details"):
                             for key, value in item["details"].items():
-                                escaped_key = self._escape_html(key)
-                                escaped_value = self._escape_html(str(value) if value is not None else "")
-                                html += f"""
+                                rendered_value = self._render_detail_value(key, value)
+                                if rendered_value:
+                                    escaped_key = self._escape_html(key)
+                                    html += f"""
                                 <div class="detail-item">
                                     <div class="detail-label">{escaped_key}</div>
-                                    <div class="detail-value">{escaped_value}</div>
+                                    <div class="detail-value">{rendered_value}</div>
                                 </div>
 """
                         html += """
@@ -4574,13 +6075,13 @@ class HTMLOutputFormatter(OutputFormatter):
 
                     html += f'''
                     <div class="finding-item" data-severity="{item_severity}">
-                        <div class="finding-header" onclick="toggleFinding(this.parentElement)">
+                        <div class="finding-header" onclick="toggleFinding(this.parentElement)" role="button" tabindex="0" aria-expanded="true" onkeydown="if(event.key === 'Enter' || event.key === ' ') {{ toggleFinding(this.parentElement); }}">
                             <div class="finding-summary">{escaped_summary2}</div>
                             <div class="finding-badges">
-                                <span class="severity-badge {item_severity}">{item_severity}</span>
-                                {finding_type_badge}
-                                {source_badge}
-                                <span class="finding-expand">▼</span>
+                            <span class="severity-badge {item_severity}">{item_severity}</span>
+                            {finding_type_badge}
+                            {source_badge}
+                            <span class="finding-expand" role="button" aria-label="Expand">▼</span>
                             </div>
                         </div>
                         <div class="finding-details">
@@ -4588,12 +6089,13 @@ class HTMLOutputFormatter(OutputFormatter):
 '''
                     if item.get("details"):
                         for key, value in item["details"].items():
-                            escaped_key2 = self._escape_html(key)
-                            escaped_value2 = self._escape_html(str(value) if value is not None else "")
-                            html += f"""
+                            rendered_value2 = self._render_detail_value(key, value)
+                            if rendered_value2:
+                                escaped_key2 = self._escape_html(key)
+                                html += f"""
                                 <div class="detail-item">
                                     <div class="detail-label">{escaped_key2}</div>
-                                    <div class="detail-value">{escaped_value2}</div>
+                                    <div class="detail-value">{rendered_value2}</div>
                                 </div>
 """
                     html += """
@@ -4732,7 +6234,8 @@ class HTMLOutputFormatter(OutputFormatter):
                             <ol class="diagnostic-steps">
 """
                     for step in diagnostic_steps:
-                        html += f"                                <li><code>{step}</code></li>\n"
+                        escaped_step = self._escape_html(str(step))
+                        html += f'                                <li><code>{escaped_step}</code> <button class="copy-btn" onclick="copyToClipboard(this.previousElementSibling.textContent, this)" title="Copy command">📋</button></li>\n'
                     html += """                            </ol>
                         </div>
 """
@@ -4848,6 +6351,76 @@ class HTMLOutputFormatter(OutputFormatter):
             });
         }
         
+        let currentSeverityFilter = 'all';
+        
+        function filterBySeverity(severity, button) {
+            currentSeverityFilter = severity;
+            
+            // Update active state on buttons
+            document.querySelectorAll('.severity-filter').forEach(btn => btn.classList.remove('active'));
+            button.classList.add('active');
+            
+            // Filter findings
+            document.querySelectorAll('.finding-item').forEach(item => {
+                const itemSeverity = item.getAttribute('data-severity');
+                if (severity === 'all' || itemSeverity === severity) {
+                    item.style.display = 'block';
+                } else {
+                    item.style.display = 'none';
+                }
+            });
+            
+            // Also filter in modal if open
+            document.querySelectorAll('.modal .finding-item').forEach(item => {
+                const itemSeverity = item.getAttribute('data-severity');
+                if (severity === 'all' || itemSeverity === severity) {
+                    item.style.display = 'block';
+                } else {
+                    item.style.display = 'none';
+                }
+            });
+        }
+        
+        function copyToClipboard(text, button) {
+            navigator.clipboard.writeText(text).then(() => {
+                const originalText = button.innerHTML;
+                button.innerHTML = '✓';
+                button.classList.add('copied');
+                setTimeout(() => {
+                    button.innerHTML = originalText;
+                    button.classList.remove('copied');
+                }, 2000);
+            }).catch(err => {
+                console.error('Failed to copy:', err);
+            });
+        }
+        
+        function toggleTheme() {
+            const html = document.documentElement;
+            const currentTheme = html.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            html.setAttribute('data-theme', newTheme);
+            localStorage.setItem('eks-debugger-theme', newTheme);
+            updateThemeIcon(newTheme);
+        }
+        
+        function updateThemeIcon(theme) {
+            const btn = document.querySelector('.theme-toggle');
+            if (btn) {
+                btn.innerHTML = theme === 'dark' ? '☀️' : '🌙';
+            }
+        }
+        
+        // Restore saved theme on page load
+        (function() {
+            const savedTheme = localStorage.getItem('eks-debugger-theme') || 'light';
+            document.documentElement.setAttribute('data-theme', savedTheme);
+            // Set initial icon after DOM is ready
+            document.addEventListener('DOMContentLoaded', function() {
+                updateThemeIcon(savedTheme);
+            });
+        })();
+        
         function showAllFindingsModal() {
             document.getElementById('allFindingsModal').classList.add('active');
         }
@@ -4856,9 +6429,23 @@ class HTMLOutputFormatter(OutputFormatter):
             document.getElementById('allFindingsModal').classList.remove('active');
         }
         
+        function toggleSidebar() {
+            const sidebar = document.querySelector('.sidebar');
+            const hamburger = document.querySelector('.hamburger');
+            const overlay = document.querySelector('.sidebar-overlay');
+            sidebar.classList.toggle('open');
+            hamburger.classList.toggle('active');
+            overlay.classList.toggle('active');
+        }
+        
         // Close modal on outside click
         document.getElementById('allFindingsModal').addEventListener('click', function(e) {
             if (e.target === this) closeModal();
+        });
+        
+        // Close modal on Escape key
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') closeModal();
         });
         
         // Smooth scroll for nav links
@@ -4871,8 +6458,54 @@ class HTMLOutputFormatter(OutputFormatter):
                     if (target) {
                         target.scrollIntoView({ behavior: 'smooth', block: 'start' });
                     }
+                    // Close sidebar on mobile after navigation
+                    const sidebar = document.querySelector('.sidebar');
+                    if (sidebar.classList.contains('open')) {
+                        toggleSidebar();
+                    }
                 }
             });
+        });
+        
+        // Active nav tracking with IntersectionObserver
+        const sections = document.querySelectorAll('section[id]');
+        const navItems = document.querySelectorAll('.nav-item[href^="#"]');
+        
+        const observerOptions = {
+            rootMargin: '-20% 0px -80% 0px',
+            threshold: 0
+        };
+        
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    const id = entry.target.getAttribute('id');
+                    navItems.forEach(item => {
+                        item.classList.remove('active');
+                        if (item.getAttribute('href') === '#' + id) {
+                            item.classList.add('active');
+                        }
+                    });
+                }
+            });
+        }, observerOptions);
+        
+        sections.forEach(section => observer.observe(section));
+        
+        // Scroll to top button
+        const scrollBtn = document.createElement('button');
+        scrollBtn.className = 'scroll-top';
+        scrollBtn.innerHTML = '↑';
+        scrollBtn.title = 'Scroll to top';
+        scrollBtn.onclick = () => window.scrollTo({top: 0, behavior: 'smooth'});
+        document.body.appendChild(scrollBtn);
+        
+        window.addEventListener('scroll', () => {
+            if (window.scrollY > 300) {
+                scrollBtn.classList.add('visible');
+            } else {
+                scrollBtn.classList.remove('visible');
+            }
         });
     </script>
 </body>
@@ -5262,6 +6895,506 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self._shared_data["kubectl_cache"][cmd] = output
         return output
 
+    def collect_cluster_statistics(self):
+        """
+        Collect comprehensive cluster statistics for reporting.
+
+        Gathers counts for all major Kubernetes resource types:
+        - Workloads: Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Pods
+        - Networking: Services, Ingresses, Endpoints, NetworkPolicies
+        - Storage: PVCs, PVs, StorageClasses
+        - Configuration: ConfigMaps, Secrets
+        - RBAC: Roles, RoleBindings, ClusterRoles, ClusterRoleBindings, ServiceAccounts
+        - Infrastructure: Nodes, Namespaces
+
+        Returns:
+            dict: Cluster statistics with counts and health indicators
+        """
+        self.progress.step("Collecting cluster statistics...")
+
+        statistics = {
+            "workloads": {},
+            "networking": {},
+            "storage": {},
+            "configuration": {},
+            "rbac": {},
+            "infrastructure": {},
+            "collection_timestamp": TimezoneManager.to_iso_string(TimezoneManager.now_utc()),
+        }
+
+        try:
+            # === Infrastructure Statistics ===
+            # Namespaces
+            ns_output = self.safe_kubectl_call("kubectl get namespaces -o json")
+            if ns_output:
+                try:
+                    ns_data = json.loads(ns_output)
+                    namespaces = ns_data.get("items", [])
+                    statistics["infrastructure"]["namespaces"] = len(namespaces)
+                    statistics["infrastructure"]["namespace_list"] = [
+                        ns.get("metadata", {}).get("name") for ns in namespaces
+                    ]
+                except json.JSONDecodeError:
+                    pass
+
+            # Nodes
+            nodes_output = self.safe_kubectl_call("kubectl get nodes -o json")
+            if nodes_output:
+                try:
+                    nodes_data = json.loads(nodes_output)
+                    nodes = nodes_data.get("items", [])
+                    statistics["infrastructure"]["nodes"] = len(nodes)
+
+                    # Node conditions summary
+                    ready_nodes = 0
+                    not_ready_nodes = 0
+                    node_versions = set()
+                    node_types = {"ec2": 0, "fargate": 0}
+
+                    for node in nodes:
+                        conditions = node.get("status", {}).get("conditions", [])
+                        for cond in conditions:
+                            if cond.get("type") == "Ready":
+                                if cond.get("status") == "True":
+                                    ready_nodes += 1
+                                else:
+                                    not_ready_nodes += 1
+
+                        node_info = node.get("metadata", {}).get("labels", {})
+                        node_version = node_info.get("node.kubernetes.io/instance-type", "unknown")
+                        node_versions.add(node_version)
+
+                        # Detect Fargate nodes
+                        if "eks.amazonaws.com/compute-type" in node_info:
+                            if node_info["eks.amazonaws.com/compute-type"] == "fargate":
+                                node_types["fargate"] += 1
+                            else:
+                                node_types["ec2"] += 1
+                        else:
+                            node_types["ec2"] += 1
+
+                    statistics["infrastructure"]["nodes_ready"] = ready_nodes
+                    statistics["infrastructure"]["nodes_not_ready"] = not_ready_nodes
+                    statistics["infrastructure"]["node_instance_types"] = list(node_versions)
+                    statistics["infrastructure"]["node_compute_types"] = node_types
+
+                    # Kubelet versions
+                    kube_versions = set()
+                    for node in nodes:
+                        kv = node.get("status", {}).get("nodeInfo", {}).get("kubeletVersion", "unknown")
+                        kube_versions.add(kv)
+                    statistics["infrastructure"]["kubelet_versions"] = list(kube_versions)
+
+                except json.JSONDecodeError:
+                    pass
+
+            # === Workload Statistics ===
+            # Deployments
+            if self.namespace:
+                cmd = f"kubectl get deployments -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get deployments --all-namespaces -o json"
+            dep_output = self.safe_kubectl_call(cmd)
+            if dep_output:
+                try:
+                    dep_data = json.loads(dep_output)
+                    deployments = dep_data.get("items", [])
+                    statistics["workloads"]["deployments"] = len(deployments)
+
+                    # Count by status
+                    healthy_deps = 0
+                    unhealthy_deps = 0
+                    for dep in deployments:
+                        conditions = dep.get("status", {}).get("conditions", [])
+                        progressing = False
+                        available = False
+                        for cond in conditions:
+                            if cond.get("type") == "Progressing" and cond.get("status") == "True":
+                                progressing = True
+                            if cond.get("type") == "Available" and cond.get("status") == "True":
+                                available = True
+                        if progressing and available:
+                            healthy_deps += 1
+                        else:
+                            unhealthy_deps += 1
+
+                    statistics["workloads"]["deployments_healthy"] = healthy_deps
+                    statistics["workloads"]["deployments_unhealthy"] = unhealthy_deps
+                except json.JSONDecodeError:
+                    pass
+
+            # StatefulSets
+            if self.namespace:
+                cmd = f"kubectl get statefulsets -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get statefulsets --all-namespaces -o json"
+            sts_output = self.safe_kubectl_call(cmd)
+            if sts_output:
+                try:
+                    sts_data = json.loads(sts_output)
+                    statefulsets = sts_data.get("items", [])
+                    statistics["workloads"]["statefulsets"] = len(statefulsets)
+
+                    ready_sts = 0
+                    for sts in statefulsets:
+                        replicas = sts.get("status", {}).get("replicas", 0)
+                        ready = sts.get("status", {}).get("readyReplicas", 0)
+                        if replicas == ready:
+                            ready_sts += 1
+                    statistics["workloads"]["statefulsets_ready"] = ready_sts
+                except json.JSONDecodeError:
+                    pass
+
+            # DaemonSets
+            if self.namespace:
+                cmd = f"kubectl get daemonsets -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get daemonsets --all-namespaces -o json"
+            ds_output = self.safe_kubectl_call(cmd)
+            if ds_output:
+                try:
+                    ds_data = json.loads(ds_output)
+                    daemonsets = ds_data.get("items", [])
+                    statistics["workloads"]["daemonsets"] = len(daemonsets)
+                except json.JSONDecodeError:
+                    pass
+
+            # Jobs
+            if self.namespace:
+                cmd = f"kubectl get jobs -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get jobs --all-namespaces -o json"
+            jobs_output = self.safe_kubectl_call(cmd)
+            if jobs_output:
+                try:
+                    jobs_data = json.loads(jobs_output)
+                    jobs = jobs_data.get("items", [])
+                    statistics["workloads"]["jobs"] = len(jobs)
+
+                    completed_jobs = sum(1 for j in jobs if j.get("status", {}).get("succeeded"))
+                    failed_jobs = sum(1 for j in jobs if j.get("status", {}).get("failed"))
+                    running_jobs = len(jobs) - completed_jobs - failed_jobs
+
+                    statistics["workloads"]["jobs_completed"] = completed_jobs
+                    statistics["workloads"]["jobs_failed"] = failed_jobs
+                    statistics["workloads"]["jobs_running"] = running_jobs
+                except json.JSONDecodeError:
+                    pass
+
+            # CronJobs
+            if self.namespace:
+                cmd = f"kubectl get cronjobs -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get cronjobs --all-namespaces -o json"
+            cj_output = self.safe_kubectl_call(cmd)
+            if cj_output:
+                try:
+                    cj_data = json.loads(cj_output)
+                    cronjobs = cj_data.get("items", [])
+                    statistics["workloads"]["cronjobs"] = len(cronjobs)
+                except json.JSONDecodeError:
+                    pass
+
+            # ReplicaSets
+            if self.namespace:
+                cmd = f"kubectl get replicasets -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get replicasets --all-namespaces -o json"
+            rs_output = self.safe_kubectl_call(cmd)
+            if rs_output:
+                try:
+                    rs_data = json.loads(rs_output)
+                    replicasets = rs_data.get("items", [])
+                    statistics["workloads"]["replicasets"] = len(replicasets)
+                except json.JSONDecodeError:
+                    pass
+
+            # Pods
+            if self.namespace:
+                cmd = f"kubectl get pods -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get pods --all-namespaces -o json"
+            pods_output = self.safe_kubectl_call(cmd)
+            if pods_output:
+                try:
+                    pods_data = json.loads(pods_output)
+                    pods = pods_data.get("items", [])
+                    statistics["workloads"]["pods"] = len(pods)
+
+                    # Count by phase
+                    phases = {"Running": 0, "Pending": 0, "Succeeded": 0, "Failed": 0, "Unknown": 0}
+                    restart_count = 0
+
+                    for pod in pods:
+                        phase = pod.get("status", {}).get("phase", "Unknown")
+                        if phase in phases:
+                            phases[phase] += 1
+
+                        # Sum restart counts
+                        for cs in pod.get("status", {}).get("containerStatuses", []):
+                            restart_count += cs.get("restartCount", 0)
+
+                    statistics["workloads"]["pods_running"] = phases["Running"]
+                    statistics["workloads"]["pods_pending"] = phases["Pending"]
+                    statistics["workloads"]["pods_succeeded"] = phases["Succeeded"]
+                    statistics["workloads"]["pods_failed"] = phases["Failed"]
+                    statistics["workloads"]["pods_unknown"] = phases["Unknown"]
+                    statistics["workloads"]["total_container_restarts"] = restart_count
+                except json.JSONDecodeError:
+                    pass
+
+            # === Networking Statistics ===
+            # Services
+            if self.namespace:
+                cmd = f"kubectl get services -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get services --all-namespaces -o json"
+            svc_output = self.safe_kubectl_call(cmd)
+            if svc_output:
+                try:
+                    svc_data = json.loads(svc_output)
+                    services = svc_data.get("items", [])
+                    statistics["networking"]["services"] = len(services)
+
+                    # Count by type
+                    svc_types = {"ClusterIP": 0, "NodePort": 0, "LoadBalancer": 0, "ExternalName": 0}
+                    for svc in services:
+                        svc_type = svc.get("spec", {}).get("type", "ClusterIP")
+                        if svc_type in svc_types:
+                            svc_types[svc_type] += 1
+
+                    statistics["networking"]["services_clusterip"] = svc_types["ClusterIP"]
+                    statistics["networking"]["services_nodeport"] = svc_types["NodePort"]
+                    statistics["networking"]["services_loadbalancer"] = svc_types["LoadBalancer"]
+                except json.JSONDecodeError:
+                    pass
+
+            # Ingresses
+            if self.namespace:
+                cmd = f"kubectl get ingresses -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get ingresses --all-namespaces -o json"
+            ing_output = self.safe_kubectl_call(cmd)
+            if ing_output:
+                try:
+                    ing_data = json.loads(ing_output)
+                    ingresses = ing_data.get("items", [])
+                    statistics["networking"]["ingresses"] = len(ingresses)
+                except json.JSONDecodeError:
+                    pass
+
+            # NetworkPolicies
+            if self.namespace:
+                cmd = f"kubectl get networkpolicies -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get networkpolicies --all-namespaces -o json"
+            np_output = self.safe_kubectl_call(cmd)
+            if np_output:
+                try:
+                    np_data = json.loads(np_output)
+                    netpols = np_data.get("items", [])
+                    statistics["networking"]["networkpolicies"] = len(netpols)
+                except json.JSONDecodeError:
+                    pass
+
+            # Endpoints
+            if self.namespace:
+                cmd = f"kubectl get endpoints -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get endpoints --all-namespaces -o json"
+            ep_output = self.safe_kubectl_call(cmd)
+            if ep_output:
+                try:
+                    ep_data = json.loads(ep_output)
+                    endpoints = ep_data.get("items", [])
+                    statistics["networking"]["endpoints"] = len(endpoints)
+
+                    # Count endpoints with no addresses
+                    empty_endpoints = 0
+                    for ep in endpoints:
+                        subsets = ep.get("subsets", [])
+                        has_addresses = False
+                        for subset in subsets:
+                            if subset.get("addresses"):
+                                has_addresses = True
+                                break
+                        if not has_addresses:
+                            empty_endpoints += 1
+
+                    statistics["networking"]["endpoints_empty"] = empty_endpoints
+                except json.JSONDecodeError:
+                    pass
+
+            # === Storage Statistics ===
+            # PVCs
+            if self.namespace:
+                cmd = f"kubectl get pvc -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get pvc --all-namespaces -o json"
+            pvc_output = self.safe_kubectl_call(cmd)
+            if pvc_output:
+                try:
+                    pvc_data = json.loads(pvc_output)
+                    pvcs = pvc_data.get("items", [])
+                    statistics["storage"]["pvcs"] = len(pvcs)
+
+                    # Count by phase
+                    phases = {"Bound": 0, "Pending": 0, "Lost": 0}
+                    for pvc in pvcs:
+                        phase = pvc.get("status", {}).get("phase", "Unknown")
+                        if phase in phases:
+                            phases[phase] += 1
+
+                    statistics["storage"]["pvcs_bound"] = phases["Bound"]
+                    statistics["storage"]["pvcs_pending"] = phases["Pending"]
+                    statistics["storage"]["pvcs_lost"] = phases["Lost"]
+                except json.JSONDecodeError:
+                    pass
+
+            # PVs
+            pv_output = self.safe_kubectl_call("kubectl get pv -o json")
+            if pv_output:
+                try:
+                    pv_data = json.loads(pv_output)
+                    pvs = pv_data.get("items", [])
+                    statistics["storage"]["pvs"] = len(pvs)
+                except json.JSONDecodeError:
+                    pass
+
+            # StorageClasses
+            sc_output = self.safe_kubectl_call("kubectl get storageclasses -o json")
+            if sc_output:
+                try:
+                    sc_data = json.loads(sc_output)
+                    storageclasses = sc_data.get("items", [])
+                    statistics["storage"]["storageclasses"] = len(storageclasses)
+
+                    # Default storage class
+                    default_sc = None
+                    for sc in storageclasses:
+                        annotations = sc.get("metadata", {}).get("annotations", {})
+                        if annotations.get("storageclass.kubernetes.io/is-default-class") == "true":
+                            default_sc = sc.get("metadata", {}).get("name")
+                            break
+                    statistics["storage"]["default_storageclass"] = default_sc
+                except json.JSONDecodeError:
+                    pass
+
+            # === Configuration Statistics ===
+            # ConfigMaps
+            if self.namespace:
+                cmd = f"kubectl get configmaps -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get configmaps --all-namespaces -o json"
+            cm_output = self.safe_kubectl_call(cmd)
+            if cm_output:
+                try:
+                    cm_data = json.loads(cm_output)
+                    configmaps = cm_data.get("items", [])
+                    statistics["configuration"]["configmaps"] = len(configmaps)
+                except json.JSONDecodeError:
+                    pass
+
+            # Secrets
+            if self.namespace:
+                cmd = f"kubectl get secrets -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get secrets --all-namespaces -o json"
+            sec_output = self.safe_kubectl_call(cmd)
+            if sec_output:
+                try:
+                    sec_data = json.loads(sec_output)
+                    secrets = sec_data.get("items", [])
+                    statistics["configuration"]["secrets"] = len(secrets)
+
+                    # Count by type
+                    secret_types = {}
+                    for secret in secrets:
+                        stype = secret.get("type", "Unknown")
+                        secret_types[stype] = secret_types.get(stype, 0) + 1
+                    statistics["configuration"]["secrets_by_type"] = secret_types
+                except json.JSONDecodeError:
+                    pass
+
+            # === RBAC Statistics ===
+            # ServiceAccounts
+            if self.namespace:
+                cmd = f"kubectl get serviceaccounts -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get serviceaccounts --all-namespaces -o json"
+            sa_output = self.safe_kubectl_call(cmd)
+            if sa_output:
+                try:
+                    sa_data = json.loads(sa_output)
+                    serviceaccounts = sa_data.get("items", [])
+                    statistics["rbac"]["serviceaccounts"] = len(serviceaccounts)
+                except json.JSONDecodeError:
+                    pass
+
+            # Roles
+            if self.namespace:
+                cmd = f"kubectl get roles -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get roles --all-namespaces -o json"
+            roles_output = self.safe_kubectl_call(cmd)
+            if roles_output:
+                try:
+                    roles_data = json.loads(roles_output)
+                    roles = roles_data.get("items", [])
+                    statistics["rbac"]["roles"] = len(roles)
+                except json.JSONDecodeError:
+                    pass
+
+            # RoleBindings
+            if self.namespace:
+                cmd = f"kubectl get rolebindings -n {self.namespace} -o json"
+            else:
+                cmd = "kubectl get rolebindings --all-namespaces -o json"
+            rb_output = self.safe_kubectl_call(cmd)
+            if rb_output:
+                try:
+                    rb_data = json.loads(rb_output)
+                    rolebindings = rb_data.get("items", [])
+                    statistics["rbac"]["rolebindings"] = len(rolebindings)
+                except json.JSONDecodeError:
+                    pass
+
+            # ClusterRoles
+            cr_output = self.safe_kubectl_call("kubectl get clusterroles -o json")
+            if cr_output:
+                try:
+                    cr_data = json.loads(cr_output)
+                    clusterroles = cr_data.get("items", [])
+                    statistics["rbac"]["clusterroles"] = len(clusterroles)
+                except json.JSONDecodeError:
+                    pass
+
+            # ClusterRoleBindings
+            crb_output = self.safe_kubectl_call("kubectl get clusterrolebindings -o json")
+            if crb_output:
+                try:
+                    crb_data = json.loads(crb_output)
+                    clusterrolebindings = crb_data.get("items", [])
+                    statistics["rbac"]["clusterrolebindings"] = len(clusterrolebindings)
+                except json.JSONDecodeError:
+                    pass
+
+            # Store in shared data for use by other methods
+            with self._shared_data_lock:
+                self._shared_data["cluster_statistics"] = statistics
+
+            self.progress.info(
+                f"Collected statistics: {statistics['infrastructure'].get('namespaces', 0)} namespaces, "
+                f"{statistics['infrastructure'].get('nodes', 0)} nodes, "
+                f"{statistics['workloads'].get('pods', 0)} pods"
+            )
+
+        except Exception as e:
+            self.errors.append({"step": "collect_cluster_statistics", "message": str(e)})
+            self.progress.warning(f"Cluster statistics collection failed: {e}")
+
+        return statistics
+
     # === Helper Methods ===
 
     def _run_kubectl_command(self, cmd_parts: list, timeout: int) -> tuple[bool, str]:
@@ -5330,34 +7463,27 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     return self._shared_data["kubectl_cache"][cmd]
 
         # Parse shell fallback patterns: "cmd1 || cmd2 || echo 'fallback'"
-        # Split on || but be careful about quotes
+        # Use shlex for robust quote handling
         commands = []
-        current = []
-        in_quote = None
-        parts = cmd.split()
-
-        for i, part in enumerate(parts):
-            if part == "||" and not in_quote:
-                if current:
-                    commands.append(" ".join(current))
-                    current = []
-            else:
-                # Track quote state - only enter quote mode if quotes are unbalanced
-                if "'" in part or '"' in part:
-                    if in_quote is None:
-                        # Only enter quote mode if this part has unbalanced quotes
-                        single_count = part.count("'")
-                        double_count = part.count('"')
-                        if single_count % 2 == 1:
-                            in_quote = "'"
-                        elif double_count % 2 == 1:
-                            in_quote = '"'
-                    elif part.count(in_quote) % 2 == 1:
-                        in_quote = None
-                current.append(part)
-
-        if current:
-            commands.append(" ".join(current))
+        try:
+            # shlex.split handles quotes properly, preserving || as separate tokens
+            tokens = shlex.split(cmd, posix=True)
+            current_cmd = []
+            for token in tokens:
+                if token == "||":
+                    if current_cmd:
+                        # Rejoin the command parts, preserving quoting
+                        commands.append(" ".join(current_cmd))
+                        current_cmd = []
+                else:
+                    current_cmd.append(
+                        shlex.quote(token) if " " in token or any(c in token for c in ['"', "'", "|", "&"]) else token
+                    )
+            if current_cmd:
+                commands.append(" ".join(current_cmd))
+        except ValueError:
+            # Fallback to simple split if shlex fails (e.g., unmatched quotes)
+            commands = [cmd]
 
         # Try each command in sequence until one succeeds
         output = None
@@ -9818,6 +11944,58 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     "critical_threshold": 0.9,
                     "description": "NLB Limit",
                 },
+                # EKS-specific quotas
+                {
+                    "service_code": "eks",
+                    "quota_name": "Clusters per Region",
+                    "quota_code": "L-40443383",
+                    "critical_threshold": 0.9,
+                    "description": "EKS Cluster Limit (default 100)",
+                },
+                {
+                    "service_code": "eks",
+                    "quota_name": "Managed Node Groups per Region",
+                    "quota_code": "L-E4B64F1",
+                    "critical_threshold": 0.8,
+                    "description": "EKS Node Group Limit (default 50 per cluster)",
+                },
+                {
+                    "service_code": "eks",
+                    "quota_name": "Fargate Profiles per Region",
+                    "quota_code": "L-257B8270",
+                    "critical_threshold": 0.8,
+                    "description": "Fargate Profile Limit (default 10 per cluster)",
+                },
+                {
+                    "service_code": "eks",
+                    "quota_name": "Control Plane Logs per Cluster",
+                    "quota_code": "L-8B8BE31",
+                    "critical_threshold": 0.9,
+                    "description": "Control Plane Log Streams Limit",
+                },
+                # IAM quotas
+                {
+                    "service_code": "iam",
+                    "quota_name": "Roles per Account",
+                    "quota_code": "L-F55C99B4",
+                    "critical_threshold": 0.9,
+                    "description": "IAM Role Limit",
+                },
+                # CloudWatch quotas
+                {
+                    "service_code": "logs",
+                    "quota_name": "Log groups per Region",
+                    "quota_code": "L-6B96592D",
+                    "critical_threshold": 0.9,
+                    "description": "CloudWatch Log Group Limit",
+                },
+                {
+                    "service_code": "logs",
+                    "quota_name": "Metric filters per Region",
+                    "quota_code": "L-A5959CE79",
+                    "critical_threshold": 0.9,
+                    "description": "CloudWatch Metric Filter Limit",
+                },
             ]
 
             for quota_check in quota_checks:
@@ -13844,6 +16022,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             except Exception as e:
                 self.progress.warning(f"Pre-fetch failed (will fetch on-demand): {e}")
 
+        # Collect cluster statistics
+        cluster_statistics = {}
+        try:
+            cluster_statistics = self.collect_cluster_statistics()
+        except Exception as e:
+            self.progress.warning(f"Cluster statistics collection failed: {e}")
+
         # Step 4-58: Run all analyses (graceful degradation)
         analysis_methods = [
             # Pod lifecycle & health
@@ -13941,6 +16126,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 "namespace": self.namespace if self.namespace else "all",
                 "version": VERSION,
             },
+            "cluster_statistics": cluster_statistics,
             "summary": self._generate_summary(),
             "findings": {k: v for k, v in self.findings.items() if v},
             "correlations": self.correlations,
@@ -14544,6 +16730,12 @@ Environment Variables:
     # Filtering options
     parser.add_argument("--namespace", help="Focus on specific Kubernetes namespace")
 
+    # Output options
+    parser.add_argument(
+        "--output-dir",
+        help="Directory to write output files (default: current directory)",
+    )
+
     # Performance options
     parser.add_argument(
         "--no-parallel",
@@ -14719,13 +16911,19 @@ def validate_and_parse_dates(args):
 # === SECTION 7: OUTPUT HANDLING ===
 
 
-def output_results(results, cluster_name: str, timezone_name: str = "UTC"):
+def output_results(results, cluster_name: str, timezone_name: str = "UTC", output_dir: str | None = None):
     """
     Output results as both HTML and LLM-JSON files.
 
     Generates two files:
     - {cluster_name}-eks-report-{timestamp}.html
     - {cluster_name}-eks-findings-{timestamp}.json
+
+    Args:
+        results: Analysis results dict
+        cluster_name: EKS cluster name
+        timezone_name: Timezone for metadata
+        output_dir: Optional directory for output files (default: current directory)
     """
 
     html_formatter = HTMLOutputFormatter()
@@ -14734,8 +16932,16 @@ def output_results(results, cluster_name: str, timezone_name: str = "UTC"):
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     safe_cluster_name = cluster_name.replace("_", "-").replace(".", "-").lower()
 
-    html_file = f"{safe_cluster_name}-eks-report-{timestamp}.html"
-    json_file = f"{safe_cluster_name}-eks-findings-{timestamp}.json"
+    html_filename = f"{safe_cluster_name}-eks-report-{timestamp}.html"
+    json_filename = f"{safe_cluster_name}-eks-findings-{timestamp}.json"
+
+    if output_dir:
+        os.makedirs(output_dir, mode=0o755, exist_ok=True)
+        html_file = os.path.join(output_dir, html_filename)
+        json_file = os.path.join(output_dir, json_filename)
+    else:
+        html_file = html_filename
+        json_file = json_filename
 
     # Add timezone to metadata
     results["metadata"]["timezone"] = timezone_name
@@ -14852,7 +17058,7 @@ def main():
         results = debugger.run_comprehensive_analysis()
 
         # Output results (always generates HTML + LLM-JSON)
-        output_results(results, args.cluster_name, args.timezone)
+        output_results(results, args.cluster_name, args.timezone, args.output_dir)
 
         # Exit with appropriate code
         sys.exit(get_exit_code(results))

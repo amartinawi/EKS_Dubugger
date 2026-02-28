@@ -865,7 +865,13 @@ class InputValidationError(EKSDebuggerError):
 
 
 class InsufficientPermissionsError(EKSDebuggerError):
-    """Missing required IAM permissions"""
+    """Raised when AWS permissions are insufficient for analysis"""
+
+    pass
+
+
+class OutputError(EKSDebuggerError):
+    """Raised when output file generation fails"""
 
     pass
 
@@ -17162,7 +17168,7 @@ def output_results(results, cluster_name: str, timezone_name: str = "UTC", outpu
     print()
 
     if not success:
-        sys.exit(2)
+        raise OutputError("Failed to write one or more report files")
 
     return html_file, json_file
 
@@ -17253,6 +17259,9 @@ def main():
     except KubectlNotAvailableError as e:
         progress.error(f"kubectl error: {e}")
         progress.error("Please ensure kubectl is installed and in your PATH")
+        sys.exit(2)
+    except OutputError as e:
+        progress.error(f"Output error: {e}")
         sys.exit(2)
     except KeyboardInterrupt:
         progress.error("\nAnalysis interrupted by user")

@@ -1553,14 +1553,17 @@ class ExecutiveSummaryGenerator:
     def _prioritize_actions(self, recommendations: list, findings: dict, correlations: list) -> list:
         """Prioritize recommended actions"""
         actions = []
+        seen_actions = set()  # Track action text to prevent duplicates
 
         # First, add actions from correlations (these are root cause based)
         for corr in correlations:
-            if corr.get("recommendation"):
+            action_text = corr.get("recommendation", "")
+            if action_text and action_text not in seen_actions:
+                seen_actions.add(action_text)
                 actions.append(
                     {
                         "priority": "high" if corr.get("severity") == "critical" else "medium",
-                        "action": corr.get("recommendation"),
+                        "action": action_text,
                         "category": corr.get("correlation_type", "correlation"),
                         "source": "Root Cause Analysis",
                         "aws_doc": corr.get("aws_doc"),
@@ -1569,19 +1572,22 @@ class ExecutiveSummaryGenerator:
 
         # Then add top recommendations
         for rec in recommendations[:5]:
-            priority = rec.get("priority", "medium")
-            if rec.get("critical_count", 0) > 0:
-                priority = "high"
+            action_text = rec.get("action", "")
+            if action_text and action_text not in seen_actions:
+                seen_actions.add(action_text)
+                priority = rec.get("priority", "medium")
+                if rec.get("critical_count", 0) > 0:
+                    priority = "high"
 
-            actions.append(
-                {
-                    "priority": priority,
-                    "action": rec.get("action"),
-                    "category": rec.get("category"),
-                    "source": "Recommendation",
-                    "aws_doc": rec.get("aws_doc"),
-                }
-            )
+                actions.append(
+                    {
+                        "priority": priority,
+                        "action": action_text,
+                        "category": rec.get("category"),
+                        "source": "Recommendation",
+                        "aws_doc": rec.get("aws_doc"),
+                    }
+                )
 
         # Sort by priority
         priority_order = {"high": 0, "medium": 1, "low": 2}
@@ -2981,70 +2987,84 @@ class HTMLOutputFormatter(OutputFormatter):
         category_info = {
             "memory_pressure": {
                 "icon": "💾",
+                "title": "Memory Pressure",
                 "source": "CloudWatch Metrics + kubectl",
                 "color": "#ff6b6b",
             },
             "disk_pressure": {
                 "icon": "💿",
+                "title": "Disk Pressure",
                 "source": "CloudWatch Metrics + kubectl",
                 "color": "#ff9f43",
             },
             "pod_errors": {
                 "icon": "🔴",
+                "title": "Pod Errors",
                 "source": "kubectl events",
                 "color": "#ee5a24",
             },
             "node_issues": {
                 "icon": "🖥️",
+                "title": "Node Issues",
                 "source": "kubectl + EKS API",
                 "color": "#9b59b6",
             },
             "oom_killed": {
                 "icon": "💥",
+                "title": "OOM Killed",
                 "source": "kubectl events + pod status",
                 "color": "#c0392b",
             },
             "control_plane_issues": {
                 "icon": "⚙️",
+                "title": "Control Plane Issues",
                 "source": "CloudWatch Logs",
                 "color": "#34495e",
             },
             "scheduling_failures": {
                 "icon": "📅",
+                "title": "Scheduling Failures",
                 "source": "kubectl events",
                 "color": "#f39c12",
             },
             "network_issues": {
                 "icon": "🌐",
+                "title": "Network Issues",
                 "source": "kubectl events + VPC-CNI",
                 "color": "#00cec9",
             },
             "rbac_issues": {
                 "icon": "🔒",
+                "title": "RBAC Issues",
                 "source": "kubectl events + audit logs",
                 "color": "#6c5ce7",
             },
             "image_pull_failures": {
                 "icon": "📦",
+                "title": "Image Pull Failures",
                 "source": "kubectl events",
                 "color": "#fd79a8",
             },
             "resource_quota_exceeded": {
                 "icon": "📊",
+                "title": "Resource Quota Exceeded",
                 "source": "kubectl resourcequotas",
                 "color": "#e17055",
             },
             "pvc_issues": {
                 "icon": "💾",
+                "title": "PVC Issues",
                 "source": "kubectl pvc + EBS CSI",
                 "color": "#74b9ff",
             },
             "dns_issues": {
                 "icon": "🔍",
+                "title": "DNS Issues",
                 "source": "kubectl pods (CoreDNS)",
                 "color": "#a29bfe",
             },
-            "addon_issues": {"icon": "🔌", "source": "EKS API", "color": "#55a3ff"},
+            "addon_issues": {"icon": "🔌", "title": "Addon Issues", "source": "EKS API", "color": "#55a3ff"},
+            "quota_issues": {"icon": "📊", "title": "Quota Issues", "source": "Service Quotas API", "color": "#e17055"},
         }
 
         html = f"""<!DOCTYPE html>
@@ -5760,11 +5780,23 @@ class HTMLOutputFormatter(OutputFormatter):
                 <a href="#executive-summary" class="nav-item">
                     <span>📋 Executive Summary</span>
                 </a>
-                <a href="#sources" class="nav-item">
-                    <span>📡 Data Sources</span>
+ """
+
+        # What Happened should appear early in nav (after exec summary) to match content order
+        if correlations or first_issue:
+            html += f"""
+                <a href="#what-happened" class="nav-item">
+                    <span>📖 What Happened</span>
+                    <span class="nav-count has-issues">{len(correlations)}</span>
                 </a>
+"""
+
+        html += f"""
                 <a href="#cluster-statistics" class="nav-item">
                     <span>📊 Cluster Statistics</span>
+                </a>
+                <a href="#sources" class="nav-item">
+                    <span>📡 Data Sources</span>
                 </a>
                 
                 <div class="nav-section">Findings</div>
@@ -5772,25 +5804,16 @@ class HTMLOutputFormatter(OutputFormatter):
                     <span>📋 All Findings</span>
                     <span class="nav-count {"has-issues" if summary["total_issues"] > 0 else ""}">{summary["total_issues"]}</span>
                 </a>
-"""
+ """
 
         for cat, items in findings.items():
             if items:
-                cat_title = cat.replace("_", " ").title()
+                cat_title = category_info.get(cat, {}).get("title", cat.replace("_", " ").title())
                 cat_icon = category_info.get(cat, {}).get("icon", "📋")
                 html += f"""
                 <a href="#{cat}" class="nav-item">
                     <span>{cat_icon} {cat_title}</span>
                     <span class="nav-count {"has-issues" if len(items) > 0 else ""}">{len(items)}</span>
-                </a>
-"""
-
-        # Unified What Happened navigation (consolidates correlations + first_issue)
-        if correlations or first_issue:
-            html += f"""
-                <a href="#what-happened" class="nav-item">
-                    <span>📖 What Happened</span>
-                    <span class="nav-count has-issues">{len(correlations)}</span>
                 </a>
 """
 
@@ -5995,8 +6018,16 @@ class HTMLOutputFormatter(OutputFormatter):
 
             for cat, items in findings.items():
                 if items:
-                    cat_info = category_info.get(cat, {"icon": "📋", "source": "Auto-detected", "color": "#666"})
-                    cat_title = cat.replace("_", " ").title()
+                    cat_info = category_info.get(
+                        cat,
+                        {
+                            "icon": "📋",
+                            "source": "Auto-detected",
+                            "color": "#666",
+                            "title": cat.replace("_", " ").title(),
+                        },
+                    )
+                    cat_title = cat_info.get("title", cat.replace("_", " ").title())
 
                     for idx, item in enumerate(items):
                         item_severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
@@ -6057,8 +6088,11 @@ class HTMLOutputFormatter(OutputFormatter):
 
         for cat, items in findings.items():
             if items:
-                cat_info = category_info.get(cat, {"icon": "📋", "source": "Auto-detected", "color": "#666"})
-                cat_title = cat.replace("_", " ").title()
+                cat_info = category_info.get(
+                    cat,
+                    {"icon": "📋", "source": "Auto-detected", "color": "#666", "title": cat.replace("_", " ").title()},
+                )
+                cat_title = cat_info.get("title", cat.replace("_", " ").title())
 
                 severities = [
                     self._classify_severity(item.get("summary", ""), item.get("details", {})) for item in items
@@ -6255,9 +6289,16 @@ class HTMLOutputFormatter(OutputFormatter):
 """
 
                 if rec.get("aws_doc"):
+                    doc_url = rec["aws_doc"]
+                    if "kubernetes.io" in doc_url:
+                        doc_label = "View Kubernetes Documentation"
+                    elif "aws.amazon.com" in doc_url or "repost.aws" in doc_url:
+                        doc_label = "View AWS Documentation"
+                    else:
+                        doc_label = "View Documentation"
                     html += f'''
-                        <a href="{self._escape_html(rec["aws_doc"])}" class="rec-link" target="_blank">
-                            📚 View AWS Documentation →
+                        <a href="{self._escape_html(doc_url)}" class="rec-link" target="_blank">
+                            📚 {doc_label} →
                         </a>
 '''
                 html += """
@@ -11132,7 +11173,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             if category == "healthy_components":
                 continue
             for finding in findings_list:
-                sev = finding.get("severity", "info")
+                sev = finding.get("details", {}).get("severity", "info")
                 if sev == "critical":
                     critical_count += 1
                 elif sev == "warning":
@@ -16710,9 +16751,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     }
                 )
 
-        # Sort by priority
+        # Sort by: 1) correlation-based first (explains root cause), 2) priority, 3) critical count
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-        recommendations.sort(key=lambda x: priority_order.get(x.get("priority", "info"), 4))
+
+        def sort_key(rec):
+            is_corr = 0 if rec.get("is_correlation") else 1  # Correlations first
+            priority = priority_order.get(rec.get("priority", "info"), 4)
+            critical_count = (
+                rec.get("evidence", {}).get("critical_count", 0) if isinstance(rec.get("evidence"), dict) else 0
+            )
+            return (is_corr, priority, -critical_count)  # Negative for descending
+
+        recommendations.sort(key=sort_key)
 
         return recommendations
 

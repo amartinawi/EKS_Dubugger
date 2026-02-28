@@ -1531,10 +1531,12 @@ class ExecutiveSummaryGenerator:
         total_offline = len(services_offline)
         if total_offline >= 5:
             impact_level = "critical"
-            impact_message = f"{total_offline} services are offline - likely impacting user traffic"
+            impact_message = (
+                f"{total_offline} internal monitoring services have no endpoints — observability stack degraded"
+            )
         elif total_offline >= 2:
             impact_level = "warning"
-            impact_message = f"{total_offline} services have no endpoints - may be impacting users"
+            impact_message = f"{total_offline} services have no endpoints — check if user-facing or internal"
         elif total_offline == 1:
             impact_level = "warning"
             impact_message = "1 service has no endpoints"
@@ -2077,7 +2079,7 @@ class HTMLOutputFormatter(OutputFormatter):
 
         return "\n".join(html_parts)
 
-    def _generate_executive_summary_html(self, exec_summary: dict) -> str:
+    def _generate_executive_summary_html(self, exec_summary: dict, cluster_stats: dict | None = None) -> str:
         """Generate HTML for the Executive Summary section with Phase 1 & 2 enhancements"""
         health = exec_summary.get("health_status", {})
         first_issue = exec_summary.get("first_issue")
@@ -2088,6 +2090,16 @@ class HTMLOutputFormatter(OutputFormatter):
         affected = exec_summary.get("affected_resources", {})
         categories = exec_summary.get("category_breakdown", [])
         healthy_components = exec_summary.get("healthy_components", [])
+
+        # Get totals from cluster_statistics if available, otherwise use affected counts
+        infra_stats = cluster_stats.get("infrastructure", {}) if cluster_stats else {}
+        workload_stats = cluster_stats.get("workloads", {}) if cluster_stats else {}
+        networking_stats = cluster_stats.get("networking", {}) if cluster_stats else {}
+
+        total_pods = workload_stats.get("pods", affected.get("pods_affected", 0))
+        total_nodes = infra_stats.get("nodes", affected.get("nodes_affected", 0))
+        total_namespaces = infra_stats.get("namespaces", affected.get("namespaces_affected", 0))
+        services_no_endpoints = networking_stats.get("endpoints_empty", affected.get("services_offline_count", 0))
 
         # Phase 2 additions
         trend = exec_summary.get("trend")
@@ -2146,20 +2158,20 @@ class HTMLOutputFormatter(OutputFormatter):
                             <div class="glance-label">Warnings</div>
                         </div>
                         <div class="glance-stat">
-                            <div class="glance-value">{affected.get("pods_affected", 0)}</div>
+                            <div class="glance-value">{total_pods}</div>
                             <div class="glance-label">Pods</div>
                         </div>
                         <div class="glance-stat">
-                            <div class="glance-value">{affected.get("nodes_affected", 0)}</div>
+                            <div class="glance-value">{total_nodes}</div>
                             <div class="glance-label">Nodes</div>
                         </div>
                         <div class="glance-stat">
-                            <div class="glance-value">{affected.get("namespaces_affected", 0)}</div>
+                            <div class="glance-value">{total_namespaces}</div>
                             <div class="glance-label">Namespaces</div>
                         </div>
                         <div class="glance-stat">
-                            <div class="glance-value">{external_impact.get("services_offline_count", 0)}</div>
-                            <div class="glance-label">Services Offline</div>
+                            <div class="glance-value">{services_no_endpoints}</div>
+                            <div class="glance-label">No Endpoints</div>
                         </div>
                     </div>
         """
@@ -2245,10 +2257,12 @@ class HTMLOutputFormatter(OutputFormatter):
             """
             for ns in top_namespaces[:5]:
                 escaped_ns_name = self._escape_html(ns.get("name", "unknown"))
+                ns_count = ns.get("count", 0)
+                issue_label = "issue" if ns_count == 1 else "issues"
                 html += f"""
                                 <div class="namespace-item">
                                     <span class="namespace-name">{escaped_ns_name}</span>
-                                    <span class="namespace-count">{ns.get("count", 0)} issues</span>
+                                    <span class="namespace-count">{ns_count} {issue_label}</span>
                                 </div>
                 """
             html += """
@@ -2507,7 +2521,7 @@ class HTMLOutputFormatter(OutputFormatter):
             for cat in categories[:8]:
                 width = (cat.get("count", 0) / max_count * 100) if max_count > 0 else 0
                 fill_class = (
-                    "critical" if cat.get("critical", 0) > 0 else "warning" if cat.get("warning", 0) > 0 else ""
+                    "critical" if cat.get("critical", 0) > 0 else "warning" if cat.get("warning", 0) > 0 else "info"
                 )
                 html += f"""
                             <div class="category-bar">
@@ -2595,7 +2609,7 @@ class HTMLOutputFormatter(OutputFormatter):
                     <h4 style="margin: 1.5rem 0 0.75rem 0; color: var(--primary);">📅 Timeline</h4>
                     <div class="story-timeline" style="border-left: 2px solid var(--border); padding-left: 1rem;">
 """
-            for event in incident_story["timeline"][:12]:
+            for event in incident_story["timeline"][:20]:
                 sev = event.get("severity", "info")
                 sev_color = "#ef4444" if sev == "critical" else ("#f59e0b" if sev == "warning" else "#6b7280")
                 html += f"""
@@ -4484,10 +4498,12 @@ class HTMLOutputFormatter(OutputFormatter):
         .category-bar-fill {{
             height: 100%;
             border-radius: 4px;
+            background: #6b7280;
         }}
         
         .category-bar-fill.critical {{ background: var(--critical); }}
         .category-bar-fill.warning {{ background: var(--warning); }}
+        .category-bar-fill.info {{ background: #6b7280; }}
         
         .category-count {{
             font-size: 0.85rem;
@@ -5710,8 +5726,8 @@ class HTMLOutputFormatter(OutputFormatter):
             .finding-expand {{ display: none; }}
             .nav-count {{ display: none; }}
             .summary-grid {{ grid-template-columns: 1fr; }}
-            .summary-card {{ break-inside: avoid; box-shadow: 0 1px solid #ddd; }}
-            .section-header {{ break-inside: avoid; box-shadow: 0 1px solid #ddd; }}
+            .summary-card {{ break-inside: avoid; border: 1px solid var(--border); }}
+            .section-header {{ break-inside: avoid; border: 1px solid var(--border); }}
             .finding-item {{ break-inside: avoid; page-break-inside: avoid; margin-bottom: 0.5rem; }}
         }}
         @page {{
@@ -5925,13 +5941,15 @@ class HTMLOutputFormatter(OutputFormatter):
         exec_summary_gen = ExecutiveSummaryGenerator()
         exec_summary = exec_summary_gen.generate(results)
 
-        html += self._generate_executive_summary_html(exec_summary)
+        # Get cluster statistics for At-a-Glance totals
+        cluster_stats = results.get("cluster_statistics", {})
+
+        html += self._generate_executive_summary_html(exec_summary, cluster_stats)
 
         # What Happened section (right after Executive Summary)
         html += self._generate_what_happened_html(results)
 
         # Cluster Statistics section
-        cluster_stats = results.get("cluster_statistics", {})
         if cluster_stats:
             html += self._generate_cluster_statistics_html(cluster_stats)
 
@@ -6303,7 +6321,7 @@ class HTMLOutputFormatter(OutputFormatter):
 
         for finding in all_findings_json:
             html += f"""
-                <div class="finding-item">
+                <div class="finding-item" data-severity="{finding["severity"]}">
                     <div class="finding-header">
                         <div class="finding-summary"><strong>{finding["category"]}:</strong> {finding["summary"]}</div>
                         <span class="severity-badge {finding["severity"]}">{finding["severity"]}</span>
@@ -11056,10 +11074,24 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         if not narrative_events:
             return "No significant issues detected during the analysis period."
 
-        # Count issues by severity
-        critical_count = sum(1 for e in narrative_events if e["severity"] == "critical")
-        warning_count = sum(1 for e in narrative_events if e["severity"] == "warning")
-        info_count = len(narrative_events) - critical_count - warning_count
+        # Count issues by severity from all findings (not just narrative events)
+        # This ensures the impact line matches the actual findings
+        total_critical = sum(len(v) for k, v in self.findings.items() if k not in ["healthy_components"])
+        critical_count = 0
+        warning_count = 0
+        info_count = 0
+
+        for category, findings_list in self.findings.items():
+            if category == "healthy_components":
+                continue
+            for finding in findings_list:
+                sev = finding.get("severity", "info")
+                if sev == "critical":
+                    critical_count += 1
+                elif sev == "warning":
+                    warning_count += 1
+                else:
+                    info_count += 1
 
         # Get time range
         if narrative_events:

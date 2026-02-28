@@ -199,6 +199,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 VERSION = "3.5.0"
+REPO_URL = "https://github.com/aws-samples/amazon-eks-troubleshooting-tools"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
 MAX_API_RETRIES = 3
@@ -6337,7 +6338,7 @@ class HTMLOutputFormatter(OutputFormatter):
             f"""
             <!-- Footer -->
             <footer class="page-footer">
-                <p>Generated with <a href="#" class="footer-link">EKS Comprehensive Debugger v{VERSION}</a></p>
+                <p>Generated with <a href="{REPO_URL}" class="footer-link" target="_blank" rel="noopener">EKS Comprehensive Debugger v{VERSION}</a></p>
                 <p>Analysis Date: {metadata["analysis_date"]}</p>
             </footer>
         </main>

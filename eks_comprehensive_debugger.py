@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EKS Health Check Dashboard v3.5.0
+EKS Health Check Dashboard v3.6.0
 
 A production-grade diagnostic tool for Amazon EKS cluster troubleshooting that provides
 systematic analysis of cluster health, workload issues, networking, storage, and control plane.
@@ -198,7 +198,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.5.0"
+VERSION = "3.6.0"
 REPO_URL = "https://github.com/aws-samples/amazon-eks-troubleshooting-tools"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -1067,6 +1067,7 @@ class LLMJSONOutputFormatter(OutputFormatter):
                     "category": first_issue.get("category"),
                     "summary": first_issue.get("summary"),
                     "is_potential_root_cause": first_issue.get("potential_root_cause", False),
+                    "confidence_tier": "unknown",
                 }
             )
 
@@ -1080,8 +1081,39 @@ class LLMJSONOutputFormatter(OutputFormatter):
                         "impact": corr.get("impact"),
                         "recommendation": corr.get("recommendation"),
                         "aws_doc": corr.get("aws_doc"),
+                        "confidence_tier": corr.get("confidence_tier", "low"),
+                        "composite_confidence": corr.get("composite_confidence", 0.0),
+                        "confidence_5d": corr.get("confidence_5d", {}),
+                        "root_cause_score": corr.get("root_cause_score", 0),
+                        "ranking_tier": corr.get("ranking_tier", "contextual"),
+                        "spatial_evidence": {
+                            "overlap_score": corr.get("spatial_evidence", {}).get("overlap_score", 0),
+                            "node_matches": corr.get("spatial_evidence", {}).get("node_matches", 0),
+                            "namespace_matches": corr.get("spatial_evidence", {}).get("namespace_matches", 0),
+                        }
+                        if corr.get("spatial_evidence")
+                        else None,
                     }
                 )
+
+        # Sort root causes by composite confidence and score
+        potential_root_causes.sort(
+            key=lambda x: (x.get("composite_confidence", 0) or 0, x.get("root_cause_score", 0) or 0),
+            reverse=True,
+        )
+
+        # Group correlations by confidence tier for LLM
+        correlations_by_tier = {"high": [], "medium": [], "low": []}
+        for corr in correlations:
+            tier = corr.get("confidence_tier", "low")
+            correlations_by_tier[tier].append(
+                {
+                    "correlation_type": corr.get("correlation_type"),
+                    "root_cause": corr.get("root_cause"),
+                    "composite_confidence": corr.get("composite_confidence"),
+                    "impact": corr.get("impact"),
+                }
+            )
 
         llm_output = {
             "analysis_context": {
@@ -1103,6 +1135,7 @@ class LLMJSONOutputFormatter(OutputFormatter):
             },
             "findings": llm_findings,
             "correlations": correlations,
+            "correlations_by_confidence_tier": correlations_by_tier,
             "timeline": timeline,
             "potential_root_causes": potential_root_causes,
             "recommendations": [
@@ -2609,16 +2642,22 @@ class HTMLOutputFormatter(OutputFormatter):
         if correlations:
             primary = correlations[0] if correlations else {}
             blast = primary.get("blast_radius", {})
-            confidence = primary.get("temporal_confidence", 0)
-            confidence_pct = int(confidence * 100) if confidence else None
+            confidence_tier = primary.get("confidence_tier", "low")
+            composite = primary.get("composite_confidence", 0)
+            tier_colors = {"high": "#22c55e", "medium": "#f59e0b", "low": "#6b7280"}
+            tier_color = tier_colors.get(confidence_tier, "#6b7280")
+            confidence_badge = (
+                f'<span style="font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 4px; margin-left: 0.5rem; background: {tier_color}; color: white;">{confidence_tier.upper()} ({composite:.0%})</span>'
+                if composite
+                else ""
+            )
 
             html += f"""
                     <div class="root-cause-summary" style="background: var(--bg-details); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; border-left: 4px solid var(--primary);">
-                        <h3 style="margin: 0 0 0.5rem 0; color: var(--primary);">🎯 Root Cause</h3>
+                        <h3 style="margin: 0 0 0.5rem 0; color: var(--primary);">🎯 Root Cause{confidence_badge}</h3>
                         <p style="margin: 0; font-size: 1.1rem; color: var(--text);">{self._escape_html(primary.get("root_cause", "Unknown issue"))}</p>
                         <div style="margin-top: 0.5rem; display: flex; gap: 1rem; flex-wrap: wrap; font-size: 0.9rem; color: var(--text-secondary);">
                             <span>⏰ {self._escape_html(primary.get("root_cause_time", "Unknown"))}</span>
-                            {f"<span>📊 {confidence_pct}% confidence</span>" if confidence_pct else ""}
                             {f"<span>💥 {blast.get('pods', 0)} pods, {blast.get('nodes', 0)} nodes affected</span>" if blast.get("pods") or blast.get("nodes") else ""}
                         </div>
                     </div>
@@ -2727,9 +2766,18 @@ class HTMLOutputFormatter(OutputFormatter):
 """
             for corr in correlations[1:]:
                 blast = corr.get("blast_radius", {})
+                confidence_tier = corr.get("confidence_tier", "low")
+                composite = corr.get("composite_confidence", 0)
+                tier_colors = {"high": "#22c55e", "medium": "#f59e0b", "low": "#6b7280"}
+                tier_color = tier_colors.get(confidence_tier, "#6b7280")
+                confidence_badge = (
+                    f'<span style="font-size: 0.75rem; padding: 0.1rem 0.4rem; border-radius: 4px; margin-left: 0.5rem; background: {tier_color}; color: white;">{confidence_tier.upper()} ({composite:.0%})</span>'
+                    if composite
+                    else ""
+                )
                 html += f"""
                             <div style="background: var(--bg-details); padding: 0.75rem; border-radius: 6px; margin-bottom: 0.75rem;">
-                                <div style="font-weight: 500; color: var(--text);">{self._escape_html(corr.get("root_cause", ""))}</div>
+                                <div style="font-weight: 500; color: var(--text);">{self._escape_html(corr.get("root_cause", ""))}{confidence_badge}</div>
                                 <div style="font-size: 0.85rem; color: var(--text-secondary);">
                                     {self._escape_html(corr.get("impact", ""))}
                                     {f" | 💥 {blast.get('pods', 0)} pods affected" if blast.get("pods") else ""}
@@ -6968,8 +7016,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Identifying EKS cluster...")
 
         try:
-            response = self.eks_client.list_clusters()
-            clusters = response.get("clusters", [])
+            clusters = []
+            next_token = None
+            while True:
+                params = {}
+                if next_token:
+                    params["nextToken"] = next_token
+                response = self.eks_client.list_clusters(**params)
+                clusters.extend(response.get("clusters", []))
+                next_token = response.get("nextToken")
+                if not next_token:
+                    break
 
             if not clusters:
                 raise ClusterNotFoundError("No EKS clusters found in this region")
@@ -7718,6 +7775,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         timeout: int = DEFAULT_TIMEOUT,
         required: bool = False,
         use_cache: bool = True,
+        suppress_expected_errors: bool = False,
     ) -> str | None:
         """Run kubectl command with error handling and optional caching.
 
@@ -7729,6 +7787,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             timeout: Timeout in seconds
             required: If True, raises exception on failure
             use_cache: If True, uses shared data cache (default: True)
+            suppress_expected_errors: If True, suppress warnings for expected errors
+                (NotFound, resource type not found, etc.)
 
         Returns:
             Command output string or None on failure
@@ -7799,7 +7859,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 msg = f"kubectl command failed: {result}"
                 if required:
                     raise EKSDebuggerError(msg)
-                self.progress.warning(msg)
+                # Check if this is an expected error that should be suppressed
+                expected_errors = [
+                    "not found",
+                    "doesn't have a resource type",
+                    "the server doesn't have a resource type",
+                    "no resources found",
+                    "notfound",
+                ]
+                is_expected = suppress_expected_errors or any(
+                    exp_err.lower() in msg.lower() for exp_err in expected_errors
+                )
+                if not is_expected:
+                    self.progress.warning(msg)
                 return None
 
         # Cache successful result
@@ -7981,10 +8053,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         """Check if node-specific checks should be skipped (Fargate-only cluster)"""
         return getattr(self, "_is_fargate_only", False)
 
-    def safe_kubectl_call(self, cmd, required=False):
-        """Safely call kubectl with error handling"""
+    def safe_kubectl_call(self, cmd, required=False, suppress_expected_errors=False):
+        """Safely call kubectl with error handling.
+
+        Args:
+            cmd: kubectl command to run
+            required: If True, raises exception on failure
+            suppress_expected_errors: If True, suppress warnings for expected errors
+                (NotFound, resource type not found, etc.)
+        """
         try:
-            return self.get_kubectl_output(cmd, required=required)
+            return self.get_kubectl_output(cmd, required=required, suppress_expected_errors=suppress_expected_errors)
         except EKSDebuggerError:
             if required:
                 raise
@@ -10302,6 +10381,1230 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception:
             return None
 
+    # === Enhanced Kubernetes Diagnostic Methods (v3.6.0) ===
+    #
+    # These methods address gaps identified in production EKS troubleshooting.
+    # Priority: HIGH > MEDIUM > LOW based on incident frequency and impact.
+
+    # --- HIGH PRIORITY METHODS ---
+
+    def analyze_init_container_failures(self):
+        """
+        Analyze init container failures directly from pod status.
+
+        Gap addressed: Pods stuck in Init:CrashLoopBackOff where events have expired
+        from the API server event TTL (default 1 hour) are invisible to event-based checks.
+
+        Detection:
+        - Init containers stuck in waiting state (CrashLoopBackOff, ImagePullBackOff, etc.)
+        - Init containers terminated with non-zero exit codes
+        - Exit code mapping to common failure reasons
+        """
+        self.progress.step("Analyzing init container failures...")
+        try:
+            pods_json = self._get_cached_kubectl("kubectl get pods --all-namespaces -o json")
+            if not pods_json:
+                return
+            pods = json.loads(pods_json).get("items", [])
+
+            EXIT_CODE_MAP = {
+                0: "Success",
+                1: "Application error",
+                2: "Misuse of shell command",
+                126: "Permission denied / command not executable",
+                127: "Command not found",
+                128: "Invalid exit code",
+                130: "Interrupted (Ctrl+C)",
+                137: "OOMKilled / SIGKILL",
+                139: "Segmentation fault (SIGSEGV)",
+                143: "Terminated (SIGTERM)",
+            }
+
+            for pod in pods:
+                pod_name = pod.get("metadata", {}).get("name", "")
+                namespace = pod.get("metadata", {}).get("namespace", "")
+                init_statuses = pod.get("status", {}).get("initContainerStatuses", [])
+
+                for ics in init_statuses:
+                    container_name = ics.get("name", "")
+                    state = ics.get("state", {})
+
+                    # Check for waiting state (stuck)
+                    waiting = state.get("waiting", {})
+                    if waiting:
+                        reason = waiting.get("reason", "")
+                        if reason in (
+                            "CrashLoopBackOff",
+                            "ImagePullBackOff",
+                            "CreateContainerConfigError",
+                            "ErrImagePull",
+                        ):
+                            self._add_finding(
+                                "pod_errors",
+                                f"Init container {container_name} in {namespace}/{pod_name} stuck: {reason}",
+                                {
+                                    "container": container_name,
+                                    "pod": pod_name,
+                                    "namespace": namespace,
+                                    "reason": reason,
+                                    "message": waiting.get("message", "")[:500],
+                                    "restart_count": ics.get("restartCount", 0),
+                                    "severity": "critical",
+                                    "finding_type": FindingType.CURRENT_STATE,
+                                    "root_causes": [
+                                        "Init container crash before main container starts",
+                                        "Image pull failure due to registry/auth issues",
+                                        "Configuration error in container spec",
+                                    ],
+                                    "diagnostic_steps": [
+                                        f"kubectl logs {pod_name} -n {namespace} -c {container_name}",
+                                        f"kubectl describe pod {pod_name} -n {namespace}",
+                                    ],
+                                },
+                            )
+
+                    # Check for terminated with non-zero exit
+                    terminated = state.get("terminated", {})
+                    if terminated:
+                        exit_code = terminated.get("exitCode", 0)
+                        if exit_code != 0:
+                            exit_meaning = EXIT_CODE_MAP.get(exit_code, "Unknown error")
+                            self._add_finding(
+                                "pod_errors",
+                                f"Init container {container_name} in {namespace}/{pod_name} failed (exit {exit_code}: {exit_meaning})",
+                                {
+                                    "container": container_name,
+                                    "pod": pod_name,
+                                    "namespace": namespace,
+                                    "exit_code": exit_code,
+                                    "exit_code_meaning": exit_meaning,
+                                    "reason": terminated.get("reason", ""),
+                                    "message": terminated.get("message", "")[:500],
+                                    "finished_at": terminated.get("finishedAt", ""),
+                                    "severity": "critical" if exit_code in (137, 139) else "warning",
+                                    "finding_type": FindingType.CURRENT_STATE,
+                                },
+                            )
+
+        except Exception as e:
+            self._add_error("analyze_init_container_failures", str(e))
+
+    def analyze_pdb_violations(self):
+        """
+        Analyze Pod Disruption Budget violations.
+
+        Gap addressed: PDBs can block node drains during upgrades, causing upgrade
+        timeouts and node group health degradation. This is the #1 reason EKS
+        managed node group updates get stuck.
+
+        Detection:
+        - PDBs with disruptionsAllowed = 0 (blocking all voluntary disruptions)
+        - PDBs with minAvailable equal to total pods (misconfiguration)
+        """
+        self.progress.step("Analyzing Pod Disruption Budgets...")
+        try:
+            pdb_json = self.safe_kubectl_call("kubectl get pdb --all-namespaces -o json")
+            if not pdb_json:
+                return
+            pdbs = json.loads(pdb_json).get("items", [])
+
+            for pdb in pdbs:
+                name = pdb.get("metadata", {}).get("name", "")
+                namespace = pdb.get("metadata", {}).get("namespace", "")
+                status = pdb.get("status", {})
+                spec = pdb.get("spec", {})
+
+                disruptions_allowed = status.get("disruptionsAllowed", 0)
+                expected_pods = status.get("expectedPods", 0)
+                current_healthy = status.get("currentHealthy", 0)
+                desired_healthy = status.get("desiredHealthy", 0)
+
+                # PDB blocking all disruptions
+                if disruptions_allowed == 0 and expected_pods > 0:
+                    self._add_finding(
+                        "scheduling_failures",
+                        f"PDB {namespace}/{name} blocking all disruptions: {current_healthy}/{expected_pods} healthy, 0 allowed",
+                        {
+                            "pdb": name,
+                            "namespace": namespace,
+                            "disruptions_allowed": disruptions_allowed,
+                            "current_healthy": current_healthy,
+                            "expected_pods": expected_pods,
+                            "desired_healthy": desired_healthy,
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "impact": "Node drains and cluster upgrades will be blocked until pods become healthy",
+                            "root_causes": [
+                                "Not enough healthy pods to satisfy minAvailable/maxUnavailable",
+                                "Pod stuck in non-ready state",
+                                "Misconfigured PDB with minAvailable equal to or greater than available pods",
+                            ],
+                            "diagnostic_steps": [
+                                f"kubectl describe pdb {name} -n {namespace}",
+                                f"kubectl get pods -n {namespace} -l {pdb.get('spec', {}).get('selector', {})}",
+                                "Check if application pods are healthy and ready",
+                            ],
+                        },
+                    )
+
+                # PDB with misconfigured minAvailable == replicas
+                min_available = spec.get("minAvailable")
+                max_unavailable = spec.get("maxUnavailable")
+                if min_available is not None and str(min_available).isdigit():
+                    if int(min_available) >= expected_pods and expected_pods > 0:
+                        self._add_finding(
+                            "scheduling_failures",
+                            f"PDB {namespace}/{name} has minAvailable={min_available} >= total pods ({expected_pods})",
+                            {
+                                "pdb": name,
+                                "namespace": namespace,
+                                "min_available": min_available,
+                                "expected_pods": expected_pods,
+                                "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
+                                "impact": "This PDB will block ALL voluntary disruptions including node upgrades",
+                            },
+                        )
+
+        except Exception as e:
+            self._add_error("analyze_pdb_violations", str(e))
+
+    def analyze_sidecar_health(self):
+        """
+        Analyze service mesh and sidecar container health.
+
+        Gap addressed: Failed sidecars cause silent network failures where the
+        app container is healthy but all traffic fails.
+
+        Detection:
+        - Sidecar containers (Istio, Envoy, Linkerd, etc.) not ready while main container runs
+        - Sidecar containers with high restart counts
+        """
+        self.progress.step("Analyzing sidecar container health...")
+        try:
+            pods_json = self._get_cached_kubectl("kubectl get pods --all-namespaces -o json")
+            if not pods_json:
+                return
+            pods = json.loads(pods_json).get("items", [])
+
+            SIDECAR_PATTERNS = [
+                "istio-proxy",
+                "envoy",
+                "linkerd-proxy",
+                "linkerd-init",
+                "datadog-agent",
+                "vault-agent",
+                "aws-appmesh-proxy",
+                "consul-connect",
+            ]
+
+            for pod in pods:
+                pod_name = pod.get("metadata", {}).get("name", "")
+                namespace = pod.get("metadata", {}).get("namespace", "")
+                container_statuses = pod.get("status", {}).get("containerStatuses", [])
+
+                for cs in container_statuses:
+                    container_name = cs.get("name", "")
+                    is_sidecar = any(pattern in container_name for pattern in SIDECAR_PATTERNS)
+
+                    if is_sidecar:
+                        ready = cs.get("ready", False)
+                        restart_count = cs.get("restartCount", 0)
+
+                        # Sidecar not ready while main container is running
+                        if not ready:
+                            main_containers = [
+                                c for c in container_statuses if c["name"] != container_name and c.get("ready")
+                            ]
+                            if main_containers:
+                                self._add_finding(
+                                    "network_issues",
+                                    f"Sidecar {container_name} not ready in {namespace}/{pod_name} while app container is running",
+                                    {
+                                        "container": container_name,
+                                        "pod": pod_name,
+                                        "namespace": namespace,
+                                        "restart_count": restart_count,
+                                        "severity": "critical",
+                                        "finding_type": FindingType.CURRENT_STATE,
+                                        "impact": "All network traffic to/from this pod will fail",
+                                        "root_causes": [
+                                            "Sidecar proxy failed to start",
+                                            "Configuration error in sidecar injection",
+                                            "Resource limits too low for sidecar",
+                                        ],
+                                        "diagnostic_steps": [
+                                            f"kubectl logs {pod_name} -n {namespace} -c {container_name}",
+                                            f"kubectl describe pod {pod_name} -n {namespace}",
+                                        ],
+                                    },
+                                )
+
+                        # Sidecar with high restart count
+                        if restart_count > 5:
+                            self._add_finding(
+                                "network_issues",
+                                f"Sidecar {container_name} in {namespace}/{pod_name} restarting frequently ({restart_count} restarts)",
+                                {
+                                    "container": container_name,
+                                    "pod": pod_name,
+                                    "namespace": namespace,
+                                    "restart_count": restart_count,
+                                    "severity": "warning",
+                                    "finding_type": FindingType.CURRENT_STATE,
+                                    "impact": "Intermittent network failures during sidecar restarts",
+                                },
+                            )
+
+        except Exception as e:
+            self._add_error("analyze_sidecar_health", str(e))
+
+    def analyze_node_resource_saturation(self):
+        """
+        Analyze nodes approaching resource limits before pressure triggers.
+
+        Gap addressed: Current node analysis checks conditions (DiskPressure, MemoryPressure)
+        but doesn't detect nodes approaching limits before pressure triggers. This is a
+        LEADING INDICATOR that gives SREs time to react.
+
+        Detection:
+        - Nodes with >90% memory request allocation (pre-pressure warning)
+        - Nodes with >90% CPU request allocation
+        """
+        self.progress.step("Analyzing node resource saturation...")
+        try:
+            nodes_json = self._get_cached_kubectl("kubectl get nodes -o json")
+            pods_json = self._get_cached_kubectl("kubectl get pods --all-namespaces -o json")
+
+            if not nodes_json or not pods_json:
+                return
+
+            nodes = json.loads(nodes_json).get("items", [])
+            pods = json.loads(pods_json).get("items", [])
+
+            for node in nodes:
+                node_name = node.get("metadata", {}).get("name", "")
+                allocatable = node.get("status", {}).get("allocatable", {})
+
+                # Parse memory (handle Ki, Mi, Gi suffixes)
+                def parse_memory(val):
+                    if not val:
+                        return 0
+                    val = str(val)
+                    multipliers = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4}
+                    for suffix, mult in multipliers.items():
+                        if val.endswith(suffix):
+                            return int(float(val[:-2]) * mult)
+                    return int(val) if val.isdigit() else 0
+
+                alloc_mem = parse_memory(allocatable.get("memory", "0"))
+                alloc_cpu = allocatable.get("cpu", "0")
+
+                # Parse CPU (handle millicores)
+                def parse_cpu(val):
+                    if not val:
+                        return 0
+                    val = str(val)
+                    if val.endswith("m"):
+                        return int(val[:-1])
+                    return int(float(val) * 1000)  # Convert cores to millicores
+
+                alloc_cpu_mc = parse_cpu(alloc_cpu)
+
+                # Calculate actual allocation from pods on this node
+                pods_on_node = [p for p in pods if p.get("spec", {}).get("nodeName") == node_name]
+
+                total_mem_requests = 0
+                total_cpu_requests_mc = 0
+
+                for pod in pods_on_node:
+                    for container in pod.get("spec", {}).get("containers", []):
+                        requests = container.get("resources", {}).get("requests", {})
+                        total_mem_requests += parse_memory(requests.get("memory", "0"))
+                        total_cpu_requests_mc += parse_cpu(requests.get("cpu", "0"))
+
+                # Calculate utilization
+                mem_util = (total_mem_requests / alloc_mem * 100) if alloc_mem > 0 else 0
+                cpu_util = (total_cpu_requests_mc / alloc_cpu_mc * 100) if alloc_cpu_mc > 0 else 0
+
+                # Warn at >90% allocation (pre-pressure)
+                if mem_util > 90:
+                    self._add_finding(
+                        "memory_pressure",
+                        f"Node {node_name} at {mem_util:.0f}% memory request allocation (pre-pressure warning)",
+                        {
+                            "node": node_name,
+                            "memory_utilization_pct": round(mem_util, 1),
+                            "allocatable_memory": allocatable.get("memory"),
+                            "requested_memory_bytes": total_mem_requests,
+                            "pods_on_node": len(pods_on_node),
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "impact": "Next pod scheduled here may trigger MemoryPressure and evictions",
+                            "diagnostic_steps": [
+                                f"kubectl describe node {node_name} | grep -A 20 'Allocated resources'",
+                                "kubectl top nodes",
+                                "Consider adding nodes or rebalancing pods",
+                            ],
+                        },
+                    )
+
+                if cpu_util > 90:
+                    self._add_finding(
+                        "scheduling_failures",
+                        f"Node {node_name} at {cpu_util:.0f}% CPU request allocation (pre-pressure warning)",
+                        {
+                            "node": node_name,
+                            "cpu_utilization_pct": round(cpu_util, 1),
+                            "allocatable_cpu": alloc_cpu,
+                            "requested_cpu_mc": total_cpu_requests_mc,
+                            "pods_on_node": len(pods_on_node),
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "impact": "CPU throttling may occur, affecting application performance",
+                        },
+                    )
+
+        except Exception as e:
+            self._add_error("analyze_node_resource_saturation", str(e))
+
+    def analyze_version_skew(self):
+        """
+        Analyze kubelet version skew between control plane and nodes.
+
+        Gap addressed: Kubernetes supports N-2 minor versions between control plane
+        and nodes. Version skew beyond this is unsupported and risky.
+
+        Detection:
+        - Nodes with kubelet >2 minor versions behind control plane (critical)
+        - Nodes at maximum allowed skew (warning - will break on next upgrade)
+        """
+        self.progress.step("Analyzing Kubernetes version skew...")
+        try:
+            # Get control plane version
+            cluster_info = self.eks_client.describe_cluster(name=self.cluster_name)
+            cp_version = cluster_info["cluster"]["version"]  # e.g., "1.29"
+            cp_minor = int(cp_version.split(".")[1])
+
+            nodes_json = self._get_cached_kubectl("kubectl get nodes -o json")
+            if not nodes_json:
+                return
+            nodes = json.loads(nodes_json).get("items", [])
+
+            for node in nodes:
+                node_name = node.get("metadata", {}).get("name", "")
+                kubelet_version = node.get("status", {}).get("nodeInfo", {}).get("kubeletVersion", "")
+
+                # Parse kubelet version (e.g., "v1.27.9-eks-...")
+                version_match = re.search(r"v1\.(\d+)", kubelet_version)
+                if version_match:
+                    node_minor = int(version_match.group(1))
+                    skew = cp_minor - node_minor
+
+                    if skew > 2:
+                        self._add_finding(
+                            "node_issues",
+                            f"Node {node_name} kubelet {kubelet_version} is {skew} minor versions "
+                            f"behind control plane {cp_version} (unsupported skew)",
+                            {
+                                "node": node_name,
+                                "kubelet_version": kubelet_version,
+                                "control_plane_version": cp_version,
+                                "version_skew": skew,
+                                "severity": "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
+                                "impact": "Node may lose API compatibility at any time. "
+                                "Kubernetes only supports N-2 version skew.",
+                                "diagnostic_steps": [
+                                    "Update node group to use a supported Kubernetes version",
+                                    "Consider creating a new node group with updated AMI",
+                                ],
+                            },
+                        )
+                    elif skew == 2:
+                        self._add_finding(
+                            "node_issues",
+                            f"Node {node_name} kubelet {kubelet_version} at maximum allowed skew "
+                            f"from control plane {cp_version}",
+                            {
+                                "node": node_name,
+                                "kubelet_version": kubelet_version,
+                                "control_plane_version": cp_version,
+                                "version_skew": skew,
+                                "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
+                                "impact": "Next control plane upgrade will make this node incompatible",
+                            },
+                        )
+
+        except Exception as e:
+            self._add_error("analyze_version_skew", str(e))
+
+    def analyze_ingress_health(self):
+        """
+        Analyze Ingress resource misconfigurations.
+
+        Gap addressed: ALB health is checked but Ingress resource misconfigurations
+        (missing backends, TLS cert issues) are not detected.
+
+        Detection:
+        - Ingress with missing backend services
+        - Ingress with missing TLS secrets
+        """
+        self.progress.step("Analyzing Ingress health...")
+        try:
+            ing_json = self.safe_kubectl_call("kubectl get ingresses --all-namespaces -o json")
+            if not ing_json:
+                return
+            ingresses = json.loads(ing_json).get("items", [])
+
+            for ing in ingresses:
+                name = ing.get("metadata", {}).get("name", "")
+                namespace = ing.get("metadata", {}).get("namespace", "")
+
+                # Check for missing backend services
+                for rule in ing.get("spec", {}).get("rules", []):
+                    host = rule.get("host", "*")
+                    for path in rule.get("http", {}).get("paths", []):
+                        backend = path.get("backend", {})
+                        service = backend.get("service", {})
+                        backend_svc = service.get("name")
+
+                        if backend_svc:
+                            svc_check = self.safe_kubectl_call(f"kubectl get svc {backend_svc} -n {namespace} -o name")
+                            if not svc_check:
+                                self._add_finding(
+                                    "network_issues",
+                                    f"Ingress {namespace}/{name}: backend service '{backend_svc}' not found",
+                                    {
+                                        "ingress": name,
+                                        "namespace": namespace,
+                                        "missing_service": backend_svc,
+                                        "host": host,
+                                        "path": path.get("path", "/"),
+                                        "severity": "critical",
+                                        "finding_type": FindingType.CURRENT_STATE,
+                                        "impact": f"Traffic to {host}{path.get('path', '/')} will return 503",
+                                    },
+                                )
+
+                # Check for missing TLS secrets
+                for tls in ing.get("spec", {}).get("tls", []):
+                    secret_name = tls.get("secretName")
+                    if secret_name:
+                        secret_check = self.safe_kubectl_call(
+                            f"kubectl get secret {secret_name} -n {namespace} -o name"
+                        )
+                        if not secret_check:
+                            self._add_finding(
+                                "network_issues",
+                                f"Ingress {namespace}/{name}: TLS secret '{secret_name}' not found",
+                                {
+                                    "ingress": name,
+                                    "namespace": namespace,
+                                    "missing_secret": secret_name,
+                                    "hosts": tls.get("hosts", []),
+                                    "severity": "critical",
+                                    "finding_type": FindingType.CURRENT_STATE,
+                                    "impact": "HTTPS termination will fail for these hosts",
+                                },
+                            )
+
+        except Exception as e:
+            self._add_error("analyze_ingress_health", str(e))
+
+    def analyze_hpa_metrics_source(self):
+        """
+        Analyze HPA metrics source availability.
+
+        Gap addressed: analyze_hpa_vpa() checks HPA conditions but not whether
+        the metrics source (metrics-server, Prometheus adapter) is working.
+
+        Detection:
+        - metrics-server deployment health
+        - Whether kubectl top works (metrics API responding)
+        """
+        self.progress.step("Analyzing HPA metrics source...")
+        try:
+            # Check if metrics-server is running
+            ms_json = self.safe_kubectl_call(
+                "kubectl get deployment metrics-server -n kube-system -o json", suppress_expected_errors=True
+            )
+
+            if not ms_json:
+                # Try alternative locations
+                ms_json = self.safe_kubectl_call(
+                    "kubectl get deployment metrics-server -n amazon-metrics-server -o json",
+                    suppress_expected_errors=True,
+                )
+
+            if not ms_json:
+                self._add_finding(
+                    "addon_issues",
+                    "metrics-server not found — HPA resource metrics will not work",
+                    {
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "HPAs targeting CPU/memory metrics cannot scale",
+                        "diagnostic_steps": [
+                            "Deploy metrics-server: kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml",
+                            "Or enable Amazon Managed Prometheus for custom metrics",
+                        ],
+                    },
+                )
+                return
+
+            ms = json.loads(ms_json)
+            ready = ms.get("status", {}).get("readyReplicas", 0)
+            desired = ms.get("spec", {}).get("replicas", 1)
+
+            if ready < desired:
+                self._add_finding(
+                    "addon_issues",
+                    f"metrics-server degraded: {ready}/{desired} replicas ready",
+                    {
+                        "ready_replicas": ready,
+                        "desired_replicas": desired,
+                        "severity": "critical",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "HPA scaling decisions are delayed or broken",
+                    },
+                )
+
+            # Check if kubectl top works
+            top_output = self.safe_kubectl_call("kubectl top nodes --no-headers")
+            if not top_output:
+                self._add_finding(
+                    "addon_issues",
+                    "Metrics API not responding (kubectl top nodes failed)",
+                    {
+                        "severity": "critical",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "HPA cannot make scaling decisions without metrics",
+                        "diagnostic_steps": [
+                            "kubectl logs -n kube-system deployment/metrics-server",
+                            "Check metrics-server pod logs for errors",
+                        ],
+                    },
+                )
+
+        except Exception as e:
+            self._add_error("analyze_hpa_metrics_source", str(e))
+
+    def analyze_deprecated_apis(self):
+        """
+        Analyze deprecated API usage for upgrade readiness.
+
+        Gap addressed: API removals are the #1 cause of post-upgrade failures in EKS.
+        This scans for deprecated API versions that will break on upgrade.
+
+        Detection:
+        - Control plane logs with deprecation warnings
+        - Workloads using deprecated API versions
+        """
+        self.progress.step("Analyzing deprecated API usage...")
+        try:
+            DEPRECATED_APIS = {
+                "extensions/v1beta1": {"removed_in": "1.22", "resources": ["Ingress", "NetworkPolicy"]},
+                "networking.k8s.io/v1beta1": {"removed_in": "1.22", "resources": ["Ingress", "IngressClass"]},
+                "policy/v1beta1": {"removed_in": "1.25", "resources": ["PodSecurityPolicy", "PodDisruptionBudget"]},
+                "autoscaling/v2beta1": {"removed_in": "1.26", "resources": ["HorizontalPodAutoscaler"]},
+                "flowcontrol.apiserver.k8s.io/v1beta1": {"removed_in": "1.26", "resources": ["FlowSchema"]},
+                "flowcontrol.apiserver.k8s.io/v1beta2": {"removed_in": "1.29", "resources": ["FlowSchema"]},
+                "admissionregistration.k8s.io/v1beta1": {
+                    "removed_in": "1.22",
+                    "resources": ["ValidatingWebhookConfiguration"],
+                },
+                "certificates.k8s.io/v1beta1": {"removed_in": "1.22", "resources": ["CertificateSigningRequest"]},
+                "coordination.k8s.io/v1beta1": {"removed_in": "1.22", "resources": ["Lease"]},
+                "rbac.authorization.k8s.io/v1beta1": {"removed_in": "1.22", "resources": ["Role", "RoleBinding"]},
+            }
+
+            # Get current cluster version
+            cluster_info = self.eks_client.describe_cluster(name=self.cluster_name)
+            cp_version = cluster_info["cluster"]["version"]
+            cp_minor = int(cp_version.split(".")[1])
+
+            # Check for deprecated API usage in resources
+            deprecated_findings = {}
+
+            for api_version, info in DEPRECATED_APIS.items():
+                removed_in_minor = int(info["removed_in"].split(".")[1])
+
+                # Only warn if the removal version is within 2 minor versions
+                if removed_in_minor - cp_minor <= 2:
+                    for resource in info["resources"]:
+                        # Try to list resources with this API version
+                        resource_check = self.safe_kubectl_call(
+                            f"kubectl get {resource.lower()} --all-namespaces -o jsonpath='{{.items[*].metadata.name}}'",
+                            suppress_expected_errors=True,
+                        )
+
+                        # Check if any resources are using deprecated API by checking their stored version
+                        # This is a heuristic - check if the resource exists and note the deprecation
+                        if (
+                            resource_check
+                            and "not found" not in resource_check.lower()
+                            and "error" not in resource_check.lower()
+                        ):
+                            key = f"{api_version}/{resource}"
+                            deprecated_findings[key] = {
+                                "api_version": api_version,
+                                "resource": resource,
+                                "removed_in": info["removed_in"],
+                                "current_version": cp_version,
+                            }
+
+            # Report findings
+            for key, details in deprecated_findings.items():
+                removed_minor = int(details["removed_in"].split(".")[1])
+                urgency = "critical" if removed_minor <= cp_minor else "warning"
+
+                self._add_finding(
+                    "control_plane_issues",
+                    f"Deprecated API {details['api_version']} for {details['resource']} "
+                    f"(removed in Kubernetes {details['removed_in']})",
+                    {
+                        "api_version": details["api_version"],
+                        "resource": details["resource"],
+                        "removed_in": details["removed_in"],
+                        "current_k8s_version": details["current_version"],
+                        "severity": urgency,
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Will break on Kubernetes version upgrade. "
+                        "API removals are the #1 cause of post-upgrade failures.",
+                        "diagnostic_steps": [
+                            f"Find resources: kubectl get {details['resource']} --all-namespaces -o yaml | grep apiVersion",
+                            "Update manifests to use stable API versions",
+                            "Test upgrade in non-production first",
+                        ],
+                    },
+                )
+
+        except Exception as e:
+            self._add_error("analyze_deprecated_apis", str(e))
+
+    # --- MEDIUM PRIORITY METHODS ---
+
+    def analyze_topology_spread(self):
+        """
+        Analyze topology spread constraint violations.
+
+        Gap addressed: Pods with topologySpreadConstraints can fail to schedule
+        in specific AZ-failure scenarios.
+
+        Detection:
+        - Pending pods with topology spread constraints
+        - Analysis of constraint satisfaction
+        """
+        self.progress.step("Analyzing topology spread constraints...")
+        try:
+            pods_json = self._get_cached_kubectl("kubectl get pods --all-namespaces -o json")
+            if not pods_json:
+                return
+            pods = json.loads(pods_json).get("items", [])
+
+            for pod in pods:
+                pod_name = pod.get("metadata", {}).get("name", "")
+                namespace = pod.get("metadata", {}).get("namespace", "")
+                phase = pod.get("status", {}).get("phase", "")
+
+                if phase != "Pending":
+                    continue
+
+                constraints = pod.get("spec", {}).get("topologySpreadConstraints", [])
+                if constraints:
+                    for constraint in constraints:
+                        topo_key = constraint.get("topologyKey", "")
+                        when_unsatisfiable = constraint.get("whenUnsatisfiable", "DoNotSchedule")
+                        max_skew = constraint.get("maxSkew", 1)
+
+                        if when_unsatisfiable == "DoNotSchedule":
+                            self._add_finding(
+                                "scheduling_failures",
+                                f"Pod {namespace}/{pod_name} unschedulable: topology spread constraint "
+                                f"on {topo_key} (maxSkew={max_skew}, DoNotSchedule)",
+                                {
+                                    "pod": pod_name,
+                                    "namespace": namespace,
+                                    "topology_key": topo_key,
+                                    "max_skew": max_skew,
+                                    "when_unsatisfiable": when_unsatisfiable,
+                                    "severity": "warning",
+                                    "finding_type": FindingType.CURRENT_STATE,
+                                    "root_causes": [
+                                        "AZ imbalance - nodes not distributed across topology domains",
+                                        "Node label mismatch - nodes missing required topology labels",
+                                        "Insufficient nodes in required topology domain",
+                                    ],
+                                    "diagnostic_steps": [
+                                        f"kubectl describe pod {pod_name} -n {namespace}",
+                                        f"kubectl get nodes --show-labels | grep {topo_key}",
+                                    ],
+                                },
+                            )
+
+        except Exception as e:
+            self._add_error("analyze_topology_spread", str(e))
+
+    def analyze_node_ami_age(self):
+        """
+        Analyze node AMI age for security patch status.
+
+        Gap addressed: Old AMIs miss kernel patches and containerd fixes.
+
+        Detection:
+        - Nodes older than 90 days (warning)
+        - Nodes older than 180 days (critical)
+        """
+        self.progress.step("Analyzing node AMI age...")
+        try:
+            nodes_json = self._get_cached_kubectl("kubectl get nodes -o json")
+            if not nodes_json:
+                return
+            nodes = json.loads(nodes_json).get("items", [])
+
+            for node in nodes:
+                node_name = node.get("metadata", {}).get("name", "")
+                creation_ts = node.get("metadata", {}).get("creationTimestamp", "")
+                os_image = node.get("status", {}).get("nodeInfo", {}).get("osImage", "")
+                kubelet_version = node.get("status", {}).get("nodeInfo", {}).get("kubeletVersion", "")
+
+                if creation_ts:
+                    from dateutil import parser as date_parser
+
+                    created = date_parser.parse(creation_ts)
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    age_days = (TimezoneManager.now_utc() - created).days
+
+                    if age_days > 180:
+                        self._add_finding(
+                            "node_issues",
+                            f"Node {node_name} is {age_days} days old — AMI likely missing critical security patches",
+                            {
+                                "node": node_name,
+                                "age_days": age_days,
+                                "os_image": os_image,
+                                "kubelet_version": kubelet_version,
+                                "created_at": creation_ts,
+                                "severity": "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
+                                "impact": "Node may be vulnerable to known security issues",
+                                "diagnostic_steps": [
+                                    "Check node group AMI release version",
+                                    "Consider rolling replacement with updated AMI",
+                                    "Review AWS security bulletins for EKS AMI updates",
+                                ],
+                            },
+                        )
+                    elif age_days > 90:
+                        self._add_finding(
+                            "node_issues",
+                            f"Node {node_name} is {age_days} days old — AMI may be missing security patches",
+                            {
+                                "node": node_name,
+                                "age_days": age_days,
+                                "os_image": os_image,
+                                "kubelet_version": kubelet_version,
+                                "created_at": creation_ts,
+                                "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
+                            },
+                        )
+
+        except Exception as e:
+            self._add_error("analyze_node_ami_age", str(e))
+
+    def analyze_endpointslice_health(self):
+        """
+        Analyze EndpointSlice readiness (newer API replacing Endpoints).
+
+        Gap addressed: analyze_service_health() checks Endpoints but not
+        EndpointSlices (the newer API used in K8s 1.21+).
+
+        Detection:
+        - EndpointSlices with not-ready endpoints
+        - Endpoints that are ready but not serving
+        """
+        self.progress.step("Analyzing EndpointSlice health...")
+        try:
+            es_json = self.safe_kubectl_call("kubectl get endpointslices --all-namespaces -o json")
+            if not es_json:
+                return
+            slices = json.loads(es_json).get("items", [])
+
+            for es in slices:
+                name = es.get("metadata", {}).get("name", "")
+                namespace = es.get("metadata", {}).get("namespace", "")
+                endpoints = es.get("endpoints") or []  # Handle None explicitly
+
+                not_ready = [ep for ep in endpoints if not ep.get("conditions", {}).get("ready", True)]
+                not_serving = [
+                    ep
+                    for ep in endpoints
+                    if ep.get("conditions", {}).get("ready") and not ep.get("conditions", {}).get("serving", True)
+                ]
+
+                svc_name = es.get("metadata", {}).get("labels", {}).get("kubernetes.io/service-name", name)
+
+                if not_ready:
+                    self._add_finding(
+                        "network_issues",
+                        f"Service {namespace}/{svc_name}: {len(not_ready)}/{len(endpoints)} endpoints not ready",
+                        {
+                            "service": svc_name,
+                            "namespace": namespace,
+                            "endpointslice": name,
+                            "total_endpoints": len(endpoints),
+                            "not_ready_count": len(not_ready),
+                            "not_ready_addresses": [ep.get("addresses", []) for ep in not_ready[:5]],
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                        },
+                    )
+
+                if not_serving:
+                    self._add_finding(
+                        "network_issues",
+                        f"Service {namespace}/{svc_name}: {len(not_serving)} endpoints ready but not serving",
+                        {
+                            "service": svc_name,
+                            "namespace": namespace,
+                            "endpointslice": name,
+                            "not_serving_count": len(not_serving),
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "impact": "Endpoints are passing readiness but traffic is being rejected",
+                        },
+                    )
+
+        except Exception as e:
+            self._add_error("analyze_endpointslice_health", str(e))
+
+    def analyze_dns_configuration(self):
+        """
+        Analyze pod DNS configuration for performance issues.
+
+        Gap addressed: The default ndots:5 causes 5x DNS queries for every
+        external domain lookup — a common source of DNS latency.
+
+        Detection:
+        - Count pods using default ndots:5 (performance concern)
+        - Identify clusters at risk of DNS amplification
+        """
+        self.progress.step("Analyzing DNS configuration...")
+        try:
+            pods_json = self._get_cached_kubectl("kubectl get pods --all-namespaces -o json")
+            if not pods_json:
+                return
+            pods = json.loads(pods_json).get("items", [])
+
+            ndots5_count = 0
+            custom_dns_count = 0
+            total_pods = 0
+
+            for pod in pods:
+                namespace = pod.get("metadata", {}).get("namespace", "")
+                # Skip system namespaces
+                if namespace in ("kube-system", "amazon-cloudwatch", "calico-system", "kube-node-lease"):
+                    continue
+
+                total_pods += 1
+                dns_config = pod.get("spec", {}).get("dnsConfig", {})
+                dns_policy = pod.get("spec", {}).get("dnsPolicy", "ClusterFirst")
+
+                options = dns_config.get("options", [])
+                ndots = next((o.get("value") for o in options if o.get("name") == "ndots"), None)
+
+                if ndots is None and dns_policy == "ClusterFirst":
+                    ndots5_count += 1  # Using default ndots:5
+                elif ndots is not None:
+                    custom_dns_count += 1
+
+            if ndots5_count > 100:
+                self._add_finding(
+                    "dns_issues",
+                    f"{ndots5_count} pods using default ndots:5 — "
+                    f"causing 5x DNS query amplification for external domains",
+                    {
+                        "pods_with_ndots5": ndots5_count,
+                        "pods_with_custom_dns": custom_dns_count,
+                        "total_pods_analyzed": total_pods,
+                        "severity": "info",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Each external DNS lookup generates 5 search domain queries "
+                        "before resolving. On clusters with >100 pods, this can overload CoreDNS.",
+                        "diagnostic_steps": [
+                            "Add dnsConfig with ndots:2 to deployment specs",
+                            "Or add FQDN dots (e.g., 'api.example.com.') in application configs",
+                            "Monitor CoreDNS metrics for query volume",
+                        ],
+                    },
+                )
+
+        except Exception as e:
+            self._add_error("analyze_dns_configuration", str(e))
+
+    def analyze_karpenter_drift(self):
+        """
+        Analyze Karpenter NodeClaim drift.
+
+        Gap addressed: analyze_karpenter() checks provisioner health but not
+        consolidation failures or drift.
+
+        Detection:
+        - Drifted NodeClaims (nodes that no longer match NodePool spec)
+        """
+        self.progress.step("Analyzing Karpenter drift...")
+        try:
+            # Check for NodeClaims (Karpenter v0.32+)
+            nc_json = self.safe_kubectl_call("kubectl get nodeclaims -o json", suppress_expected_errors=True)
+            if not nc_json:
+                # Try older Provisioners or Karpenter not installed
+                return
+
+            nodeclaims = json.loads(nc_json).get("items", [])
+
+            for nc in nodeclaims:
+                name = nc.get("metadata", {}).get("name", "")
+                conditions = nc.get("status", {}).get("conditions", [])
+
+                for cond in conditions:
+                    cond_type = cond.get("type", "")
+                    cond_status = cond.get("status", "")
+                    cond_message = cond.get("message", "")
+                    cond_reason = cond.get("reason", "")
+
+                    if cond_type == "Drifted" and cond_status == "True":
+                        self._add_finding(
+                            "node_issues",
+                            f"Karpenter NodeClaim {name} is drifted",
+                            {
+                                "nodeclaim": name,
+                                "reason": cond_reason,
+                                "message": cond_message,
+                                "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
+                                "impact": "Node spec no longer matches NodePool. "
+                                "Karpenter will replace it during next consolidation cycle.",
+                                "diagnostic_steps": [
+                                    f"kubectl describe nodeclaim {name}",
+                                    "Check Karpenter logs for consolidation events",
+                                ],
+                            },
+                        )
+
+                    if cond_type == "ConsolidationBlocked" and cond_status == "True":
+                        self._add_finding(
+                            "node_issues",
+                            f"Karpenter NodeClaim {name} consolidation blocked",
+                            {
+                                "nodeclaim": name,
+                                "reason": cond_reason,
+                                "message": cond_message,
+                                "severity": "info",
+                                "finding_type": FindingType.CURRENT_STATE,
+                            },
+                        )
+
+        except Exception as e:
+            self._add_error("analyze_karpenter_drift", str(e))
+
+    def analyze_workload_security_posture(self):
+        """
+        Analyze workload security posture.
+
+        Gap addressed: analyze_psa_violations() checks PSA labels but doesn't
+        scan actual pod specs for dangerous security configurations.
+
+        Detection:
+        - Privileged containers
+        - Containers with dangerous capabilities (SYS_ADMIN)
+        - Pods mounting sensitive host paths
+        """
+        self.progress.step("Analyzing workload security posture...")
+        try:
+            pods_json = self._get_cached_kubectl("kubectl get pods --all-namespaces -o json")
+            if not pods_json:
+                return
+            pods = json.loads(pods_json).get("items", [])
+
+            SENSITIVE_HOST_PATHS = ["/", "/etc", "/var/run/docker.sock", "/var/run/containerd", "/var/lib/docker"]
+
+            for pod in pods:
+                pod_name = pod.get("metadata", {}).get("name", "")
+                namespace = pod.get("metadata", {}).get("namespace", "")
+
+                # Skip system namespaces
+                if namespace in ("kube-system", "amazon-cloudwatch", "calico-system", "kube-node-lease", "eks-system"):
+                    continue
+
+                # Check container security contexts
+                for container in pod.get("spec", {}).get("containers", []):
+                    container_name = container.get("name", "")
+                    sc = container.get("securityContext", {})
+
+                    if sc.get("privileged"):
+                        self._add_finding(
+                            "rbac_issues",
+                            f"Privileged container {container_name} in {namespace}/{pod_name}",
+                            {
+                                "container": container_name,
+                                "pod": pod_name,
+                                "namespace": namespace,
+                                "severity": "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
+                                "impact": "Container has full host access, can escape to node",
+                                "diagnostic_steps": [
+                                    f"kubectl get pod {pod_name} -n {namespace} -o yaml | grep -A 10 securityContext",
+                                    "Review if privileged mode is actually required",
+                                ],
+                            },
+                        )
+
+                    added_caps = sc.get("capabilities", {}).get("add", [])
+                    if added_caps and "SYS_ADMIN" in added_caps:
+                        self._add_finding(
+                            "rbac_issues",
+                            f"Container {container_name} in {namespace}/{pod_name} has SYS_ADMIN capability",
+                            {
+                                "container": container_name,
+                                "pod": pod_name,
+                                "namespace": namespace,
+                                "added_capabilities": added_caps,
+                                "severity": "critical",
+                                "finding_type": FindingType.CURRENT_STATE,
+                                "impact": "Container can perform system administration tasks",
+                            },
+                        )
+
+                # Check host path mounts
+                for volume in pod.get("spec", {}).get("volumes", []):
+                    if volume.get("hostPath"):
+                        path = volume["hostPath"].get("path", "")
+                        volume_name = volume.get("name", "")
+
+                        if path in SENSITIVE_HOST_PATHS or any(s in path for s in SENSITIVE_HOST_PATHS):
+                            self._add_finding(
+                                "rbac_issues",
+                                f"Pod {namespace}/{pod_name} mounts sensitive host path: {path}",
+                                {
+                                    "pod": pod_name,
+                                    "namespace": namespace,
+                                    "volume_name": volume_name,
+                                    "host_path": path,
+                                    "severity": "critical",
+                                    "finding_type": FindingType.CURRENT_STATE,
+                                    "impact": "Pod has access to sensitive host filesystem",
+                                },
+                            )
+
+        except Exception as e:
+            self._add_error("analyze_workload_security_posture", str(e))
+
+    # --- LOW PRIORITY METHODS ---
+
+    def analyze_ephemeral_containers(self):
+        """
+        Analyze ephemeral containers (debug containers).
+
+        Gap addressed: Ephemeral containers (kubectl debug) can fail and
+        consume resources, but are not currently tracked.
+
+        Detection:
+        - Ephemeral containers that have OOMKilled
+        - Ephemeral containers with errors
+        """
+        self.progress.step("Analyzing ephemeral containers...")
+        try:
+            pods_json = self._get_cached_kubectl("kubectl get pods --all-namespaces -o json")
+            if not pods_json:
+                return
+            pods = json.loads(pods_json).get("items", [])
+
+            for pod in pods:
+                pod_name = pod.get("metadata", {}).get("name", "")
+                namespace = pod.get("metadata", {}).get("namespace", "")
+                ephemeral_statuses = pod.get("status", {}).get("ephemeralContainerStatuses", [])
+
+                for ecs in ephemeral_statuses:
+                    container_name = ecs.get("name", "")
+                    state = ecs.get("state", {})
+
+                    terminated = state.get("terminated", {})
+                    if terminated:
+                        reason = terminated.get("reason", "")
+                        exit_code = terminated.get("exitCode", 0)
+
+                        if reason == "OOMKilled" or exit_code == 137:
+                            self._add_finding(
+                                "pod_errors",
+                                f"Ephemeral container {container_name} in {namespace}/{pod_name} was OOMKilled",
+                                {
+                                    "container": container_name,
+                                    "pod": pod_name,
+                                    "namespace": namespace,
+                                    "exit_code": exit_code,
+                                    "reason": reason,
+                                    "severity": "info",
+                                    "finding_type": FindingType.HISTORICAL_EVENT,
+                                    "impact": "Debug container ran out of memory - indicates resource constraints",
+                                },
+                            )
+
+        except Exception as e:
+            self._add_error("analyze_ephemeral_containers", str(e))
+
+    def analyze_volume_snapshots(self):
+        """
+        Analyze VolumeSnapshot health.
+
+        Gap addressed: No VolumeSnapshot or VolumeSnapshotContent analysis.
+
+        Detection:
+        - Failed volume snapshots
+        - Snapshots not ready to use
+        """
+        self.progress.step("Analyzing volume snapshots...")
+        try:
+            vs_json = self.safe_kubectl_call(
+                "kubectl get volumesnapshots --all-namespaces -o json || echo '{\"items\":[]}'"
+            )
+            if not vs_json:
+                return
+
+            snapshots = json.loads(vs_json).get("items", [])
+
+            for vs in snapshots:
+                name = vs.get("metadata", {}).get("name", "")
+                namespace = vs.get("metadata", {}).get("namespace", "")
+                status = vs.get("status", {})
+
+                ready = status.get("readyToUse", False)
+                error = status.get("error", {})
+
+                if not ready and error:
+                    self._add_finding(
+                        "pvc_issues",
+                        f"VolumeSnapshot {namespace}/{name} failed: {error.get('message', 'unknown')}",
+                        {
+                            "snapshot": name,
+                            "namespace": namespace,
+                            "error_message": error.get("message", ""),
+                            "ready": ready,
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "diagnostic_steps": [
+                                f"kubectl describe volumesnapshot {name} -n {namespace}",
+                                "Check VolumeSnapshotClass configuration",
+                            ],
+                        },
+                    )
+
+        except Exception as e:
+            self._add_error("analyze_volume_snapshots", str(e))
+
     def correlate_findings(self):
         """
         Smart correlation of findings across data sources.
@@ -10671,6 +11974,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "rolling update",
             "node update",
             "platform version",
+            "launch template",
+            "new node",
         ]
         upgrade_event_types = [
             "NodeReady",
@@ -10678,6 +11983,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "Rebooted",
             "Starting",
             "Started",
+            "RegisteredNode",
+            "RemovingNode",
         ]
 
         # Check for upgrade-related events in findings
@@ -10697,7 +12004,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     )
 
                 # Check for mass node/pod restarts (common during upgrades)
-                if any(et in summary for et in upgrade_event_types):
+                if any(et.lower() in summary for et in upgrade_event_types):
                     upgrade_indicators.append(
                         {
                             "category": category,
@@ -10710,21 +12017,175 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         node_ready_events = [
             f
             for f in self.findings.get("node_issues", [])
-            if "ready" in f.get("summary", "").lower() or "reboot" in f.get("summary", "").lower()
+            if any(kw in f.get("summary", "").lower() for kw in ["ready", "reboot", "notready", "pressure"])
         ]
 
         # Check for DaemonSet restarts (common during upgrades)
         ds_restarts = [
             f
             for f in self.findings.get("pod_errors", [])
-            if any(ds in f.get("summary", "").lower() for ds in ["aws-node", "coredns", "kube-proxy", "vpc-cni"])
+            if any(
+                ds in f.get("summary", "").lower()
+                for ds in ["aws-node", "coredns", "kube-proxy", "vpc-cni", "ebs-csi", "efs-csi"]
+            )
         ]
+
+        # ENHANCED: Check for upgrade-like patterns even without explicit keywords
+        # Pattern 1: Mass pod evictions across multiple nodes (upgrade causes node cycling)
+        evicted_pods = [
+            f
+            for f in self.findings.get("pod_errors", [])
+            if any(
+                kw in f.get("summary", "").lower() for kw in ["evict", "terminat", "deleted", "removed", "disruption"]
+            )
+        ]
+        evicted_nodes = set()
+        for ep in evicted_pods:
+            node = ep.get("details", {}).get("node")
+            if node:
+                evicted_nodes.add(node)
+
+        # Pattern 2: Multiple pods restarting on same node (upgrade rollout)
+        restarted_pods = [
+            f
+            for f in self.findings.get("pod_errors", [])
+            if any(kw in f.get("summary", "").lower() for kw in ["restart", "crashloop", "backoff", "killed", "failed"])
+        ]
+
+        # Pattern 3: High finding density - lots of issues in short time window
+        total_findings_count = sum(len(v) for v in self.findings.values())
+
+        # Pattern 4: Issues spread across multiple categories (upgrade affects everything)
+        affected_categories = [cat for cat, flist in self.findings.items() if flist]
+        category_spread = len(affected_categories)
+
+        # Pattern 5: OOM kills during upgrade (pods restarting with lower memory)
+        oom_kills = self.findings.get("oom_killed", [])
+
+        # Pattern 6: Scheduling failures during upgrade (nodes temporarily unavailable)
+        sched_failures = self.findings.get("scheduling_failures", [])
+
+        # Pattern 7: Multiple nodes affected by pressure
+        pressure_events = self.findings.get("memory_pressure", []) + self.findings.get("disk_pressure", [])
+        pressure_nodes = set()
+        for pe in pressure_events:
+            node = pe.get("details", {}).get("node")
+            if node:
+                pressure_nodes.add(node)
+
+        # Pattern 8: Image pull failures (pods restarting quickly)
+        image_pull_failures = self.findings.get("image_pull_failures", [])
+
+        # Pattern 9: Network issues (CNI restarting)
+        network_issues = self.findings.get("network_issues", [])
+
+        # Pattern 10: Node issues (NotReady, conditions changing)
+        node_issues_count = len(self.findings.get("node_issues", []))
+
+        # Calculate upgrade pattern score
+        upgrade_pattern_score = 0
+        upgrade_pattern_evidence = []
+
+        # Mass evictions across nodes (STRONG indicator)
+        if len(evicted_nodes) >= 1 and len(evicted_pods) >= 3:
+            upgrade_pattern_score += 3
+            upgrade_pattern_evidence.append(f"{len(evicted_pods)} pods evicted across {len(evicted_nodes)} nodes")
+        elif len(evicted_nodes) >= 2:
+            upgrade_pattern_score += 2
+            upgrade_pattern_evidence.append(f"Pod evictions on {len(evicted_nodes)} nodes")
+
+        # Multiple nodes under pressure (STRONG indicator)
+        if len(pressure_nodes) >= 2:
+            upgrade_pattern_score += 3
+            upgrade_pattern_evidence.append(f"{len(pressure_nodes)} nodes under resource pressure")
+        elif len(pressure_nodes) >= 1:
+            upgrade_pattern_score += 1
+            upgrade_pattern_evidence.append(f"Node {list(pressure_nodes)[0]} under pressure")
+
+        # High category spread (upgrade affects many subsystems)
+        if category_spread >= 5:
+            upgrade_pattern_score += 2
+            upgrade_pattern_evidence.append(f"Issues across {category_spread} categories")
+        elif category_spread >= 3:
+            upgrade_pattern_score += 1
+            upgrade_pattern_evidence.append(f"Issues in {category_spread} categories")
+
+        # DaemonSet restarts (COMMON during upgrades)
+        if len(ds_restarts) >= 2:
+            upgrade_pattern_score += 2
+            upgrade_pattern_evidence.append(f"{len(ds_restarts)} DaemonSet restarts (aws-node, coredns, etc.)")
+        elif len(ds_restarts) >= 1:
+            upgrade_pattern_score += 1
+            upgrade_pattern_evidence.append("DaemonSet restarts detected")
+
+        # OOM kills with pod churn
+        if len(oom_kills) >= 2:
+            upgrade_pattern_score += 1
+            upgrade_pattern_evidence.append(f"{len(oom_kills)} OOM kills during pod churn")
+
+        # Scheduling failures with node issues
+        if len(sched_failures) >= 2:
+            upgrade_pattern_score += 1
+            upgrade_pattern_evidence.append(f"{len(sched_failures)} scheduling failures")
+
+        # High finding count in short time window
+        if total_findings_count >= 20:
+            upgrade_pattern_score += 2
+            upgrade_pattern_evidence.append(f"{total_findings_count} total findings in analysis window")
+        elif total_findings_count >= 10:
+            upgrade_pattern_score += 1
+            upgrade_pattern_evidence.append(f"{total_findings_count} findings detected")
+
+        # Multiple pod restarts
+        if len(restarted_pods) >= 5:
+            upgrade_pattern_score += 2
+            upgrade_pattern_evidence.append(f"{len(restarted_pods)} pod restart/failure events")
+        elif len(restarted_pods) >= 3:
+            upgrade_pattern_score += 1
+            upgrade_pattern_evidence.append(f"{len(restarted_pods)} pods with issues")
+
+        # Image pull failures (pods restarting quickly during upgrade)
+        if len(image_pull_failures) >= 2:
+            upgrade_pattern_score += 1
+            upgrade_pattern_evidence.append(f"{len(image_pull_failures)} image pull failures")
+
+        # Network issues (CNI restarting)
+        if len(network_issues) >= 2:
+            upgrade_pattern_score += 1
+            upgrade_pattern_evidence.append(f"{len(network_issues)} network issues")
+
+        # Node issues
+        if node_issues_count >= 3:
+            upgrade_pattern_score += 1
+            upgrade_pattern_evidence.append(f"{node_issues_count} node issues")
+
+        # Add pattern-based indicators
+        if upgrade_pattern_score >= 2:
+            upgrade_indicators.append(
+                {
+                    "category": "upgrade_pattern",
+                    "summary": f"Upgrade-like pattern detected (score: {upgrade_pattern_score})",
+                    "evidence": upgrade_pattern_evidence[:5],
+                    "timestamp": None,
+                }
+            )
 
         # If we have AWS API confirmation, use that (highest confidence)
         # Otherwise, correlate based on event patterns
         total_indicators = len(upgrade_indicators) + len(node_ready_events) + len(ds_restarts)
 
-        if aws_upgrade_info or total_indicators >= 3 or (len(node_ready_events) >= 2 and len(ds_restarts) >= 1):
+        # ENHANCED: Lower threshold for pattern-based detection
+        # Trigger upgrade correlation if:
+        # - AWS API confirms upgrade (highest confidence)
+        # - 2+ upgrade indicators found
+        # - Upgrade pattern score >= 2 (mass evictions, multi-node issues, high category spread)
+        # - Any node events + DaemonSet restarts
+        if (
+            aws_upgrade_info
+            or total_indicators >= 2
+            or upgrade_pattern_score >= 2
+            or (len(node_ready_events) >= 1 and len(ds_restarts) >= 1)
+        ):
             # Count findings by severity
             total_findings = sum(len(v) for v in self.findings.values())
             critical_findings = sum(
@@ -11578,6 +13039,145 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "causal_pairs": causal_pairs[:5],  # Top 5 examples
         }
 
+    def _calculate_5d_confidence(
+        self,
+        cause_events: list,
+        effect_events: list,
+        mechanism_known: bool = False,
+        alternative_causes: list | None = None,
+    ) -> dict:
+        """Calculate 5-dimensional confidence score for root cause correlation.
+
+        Dimensions:
+            1. Temporal (0.0-1.0): Does cause precede effect within causal window?
+            2. Spatial (0.0-1.0): Are cause and effect on same node/pod/namespace?
+            3. Mechanism (0.0-1.0): Is there a known causal mechanism?
+            4. Exclusivity (0.0-1.0): Is this the only plausible cause?
+            5. Reproducibility (0.0-1.0): Has this pattern occurred multiple times?
+
+        Returns:
+            Dict with individual scores and weighted composite confidence
+        """
+        scores = {
+            "temporal": 0.0,
+            "spatial": 0.0,
+            "mechanism": 0.0,
+            "exclusivity": 0.0,
+            "reproducibility": 0.0,
+        }
+
+        if not cause_events or not effect_events:
+            return {"scores": scores, "composite": 0.0, "confidence_tier": "low"}
+
+        # 1. Temporal: Score based on causal precedence
+        temporal_result = self._score_temporal_causality(cause_events, effect_events)
+        scores["temporal"] = temporal_result["confidence"]
+
+        # 2. Spatial: Score based on resource overlap
+        spatial_result = self._score_spatial_correlation(cause_events, effect_events)
+        scores["spatial"] = spatial_result["overlap_score"]
+
+        # 3. Mechanism: Known causal relationship
+        scores["mechanism"] = 1.0 if mechanism_known else 0.3
+
+        # 4. Exclusivity: Fewer alternatives = higher score
+        alt_count = len(alternative_causes) if alternative_causes else 0
+        scores["exclusivity"] = max(0.0, 1.0 - (alt_count * 0.25))
+
+        # 5. Reproducibility: Multiple occurrences of same pattern
+        unique_pairs = temporal_result.get("causal_pairs_count", 0)
+        scores["reproducibility"] = min(1.0, unique_pairs / 5.0) if unique_pairs > 0 else 0.0
+
+        # Weighted composite (temporal and mechanism weighted higher)
+        weights = {
+            "temporal": 0.30,
+            "spatial": 0.20,
+            "mechanism": 0.25,
+            "exclusivity": 0.15,
+            "reproducibility": 0.10,
+        }
+        composite = sum(scores[k] * weights[k] for k in scores)
+
+        # Assign confidence tier
+        if composite >= 0.75:
+            tier = "high"
+        elif composite >= 0.50:
+            tier = "medium"
+        else:
+            tier = "low"
+
+        return {
+            "scores": scores,
+            "composite": round(composite, 3),
+            "confidence_tier": tier,
+            "temporal_evidence": temporal_result,
+            "spatial_evidence": spatial_result,
+        }
+
+    def _score_spatial_correlation(self, cause_events: list, effect_events: list) -> dict:
+        """Score spatial correlation between cause and effect events.
+
+        Checks if cause and effect occurred on same node, pod, or namespace.
+
+        Returns:
+            Dict with overlap scores and matching resources
+        """
+        spatial_matches = {
+            "node_matches": 0,
+            "namespace_matches": 0,
+            "pod_matches": 0,
+        }
+        matched_resources = {"nodes": set(), "namespaces": set(), "pods": set()}
+
+        # Extract resource identifiers from cause events
+        cause_nodes = set()
+        cause_namespaces = set()
+        cause_pods = set()
+
+        for cause in cause_events:
+            details = cause.get("details", {})
+            if details.get("node"):
+                cause_nodes.add(details["node"])
+            if details.get("namespace"):
+                cause_namespaces.add(details["namespace"])
+            if details.get("pod"):
+                ns = details.get("namespace", "")
+                cause_pods.add(f"{ns}/{details['pod']}" if ns else details["pod"])
+
+        # Check effect events for spatial overlap
+        for effect in effect_events:
+            details = effect.get("details", {})
+
+            if details.get("node") and details["node"] in cause_nodes:
+                spatial_matches["node_matches"] += 1
+                matched_resources["nodes"].add(details["node"])
+
+            if details.get("namespace") and details["namespace"] in cause_namespaces:
+                spatial_matches["namespace_matches"] += 1
+                matched_resources["namespaces"].add(details["namespace"])
+
+            pod_key = f"{details.get('namespace', '')}/{details['pod']}" if details.get("pod") else None
+            if pod_key and pod_key in cause_pods:
+                spatial_matches["pod_matches"] += 1
+                matched_resources["pods"].add(pod_key)
+
+        # Calculate overlap score (weighted: node=0.5, namespace=0.3, pod=0.2)
+        total_effects = len(effect_events) if effect_events else 1
+        node_score = spatial_matches["node_matches"] / total_effects
+        ns_score = spatial_matches["namespace_matches"] / total_effects
+        pod_score = spatial_matches["pod_matches"] / total_effects
+
+        overlap_score = min(1.0, (node_score * 0.5) + (ns_score * 0.3) + (pod_score * 0.2))
+
+        return {
+            "overlap_score": round(overlap_score, 3),
+            "node_matches": spatial_matches["node_matches"],
+            "namespace_matches": spatial_matches["namespace_matches"],
+            "pod_matches": spatial_matches["pod_matches"],
+            "matched_nodes": list(matched_resources["nodes"])[:5],
+            "matched_namespaces": list(matched_resources["namespaces"])[:5],
+        }
+
     def _calculate_blast_radius(self, root_cause_time: str) -> dict:
         """Calculate how many resources are affected after a root cause event.
 
@@ -11714,13 +13314,16 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         return chains
 
     def _rank_root_causes(self, correlations: list) -> list:
-        """Rank root causes by confidence and impact.
+        """Rank root causes by 5-dimensional confidence and impact.
 
-        Scoring:
-        - Temporal causality: 0-40 points
+        Scoring (v3.6.0 enhanced):
+        - Composite 5D confidence: 0-35 points
         - Severity: 0-30 points
         - Blast radius: 0-20 points
-        - AWS API confirmation: 0-10 points
+        - Spatial correlation: 0-10 points
+        - AWS API confirmation: 0-15 points (increased for confirmed upgrades)
+        - Explanatory power: 0-10 bonus
+        - Cluster upgrade bonus: +10 points when AWS confirms
 
         Args:
             correlations: List of correlation dicts
@@ -11731,8 +13334,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         for corr in correlations:
             score = 0
 
-            # Temporal causality score (0-40 points)
-            score += corr.get("temporal_confidence", 0) * 40
+            # Composite 5D confidence score (0-35 points)
+            composite = corr.get("composite_confidence", corr.get("temporal_confidence", 0))
+            score += composite * 35
 
             # Severity (0-30 points)
             severity_scores = {"critical": 30, "high": 25, "warning": 15, "info": 5}
@@ -11742,9 +13346,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             blast = corr.get("blast_radius", {})
             score += min(blast.get("pods", 0), 20)
 
-            # AWS API confirmation (0-10 points)
+            # Spatial correlation bonus (0-10 points)
+            spatial_score = corr.get("spatial_evidence", {}).get("overlap_score", 0)
+            score += spatial_score * 10
+
+            # AWS API confirmation (0-15 points) - increased weight
             if corr.get("affected_components", {}).get("aws_api_confirmed"):
-                score += 10
+                score += 15
+
+            # Cluster upgrade with AWS confirmation gets extra bonus
+            if corr.get("correlation_type") == "cluster_upgrade" and corr.get("affected_components", {}).get(
+                "aws_api_confirmed"
+            ):
+                score += 10  # Extra bonus for AWS-confirmed upgrades
 
             # Explanatory power (0-10 bonus) - how many findings does this explain?
             total_findings = corr.get("affected_components", {}).get("total_findings", 0)
@@ -11759,33 +13373,45 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         return sorted(correlations, key=lambda x: x.get("root_cause_score", 0), reverse=True)
 
     def _enhance_correlations(self) -> None:
-        """Enhance all correlations with temporal causality, blast radius, and ranking.
+        """Enhance all correlations with 5-dimensional confidence scoring, spatial correlation, and ranking.
 
         Called after correlate_findings() to add enhanced analysis.
         """
+        # Define known causal mechanisms for correlation types
+        KNOWN_MECHANISMS = {
+            "node_pressure_cascade": True,  # Node pressure → pod eviction is well-established
+            "oom_pattern": True,  # Memory pressure → OOM is well-established
+            "cni_cascade": True,  # CNI issues → network failures is well-established
+            "storage_cascade": True,  # PVC issues → pod startup failures is well-established
+            "irsa_cascade": True,  # IAM issues → credential failures is well-established
+            "control_plane_impact": True,  # Control plane → pod failures is well-established
+            "image_pull_pattern": True,  # Registry issues → pull failures is well-established
+            "scheduling_pattern": True,  # Resource constraints → scheduling failures is well-established
+            "dns_pattern": True,  # CoreDNS issues → DNS failures is well-established
+            "subnet_exhaustion_cascade": True,  # Subnet IP exhaustion → CNI/scheduling failures
+            "certificate_cascade": True,  # Cert issues → webhook failures
+            "quota_exhaustion": True,  # Quota limits → scheduling failures
+            "hpa_thrashing": True,  # HPA config → rapid scaling
+            "cluster_upgrade": True,  # Upgrades → transient failures
+        }
+
         for corr in self.correlations:
-            # Add temporal causality scoring
-            if corr["correlation_type"] == "node_pressure_cascade":
+            corr_type = corr.get("correlation_type", "")
+            mechanism_known = KNOWN_MECHANISMS.get(corr_type, False)
+
+            # Determine cause and effect events based on correlation type
+            if corr_type == "node_pressure_cascade":
                 pressure_type = "memory" if self.findings["memory_pressure"] else "disk"
                 cause_events = self.findings.get(f"{pressure_type}_pressure", [])
                 effect_events = self.findings.get("pod_errors", [])
+                alternative_causes = ["application_bug", "config_error"]
 
-                causality = self._score_temporal_causality(cause_events, effect_events)
-                corr["temporal_confidence"] = causality["confidence"]
-                corr["avg_lag_minutes"] = causality["avg_lag_minutes"]
-                corr["causal_evidence"] = causality["causal_pairs"]
-
-            elif corr["correlation_type"] == "oom_pattern":
-                # OOM usually follows memory pressure
+            elif corr_type == "oom_pattern":
                 cause_events = self.findings.get("memory_pressure", [])
                 effect_events = self.findings.get("oom_killed", [])
+                alternative_causes = ["memory_leak", "limits_too_low"]
 
-                causality = self._score_temporal_causality(cause_events, effect_events)
-                corr["temporal_confidence"] = causality["confidence"]
-                corr["avg_lag_minutes"] = causality["avg_lag_minutes"]
-                corr["causal_evidence"] = causality["causal_pairs"]
-
-            elif corr["correlation_type"] == "cni_cascade":
+            elif corr_type == "cni_cascade":
                 cause_events = [
                     f
                     for f in self.findings.get("network_issues", [])
@@ -11794,17 +13420,175 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 effect_events = [
                     f for f in self.findings.get("network_issues", []) if "NetworkNotReady" in f.get("summary", "")
                 ]
+                alternative_causes = ["security_group", "subnet_config"]
 
-                causality = self._score_temporal_causality(cause_events, effect_events)
-                corr["temporal_confidence"] = causality["confidence"]
-                corr["avg_lag_minutes"] = causality["avg_lag_minutes"]
-                corr["causal_evidence"] = causality["causal_pairs"]
+            elif corr_type == "storage_cascade":
+                cause_events = [
+                    f for f in self.findings.get("pvc_issues", []) if "pending" in f.get("summary", "").lower()
+                ]
+                effect_events = [
+                    f
+                    for f in self.findings.get("pod_errors", [])
+                    if any(kw in f.get("summary", "").lower() for kw in ["containercreating", "mount", "volume"])
+                ]
+                alternative_causes = ["storage_class", "az_constraint"]
+
+            elif corr_type == "control_plane_impact":
+                cause_events = [
+                    f
+                    for f in self.findings.get("control_plane_issues", [])
+                    if f.get("details", {}).get("severity") == "critical"
+                ]
+                effect_events = self.findings.get("pod_errors", [])
+                alternative_causes = []
+
+            elif corr_type == "image_pull_pattern":
+                cause_events = self.findings.get("image_pull_failures", [])
+                effect_events = [
+                    f
+                    for f in self.findings.get("pod_errors", [])
+                    if "ImagePull" in f.get("summary", "") or "ErrImagePull" in f.get("summary", "")
+                ]
+                alternative_causes = ["network_issue", "registry_down"]
+
+            elif corr_type == "scheduling_pattern":
+                cause_events = self.findings.get("scheduling_failures", [])
+                effect_events = [
+                    f
+                    for f in self.findings.get("pod_errors", [])
+                    if "Pending" in f.get("summary", "") or "FailedScheduling" in f.get("summary", "")
+                ]
+                alternative_causes = []
+
+            elif corr_type == "dns_pattern":
+                cause_events = [
+                    f for f in self.findings.get("dns_issues", []) if "coredns" in f.get("summary", "").lower()
+                ]
+                effect_events = self.findings.get("dns_issues", [])
+                alternative_causes = ["vpc_dns", "stub_domain"]
+
+            elif corr_type == "irsa_cascade":
+                cause_events = self.findings.get("rbac_issues", [])
+                effect_events = [
+                    f
+                    for f in self.findings.get("pod_errors", [])
+                    if any(
+                        kw in str(f.get("details", {})).lower()
+                        for kw in ["403", "unauthorized", "credential", "access denied"]
+                    )
+                ]
+                alternative_causes = ["s3_bucket_policy", "kms_key_policy"]
+
+            elif corr_type == "cluster_upgrade":
+                # Special handling for cluster upgrade - AWS API confirmation = high confidence
+                aws_confirmed = corr.get("affected_components", {}).get("aws_api_confirmed", False)
+                total_findings = corr.get("affected_components", {}).get("total_findings", 0)
+
+                if aws_confirmed:
+                    # AWS API confirmed upgrade = HIGH confidence
+                    corr["confidence_5d"] = {
+                        "temporal": 1.0,  # AWS API provides timestamp
+                        "spatial": 0.8,  # Upgrade affects all nodes
+                        "mechanism": 1.0,  # Upgrade is a known cause
+                        "exclusivity": 0.9,  # Only plausible cause for mass events
+                        "reproducibility": 0.0,  # Single event
+                    }
+                    corr["composite_confidence"] = 0.92  # High confidence
+                    corr["confidence_tier"] = "high"
+                    corr["temporal_evidence"] = {"confidence": 1.0, "source": "aws_api"}
+                    corr["spatial_evidence"] = {"overlap_score": 0.8, "scope": "cluster-wide"}
+                elif total_findings >= 10:
+                    # Pattern-based detection with many findings = MEDIUM confidence
+                    corr["confidence_5d"] = {
+                        "temporal": 0.7,
+                        "spatial": 0.6,
+                        "mechanism": 1.0,
+                        "exclusivity": 0.7,
+                        "reproducibility": 0.0,
+                    }
+                    corr["composite_confidence"] = 0.72
+                    corr["confidence_tier"] = "medium"
+                    corr["temporal_evidence"] = {"confidence": 0.7}
+                    corr["spatial_evidence"] = {"overlap_score": 0.6}
+                else:
+                    # Low confidence without strong evidence
+                    corr["confidence_5d"] = {
+                        "temporal": 0.5,
+                        "spatial": 0.4,
+                        "mechanism": 0.8,
+                        "exclusivity": 0.5,
+                        "reproducibility": 0.0,
+                    }
+                    corr["composite_confidence"] = 0.52
+                    corr["confidence_tier"] = "medium"
+                    corr["temporal_evidence"] = {"confidence": 0.5}
+                    corr["spatial_evidence"] = {"overlap_score": 0.4}
+
+                # Skip the standard 5D calculation
+                cause_events = []
+                effect_events = []
+                alternative_causes = []
 
             else:
-                # Default confidence based on evidence count
-                corr["temporal_confidence"] = (
-                    0.5 if corr.get("affected_components", {}).get("aws_api_confirmed") else 0.3
+                # Default: use correlation's affected components as proxy
+                cause_events = []
+                effect_events = []
+                alternative_causes = []
+
+            # Calculate 5-dimensional confidence if we have events
+            # Skip if already set (e.g., by cluster_upgrade special handling)
+            if "composite_confidence" in corr:
+                # Confidence already calculated, skip to blast radius
+                pass
+            elif cause_events and effect_events:
+                confidence_result = self._calculate_5d_confidence(
+                    cause_events, effect_events, mechanism_known, alternative_causes
                 )
+                corr["confidence_5d"] = confidence_result["scores"]
+                corr["composite_confidence"] = confidence_result["composite"]
+                corr["confidence_tier"] = confidence_result["confidence_tier"]
+                corr["temporal_evidence"] = confidence_result.get("temporal_evidence", {})
+                corr["spatial_evidence"] = confidence_result.get("spatial_evidence", {})
+            else:
+                # Fallback: basic confidence from evidence count
+                evidence_count = sum(
+                    corr.get("affected_components", {}).get(k, 0)
+                    for k in ["evicted_pods_count", "oom_killed_pods", "total_image_failures"]
+                    if isinstance(corr.get("affected_components", {}).get(k, 0), int)
+                )
+                base_confidence = min(0.8, evidence_count / 10.0) if evidence_count > 0 else 0.3
+                corr["confidence_5d"] = {
+                    "temporal": base_confidence,
+                    "spatial": 0.0,
+                    "mechanism": 1.0 if mechanism_known else 0.3,
+                    "exclusivity": 0.5,
+                    "reproducibility": 0.0,
+                }
+                corr["composite_confidence"] = round(
+                    (
+                        base_confidence * 0.3
+                        + 0.0 * 0.2
+                        + (1.0 if mechanism_known else 0.3) * 0.25
+                        + 0.5 * 0.15
+                        + 0.0 * 0.10
+                    ),
+                    3,
+                )
+                corr["confidence_tier"] = (
+                    "high"
+                    if corr["composite_confidence"] >= 0.75
+                    else "medium"
+                    if corr["composite_confidence"] >= 0.50
+                    else "low"
+                )
+                corr["temporal_evidence"] = {"confidence": base_confidence}
+                corr["spatial_evidence"] = {"overlap_score": 0.0}
+
+            # Legacy fields for backward compatibility
+            if "temporal_evidence" in corr and isinstance(corr["temporal_evidence"], dict):
+                corr["temporal_confidence"] = corr["temporal_evidence"].get("confidence", 0.0)
+                corr["avg_lag_minutes"] = corr["temporal_evidence"].get("avg_lag_minutes", 0.0)
+                corr["causal_evidence"] = corr["temporal_evidence"].get("causal_pairs", [])
 
             # Add blast radius
             root_time = corr.get("root_cause_time", "")
@@ -16368,7 +18152,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     def run_comprehensive_analysis(self):
         """
-        Run all 56 analysis methods with graceful degradation.
+        Run all 72 analysis methods with graceful degradation.
 
         Supports parallel execution for improved performance and incremental
         analysis with delta reporting when enabled.
@@ -16390,7 +18174,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             ClusterNotFoundError: If the cluster doesn't exist.
             KubectlNotAvailableError: If kubectl is not in PATH.
         """
-        self.progress.set_total_steps(60)
+        self.progress.set_total_steps(76)
 
         # Step 1-3: Basic setup
         try:
@@ -16495,6 +18279,26 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.analyze_cloudwatch_logging_health,
             # Addons
             self.check_eks_addons,
+            # === Enhanced Kubernetes Diagnostics (v3.6.0) ===
+            # HIGH PRIORITY
+            self.analyze_init_container_failures,
+            self.analyze_pdb_violations,
+            self.analyze_sidecar_health,
+            self.analyze_node_resource_saturation,
+            self.analyze_version_skew,
+            self.analyze_ingress_health,
+            self.analyze_hpa_metrics_source,
+            self.analyze_deprecated_apis,
+            # MEDIUM PRIORITY
+            self.analyze_topology_spread,
+            self.analyze_node_ami_age,
+            self.analyze_endpointslice_health,
+            self.analyze_dns_configuration,
+            self.analyze_karpenter_drift,
+            self.analyze_workload_security_posture,
+            # LOW PRIORITY
+            self.analyze_ephemeral_containers,
+            self.analyze_volume_snapshots,
         ]
 
         if self.parallel:

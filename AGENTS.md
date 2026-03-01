@@ -6,9 +6,9 @@ Guidelines for AI coding agents working in the EKS Health Check Dashboard codeba
 
 Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
 
-**Version:** 3.5.0  
-**Lines of Code:** ~13,700  
-**Analysis Methods:** 56  
+**Version:** 3.6.0  
+**Lines of Code:** ~19,000  
+**Analysis Methods:** 72  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)  
 **Unit Tests:** 158 tests
 
@@ -35,7 +35,7 @@ mypy eks_comprehensive_debugger.py --ignore-missing-imports
 ## File Structure
 
 ```
-eks_comprehensive_debugger.py  # Main debugger (~13,600 lines, all-in-one)
+eks_comprehensive_debugger.py  # Main debugger (~19,000 lines, all-in-one)
 requirements.txt               # Python dependencies (includes test deps)
 .gitignore                     # Git ignore rules
 README-EKS-DEBUGGER.md         # User documentation
@@ -61,7 +61,7 @@ Testing: `pytest>=8.0.0`, `pytest-mock>=3.12.0`
 
 ## Code Architecture
 
-### Security Architecture (v3.4.0)
+### Security Architecture (v3.4.0+)
 
 The debugger implements defense-in-depth security for production use:
 
@@ -77,13 +77,20 @@ INPUT_VALIDATION_PATTERNS = {
 
 def validate_input(name: str, value: str) -> str:
     """Validate input parameter against safe pattern to prevent shell injection."""
+    if len(value) > 256:
+        raise InputValidationError(f"{name} exceeds maximum length of 256 characters")
 ```
 
 **Shell Injection Prevention:**
 - All user inputs (profile, region, cluster_name, namespace, kube_context) validated with strict regex
 - Blocks: `;`, `|`, `&&`, `$()`, backticks, redirections, special chars
 - `update_kubeconfig()`: Uses `shell=False` with list args
-- `get_kubectl_output()`: Uses `shell=True` (required for `||`, pipes) with validated inputs
+- `get_kubectl_output()`: Uses validated inputs with shell=False where possible
+
+**XSS Prevention (v3.6.0):**
+- HTML modal content properly escaped
+- Error messages escaped in output
+- Finding summary/category/severity escaped
 
 **File Permissions:**
 - Output files (HTML, JSON) created with `0o600` (owner-only)
@@ -94,13 +101,19 @@ def validate_input(name: str, value: str) -> str:
 - AWS Account ID masked (shows only last 4 digits: `****1234`)
 - IAM ARN truncated to role/user name only
 
-### Thread Safety (v3.4.0)
+### Thread Safety (v3.4.0+)
 
 The debugger uses thread-safe data structures for parallel analysis:
 
 ```python
 self._findings_lock = threading.Lock()  # Protects self.findings mutations
 self._shared_data_lock = threading.Lock()  # Protects cache access
+self._errors_lock = threading.Lock()  # Protects self.errors mutations
+
+def _add_error(self, step: str, message: str) -> None:
+    """Thread-safe error addition."""
+    with self._errors_lock:
+        self.errors.append({"step": step, "message": message})
 ```
 
 **Finding Addition Pattern:**
@@ -117,12 +130,62 @@ def _add_finding_dict(self, category, finding):
     return self._add_finding(category, finding["summary"], ...)
 ```
 
-All 131+ finding additions go through `_add_finding_dict()` for:
+All 150+ finding additions go through `_add_finding_dict()` for:
 1. Thread safety via lock
 2. Max findings limit (500 per category)
 3. Consistent finding_type classification
 
-### Configuration Constants (v3.0.0)
+### Enhanced Root Cause Detection (v3.6.0)
+
+The debugger uses 5-dimensional confidence scoring for root cause correlation:
+
+**5D Confidence Scoring:**
+```python
+def _calculate_5d_confidence(self, cause_events, effect_events, mechanism_known, alternative_causes):
+    """Calculate 5-dimensional confidence score.
+    
+    Dimensions:
+        1. Temporal (30%): Does cause precede effect within causal window?
+        2. Spatial (20%): Are cause and effect on same node/pod/namespace?
+        3. Mechanism (25%): Is there a known causal mechanism?
+        4. Exclusivity (15%): Is this the only plausible cause?
+        5. Reproducibility (10%): Has this pattern occurred multiple times?
+    
+    Returns:
+        Dict with scores, composite (0-1), and confidence_tier (high/medium/low)
+    """
+```
+
+**Confidence Tiers:**
+- `high` (≥0.75): Strong evidence of causality
+- `medium` (≥0.50): Moderate evidence, needs validation
+- `low` (<0.50): Weak correlation, investigate further
+
+**Spatial Correlation:**
+```python
+def _score_spatial_correlation(self, cause_events, effect_events):
+    """Score spatial correlation between cause and effect.
+    
+    Checks if cause and effect occurred on same node, pod, or namespace.
+    Weights: node=50%, namespace=30%, pod=20%
+    """
+```
+
+**Enhanced Ranking:**
+```python
+def _rank_root_causes(self, correlations):
+    """Rank root causes by 5D confidence and impact.
+    
+    Scoring:
+    - Composite 5D confidence: 0-35 points
+    - Severity: 0-30 points
+    - Blast radius: 0-20 points
+    - Spatial correlation: 0-10 points
+    - AWS API confirmation: 0-5 points
+    """
+```
+
+### Configuration Constants (v3.0.0+)
 
 ```python
 # Thresholds for alerting
@@ -201,13 +264,17 @@ CONTROL_PLANE_ERROR_PATTERNS = [
 | `_parse_event_common(event)` | Extract common fields from kubectl event |
 | `_add_finding(category, summary, details)` | Thread-safe finding addition with limit enforcement |
 | `_add_finding_dict(category, finding)` | Convenience wrapper for dict-based findings |
+| `_add_error(step, message)` | Thread-safe error addition |
 | `_classify_severity(summary, details)` | Classify finding severity based on content |
 | `_extract_timestamp(details)` | Extract timestamp from finding details |
 | `_get_node_from_pod(pod_details)` | Extract node name from pod details |
 | `_get_bucket_severity(events)` | Determine severity for timeline bucket |
 | `validate_input(name, value)` | Validate input against safe patterns (shell injection prevention) |
+| `_calculate_5d_confidence(...)` | 5-dimensional confidence scoring for correlations |
+| `_score_spatial_correlation(...)` | Spatial overlap detection between cause/effect |
+| `_score_temporal_causality(...)` | Temporal precedence scoring |
 
-### Performance Architecture (v3.3.0)
+### Performance Architecture (v3.3.0+)
 
 The debugger uses several optimization strategies for fast analysis:
 
@@ -226,12 +293,37 @@ def _prefetch_shared_data(self):
 | `PerformanceTracker` | Track and report execution times for analysis methods |
 | `IncrementalCache` | Store previous results for delta reporting |
 
-**Helper Methods:**
-| Method | Purpose |
-|--------|---------|
-| `_get_cached_log_group(prefix)` | Get cached CloudWatch log group data |
-| `_get_cached_kubectl(cmd)` | Get cached kubectl output |
-| `get_kubectl_output(cmd, use_cache=True)` | Run kubectl with optional caching |
+**API Resilience (v3.6.0):**
+```python
+def safe_api_call(self, func, *args, **kwargs):
+    """Execute AWS API call with exponential backoff and jitter."""
+    max_retries = 3
+    base_delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            return True, func(*args, **kwargs)
+        except ClientError as e:
+            if e.response['Error']['Code'] in ['Throttling', 'RequestLimitExceeded']:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(delay)
+```
+
+**Pagination Support (v3.6.0):**
+```python
+def get_cluster_name(self):
+    """Get cluster name with pagination support for >100 clusters."""
+    clusters = []
+    next_token = None
+    while True:
+        params = {}
+        if next_token:
+            params["nextToken"] = next_token
+        response = self.eks_client.list_clusters(**params)
+        clusters.extend(response.get("clusters", []))
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+```
 
 **Parallel Execution:**
 - Uses `ThreadPoolExecutor` with `MAX_PARALLEL_WORKERS=8`
@@ -249,7 +341,7 @@ results = {
 }
 ```
 
-### Smart Correlation (v1.4.0)
+### Smart Correlation (v1.4.0+)
 
 The debugger performs intelligent correlation across data sources to identify root causes:
 
@@ -264,6 +356,13 @@ The debugger performs intelligent correlation across data sources to identify ro
 | `image_pull_pattern` | Image pull failures | Registry/auth issues |
 | `scheduling_pattern` | Scheduling failures | Resource constraints or affinity rules |
 | `dns_pattern` | DNS issues + CoreDNS health | CoreDNS configuration problems |
+| `storage_cascade` | PVC pending + Pod startup failures | Storage attachment issues |
+| `irsa_cascade` | IAM issues + Credential failures | IRSA/Pod Identity issues |
+| `hpa_thrashing` | Rapid scale events | HPA misconfiguration |
+| `quota_exhaustion` | ResourceQuota + Scheduling failures | Quota limits |
+| `certificate_cascade` | Cert issues + Webhook failures | Certificate expiry |
+| `subnet_exhaustion_cascade` | Subnet IP exhaustion + CNI/scheduling failures | IP address exhaustion |
+| `cluster_upgrade` | Mass node/pod events + AWS API confirmation | Upgrade in progress |
 
 **Output Structure:**
 ```python
@@ -274,11 +373,30 @@ The debugger performs intelligent correlation across data sources to identify ro
             "severity": "critical",
             "root_cause": "Node memory pressure detected",
             "root_cause_time": "2026-02-20 10:30:00+00:00",
+            "confidence_tier": "high",
+            "composite_confidence": 0.85,
+            "confidence_5d": {
+                "temporal": 0.9,
+                "spatial": 0.72,
+                "mechanism": 1.0,
+                "exclusivity": 0.75,
+                "reproducibility": 0.6
+            },
+            "spatial_evidence": {
+                "overlap_score": 0.72,
+                "node_matches": 3,
+                "namespace_matches": 2
+            },
             "impact": "5 pods evicted due to memory pressure on 2 node(s)",
             "recommendation": "Address memory pressure on affected nodes...",
             "aws_doc": "https://repost.aws/knowledge-center/..."
         }
     ],
+    "correlations_by_confidence_tier": {
+        "high": [...],
+        "medium": [...],
+        "low": [...]
+    },
     "timeline": [
         {
             "time_bucket": "2026-02-20 10:00",
@@ -309,7 +427,7 @@ The debugger performs intelligent correlation across data sources to identify ro
 | `MarkdownOutputFormatter` | Markdown output |
 | `YAMLOutputFormatter` | YAML output |
 | `HTMLOutputFormatter` | Interactive HTML dashboard |
-| `LLMJSONOutputFormatter` | LLM-optimized JSON output |
+| `LLMJSONOutputFormatter` | LLM-optimized JSON output with confidence tiers |
 | `ExecutiveSummaryGenerator` | Generate executive summary from results |
 | `APICache` | Thread-safe TTL cache for AWS API responses |
 | `PerformanceTracker` | Track execution times for analysis methods |
@@ -333,7 +451,7 @@ EKSDebuggerError (base)
 
 ---
 
-## Unit Tests (v3.4.0)
+## Unit Tests (v3.4.0+)
 
 The test suite covers critical security and functionality areas:
 
@@ -354,9 +472,9 @@ python3 -m pytest tests/ -v
 
 ---
 
-## Analysis Methods (56 total)
+## Analysis Methods (72 total)
 
-### Pod Lifecycle & Health (9 methods)
+### Pod Lifecycle & Health (13 methods)
 
 | Method | Data Source | Catalog Coverage |
 |--------|-------------|------------------|
@@ -365,16 +483,23 @@ python3 -m pytest tests/ -v
 | `analyze_pod_health_deep` | kubectl pods | CrashLoopBackOff, init container failures, high restarts |
 | `analyze_probe_failures` | kubectl events | Liveness/readiness probe failures |
 | `analyze_image_pull_failures` | kubectl events | ImagePullBackOff, ErrImagePull, auth failures |
+| `analyze_init_container_failures` | kubectl pods | Init container stuck/failed (v3.6.0) |
+| `analyze_sidecar_health` | kubectl pods | Sidecar container failures (v3.6.0) |
+| `analyze_pdb_violations` | kubectl pdb | PDB blocking drains (v3.6.0) |
 | `analyze_pods_terminating` | kubectl pods | Stuck in Terminating (finalizers) |
 | `analyze_deployment_rollouts` | kubectl deployments | Rollout stuck, ProgressDeadlineExceeded |
 | `analyze_jobs_cronjobs` | kubectl jobs/cronjobs | BackoffLimitExceeded, missed schedules |
 | `analyze_statefulset_issues` | kubectl statefulsets | StatefulSet PVC issues, ordinal failures |
+| `analyze_ephemeral_containers` | kubectl pods | Failed debug containers (v3.6.0) |
 
-### Node Health (7 methods)
+### Node Health (10 methods)
 
 | Method | Data Source | Catalog Coverage |
 |--------|-------------|------------------|
 | `analyze_node_conditions` | kubectl nodes | NotReady, DiskPressure, MemoryPressure, PIDPressure |
+| `analyze_node_resource_saturation` | kubectl top | Pre-pressure detection >90% (v3.6.0) |
+| `analyze_version_skew` | kubectl nodes | Kubelet version mismatch (v3.6.0) |
+| `analyze_node_ami_age` | EC2 API | AMI age detection (v3.6.0) |
 | `analyze_eks_nodegroup_health` | EKS API | Managed node group degradation |
 | `analyze_certificate_expiry` | kubectl nodes/events | Kubelet certificate rotation failures |
 | `analyze_windows_nodes` | kubectl nodes | Windows node specific issues |
@@ -382,7 +507,7 @@ python3 -m pytest tests/ -v
 | `analyze_container_runtime` | kubectl events | containerd not responding |
 | `analyze_pause_image_issues` | kubectl events | Pause/sandbox image garbage-collected |
 
-### Scheduling & Resources (6 methods)
+### Scheduling & Resources (7 methods)
 
 | Method | Data Source | Catalog Coverage |
 |--------|-------------|------------------|
@@ -390,30 +515,35 @@ python3 -m pytest tests/ -v
 | `analyze_resource_quotas` | kubectl resourcequotas | Quota exceeded, near-limit warnings |
 | `analyze_cpu_throttling` | CloudWatch Metrics | CPU throttling, high utilization |
 | `analyze_hpa_vpa` | kubectl hpa | HPA unable to scale, metrics unavailable |
+| `analyze_hpa_metrics_source` | kubectl deployment | metrics-server health (v3.6.0) |
 | `analyze_gpu_scheduling` | kubectl nodes/pods | GPU scheduling issues |
 | `analyze_limits_requests` | kubectl pods | Missing limits/requests, QoS analysis |
 
-### Networking (9 methods)
+### Networking (12 methods)
 
 | Method | Data Source | Catalog Coverage |
 |--------|-------------|------------------|
 | `analyze_network_issues` | kubectl events/pods | General network connectivity |
 | `analyze_vpc_cni_health` | kubectl daemonset/events | IP exhaustion, aws-node health |
 | `analyze_coredns_health` | kubectl deployment/events | DNS resolution failures |
+| `analyze_dns_configuration` | kubectl pods | ndots:5 amplification (v3.6.0) |
 | `analyze_service_health` | kubectl endpoints/services | No endpoints, connectivity issues |
+| `analyze_endpointslice_health` | kubectl endpointslices | Backend readiness (v3.6.0) |
+| `analyze_ingress_health` | kubectl ingresses | Missing backends, TLS secrets (v3.6.0) |
 | `analyze_subnet_health` | EC2 API | Subnet IP availability |
 | `analyze_security_groups` | EC2 API | Security group rule issues |
 | `analyze_network_policies` | kubectl networkpolicies | NetworkPolicy blocking traffic |
 | `analyze_alb_health` | CloudWatch ALB metrics | ALB 5xx errors, unhealthy targets |
 | `analyze_conntrack_health` | kubectl events/nodes | Conntrack table exhaustion |
 
-### Storage (3 methods)
+### Storage (4 methods)
 
 | Method | Data Source | Catalog Coverage |
 |--------|-------------|------------------|
 | `analyze_pvc_issues` | kubectl pvc/pv | PVC Pending, PV Released/Failed, ProvisioningFailed |
 | `analyze_ebs_csi_health` | kubectl deployment/events | EBS CSI attachment failures |
 | `analyze_efs_csi_health` | kubectl deployment/events | EFS mount failures |
+| `analyze_volume_snapshots` | kubectl volumesnapshots | Failed snapshots (v3.6.0) |
 
 ### IAM & RBAC (4 methods)
 
@@ -430,6 +560,7 @@ python3 -m pytest tests/ -v
 |--------|-------------|------------------|
 | `analyze_cluster_autoscaler` | kubectl deployment/logs | Cluster Autoscaler issues |
 | `analyze_karpenter` | kubectl deployment/nodepools | Karpenter provisioning failures |
+| `analyze_karpenter_drift` | kubectl nodeclaims | NodeClaim drift (v3.6.0) |
 | `analyze_fargate_health` | EKS API | Fargate profile issues |
 
 ### AWS Infrastructure (3 methods)
@@ -462,6 +593,15 @@ python3 -m pytest tests/ -v
 | `check_eks_addons` | EKS API | EKS addon health |
 | `correlate_findings` | Cross-source | Root cause correlation |
 
+### Security & Compliance (4 methods)
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `analyze_deprecated_apis` | kubectl api-resources | Deprecated API usage (v3.6.0) |
+| `analyze_workload_security_posture` | kubectl pods | Privileged containers, host paths (v3.6.0) |
+| `analyze_topology_spread` | kubectl pods | Topology constraint violations (v3.6.0) |
+| `analyze_psa_violations` | kubectl pods/namespaces | Pod Security Admission violations |
+
 ---
 
 ## Code Style
@@ -477,12 +617,13 @@ python3 -m pytest tests/ -v
 ```python
 def get_kubectl_output(self, cmd: str, timeout: int = DEFAULT_TIMEOUT, required: bool = False) -> str | None:
 def safe_api_call(self, func: Callable, *args, **kwargs) -> tuple[bool, Any]:
+def _calculate_5d_confidence(self, cause_events: list, effect_events: list, mechanism_known: bool, alternative_causes: list | None) -> dict:
 ```
 
 ### Error Handling
 
 **Analysis Methods Exception Philosophy:**
-Each of the 56 analysis methods wraps its logic in `try/except Exception` for **graceful degradation**. This is intentional: if one analysis method fails (e.g., API timeout, malformed data), other methods continue and the tool still produces useful output.
+Each of the 72 analysis methods wraps its logic in `try/except Exception` for **graceful degradation**. This is intentional: if one analysis method fails (e.g., API timeout, malformed data), other methods continue and the tool still produces useful output.
 
 Known exception sources within methods:
 - `json.loads()` → `json.JSONDecodeError` (malformed kubectl/AWS responses)
@@ -496,7 +637,7 @@ These are caught by `safe_kubectl_call()` and `safe_api_call()` helpers, but dic
 try:
     method()
 except Exception as e:
-    self.errors.append({'step': 'method_name', 'message': str(e)})
+    self._add_error("method_name", str(e))
     self.progress.warning(f"Analysis failed: {e}")
 ```
 
@@ -552,6 +693,11 @@ results = {
     },
     'findings': dict[str, list[dict]],
     'correlations': list[dict],      # Root cause analysis
+    'correlations_by_confidence_tier': {  # v3.6.0
+        'high': list[dict],
+        'medium': list[dict],
+        'low': list[dict]
+    },
     'timeline': list[dict],          # Event timeline by hour
     'first_issue': dict | None,      # Earliest detected issue
     'recommendations': list[dict],
@@ -565,7 +711,7 @@ results = {
 
 ---
 
-## Evidence-Based Recommendations (v2.1.0)
+## Evidence-Based Recommendations (v2.1.0+)
 
 Each recommendation includes evidence from actual findings:
 

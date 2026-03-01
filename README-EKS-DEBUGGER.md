@@ -8,13 +8,13 @@
 
 A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 3.5.0 | **Analysis Methods:** 56 | **Catalog Coverage:** 100% | **Tests:** 158
+**Version:** 3.6.0 | **Analysis Methods:** 72 | **Catalog Coverage:** 100% | **Tests:** 158
 
 ---
 
 ## Features
 
-### Comprehensive Issue Detection (56 Analysis Methods)
+### Comprehensive Issue Detection (72 Analysis Methods)
 
 #### Pod & Workload Issues
 - **CrashLoopBackOff** - Container crash detection with exit code analysis
@@ -22,27 +22,36 @@ A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting
 - **OOMKilled** - Memory limit exceeded detection
 - **Pod Evictions** - Memory, disk, PID pressure analysis
 - **Probe Failures** - Liveness/readiness probe failures
-- **Init Container Failures** - Init container crash, timeout, dependency issues
+- **Init Container Failures** - Init container crash, timeout, dependency issues (v3.6.0)
+- **Sidecar Health** - Istio, Envoy, Fluentd sidecar failures (v3.6.0)
 - **Stuck Terminating** - Finalizer and volume detach issues
 - **Deployment Rollouts** - ProgressDeadlineExceeded detection
 - **Jobs/CronJobs** - BackoffLimitExceeded, missed schedules
 - **StatefulSets** - PVC issues, ordinal failures
+- **PDB Violations** - Pod Disruption Budget blocking drains (v3.6.0)
+- **Ephemeral Containers** - Failed debug containers (v3.6.0)
 
 #### Node Health
 - **Node NotReady** - Kubelet, CNI, certificate issues
 - **Disk/Memory/PID Pressure** - Resource exhaustion detection
+- **Resource Saturation** - Pre-pressure detection >90% (v3.6.0)
 - **PLEG Health** - Pod Lifecycle Event Generator issues
 - **Container Runtime** - containerd unresponsive
 - **Pause Image** - Sandbox image garbage-collected
 - **Certificate Expiry** - Kubelet cert rotation failures
 - **Node Group Health** - EKS managed node group status
+- **Version Skew** - Kubelet version mismatch detection (v3.6.0)
+- **AMI Age** - Outdated AMI detection (v3.6.0)
 
 #### Networking
 - **VPC CNI** - IP exhaustion, aws-node health
 - **CoreDNS** - DNS resolution failures
+- **DNS Configuration** - ndots:5 amplification detection (v3.6.0)
 - **Service Health** - No endpoints, ClusterIP issues
+- **EndpointSlices** - Backend readiness issues (v3.6.0)
 - **Connectivity** - Connection refused, timeout, DNS failures
 - **NetworkPolicy** - Traffic blocking detection
+- **Ingress Health** - Missing backends, TLS secrets (v3.6.0)
 - **ALB Health** - 5xx errors, unhealthy targets
 - **Conntrack** - Connection tracking table exhaustion
 - **Security Groups** - Rule misconfigurations
@@ -63,6 +72,7 @@ A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting
 - **PV State** - Released/Failed detection
 - **EBS CSI** - Attachment failures, AZ mismatch
 - **EFS CSI** - Mount failures
+- **Volume Snapshots** - Failed snapshot operations (v3.6.0)
 
 #### IAM & RBAC
 - **RBAC Errors** - Forbidden, Unauthorized
@@ -70,46 +80,61 @@ A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting
 - **CloudTrail Correlation** - AssumeRole failures
 - **PSA Violations** - Pod Security Admission
 - **Missing ConfigMaps/Secrets** - Resource not found
+- **Workload Security Posture** - Privileged containers, host paths (v3.6.0)
 
 #### Autoscaling
 - **Cluster Autoscaler** - Scaling issues
-- **Karpenter** - Provisioning failures
+- **Karpenter** - Provisioning failures, drift detection (v3.6.0)
 - **Fargate** - Profile health
 - **HPA/VPA** - Scaling not active
+- **HPA Metrics Source** - metrics-server health (v3.6.0)
+- **Topology Spread** - Constraint violations (v3.6.0)
 
 #### Observability
 - **CloudWatch Logging** - Pipeline health
 - **Container Insights** - Metrics availability
 - **EKS Addons** - VPC-CNI, CoreDNS, kube-proxy
+- **Deprecated APIs** - Upgrade readiness check (v3.6.0)
 
 ### Finding Type Classification
 Each finding is classified as either:
 - **📅 Historical Event** - Occurred within the specified date range (filtered by time)
 - **🔄 Current State** - Current cluster state (not filtered by date)
 
-### Smart Correlation
-- Root cause identification across data sources
-- Timeline of events by hour
-- First issue detection (potential root cause)
-- Cascading failure analysis
+### Smart Correlation with 5D Confidence Scoring (v3.6.0)
+- **Root cause identification** across data sources
+- **5-dimensional confidence scoring:**
+  - Temporal (30%): Does cause precede effect?
+  - Spatial (20%): Same node/pod/namespace?
+  - Mechanism (25%): Known causal relationship?
+  - Exclusivity (15%): Only plausible cause?
+  - Reproducibility (10%): Pattern repeated?
+- **Confidence tiers:** high (≥0.75), medium (≥0.50), low (<0.50)
+- **Spatial correlation:** Node/namespace/pod overlap detection
+- **Timeline of events** by hour
+- **First issue detection** (potential root cause)
+- **Cascading failure analysis**
 
 ### Performance Optimizations (v3.3.0)
-- **Parallel Analysis** - 56 methods run concurrently using ThreadPoolExecutor
+- **Parallel Analysis** - 72 methods run concurrently using ThreadPoolExecutor
 - **Shared Data Pre-fetching** - CloudWatch log groups and kubectl data fetched once
 - **API Response Caching** - TTL-based cache for AWS API calls (5-minute default)
 - **kubectl Output Caching** - Reuses kubectl command results across methods
 - **Performance Metrics** - Reports slowest methods and cache statistics
+- **Pagination Support** - Handles >100 clusters via nextToken (v3.6.0)
 
-### Security Features (v3.4.0)
-- **Input Validation** - All CLI parameters validated with strict regex patterns
+### Security Features (v3.4.0+)
+- **Input Validation** - All CLI parameters validated with strict regex patterns (max 256 chars)
 - **Shell Injection Prevention** - Blocks dangerous characters (`;`, `|`, `&&`, `$()`, backticks)
+- **XSS Prevention** - HTML output properly escaped (v3.6.0)
 - **Secure File Permissions** - Output files created with `0o600` (owner-only)
 - **Log Sanitization** - AWS Account ID masked, IAM ARN truncated
 - **Thread-Safe Operations** - Concurrent analysis with proper locking
+- **Exponential Backoff** - API throttling resilience with jitter (v3.6.0)
 
 ### Automatic Report Generation
-- **HTML Report** - Interactive dashboard with sidebar navigation, search, and filtering
-- **LLM-Ready JSON** - Structured output optimized for AI/LLM analysis
+- **HTML Report** - Interactive dashboard with sidebar navigation, search, filtering, and dark mode
+- **LLM-Ready JSON** - Structured output with confidence tiers optimized for AI analysis
 
 ---
 
@@ -205,10 +230,12 @@ The tool **always generates two files** automatically:
 Interactive dashboard with:
 - Summary cards showing critical/warning/info counts
 - Finding type breakdown (Historical Events vs Current State)
+- Root cause confidence tiers (v3.6.0)
 - Expandable findings with full details
 - Severity classification
 - Data source badges
 - Evidence-based recommendations
+- Dark mode support
 - Print-friendly layout
 
 ### 2. LLM-Ready JSON
@@ -243,7 +270,20 @@ Structured JSON optimized for AI analysis:
     }
   ],
   "correlations": [...],
-  "potential_root_causes": [...],
+  "correlations_by_confidence_tier": {
+    "high": [...],
+    "medium": [...],
+    "low": [...]
+  },
+  "potential_root_causes": [
+    {
+      "correlation_type": "node_pressure_cascade",
+      "root_cause": "Node memory pressure detected",
+      "confidence_tier": "high",
+      "composite_confidence": 0.85,
+      "spatial_evidence": {"overlap_score": 0.72, "node_matches": 3}
+    }
+  ],
   "recommendations": [...]
 }
 ```

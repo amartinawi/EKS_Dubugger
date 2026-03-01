@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.7.2] - 2026-03-01
+
+### Fixed
+- Fixed missing `</div>` closing tag for `.header-content` in HTML output (browsers auto-repaired but left unbalanced DOM)
+- Fixed XSS vulnerability in copy-to-clipboard button onclick handlers
+  - Changed from inline text parameter to DOM traversal (`button.previousElementSibling.textContent`)
+  - Removed duplicate `copyToClipboard` function with swapped parameters
+- Fixed composite confidence calculation transparency for AWS-confirmed cluster upgrades
+  - Now calculates from 5D scores instead of hardcoding 0.92
+  - Result: 0.845 → properly documented calculation
+- Fixed JSON output missing version field
+  - Added `"version": VERSION` and `"schema_version": "1.0"` to metadata
+- Fixed summary default dict using `total_findings` instead of `total_issues`
+- Fixed date range display in "Understanding Finding Types" section (was showing raw template)
+
+### Changed
+- Updated README version badge to 3.7.2
+- Improved code documentation for confidence scoring calculations
+
 ## [3.7.1] - 2026-03-01
 
 ### Fixed

@@ -198,7 +198,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.7.1"
+VERSION = "3.7.2"
 REPO_URL = "https://github.com/aws-samples/amazon-eks-troubleshooting-tools"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -1590,7 +1590,9 @@ class LLMJSONOutputFormatter(OutputFormatter):
             )
 
         llm_output = {
-            "analysis_context": {
+            "metadata": {
+                "version": VERSION,
+                "schema_version": "1.0",
                 "cluster": metadata.get("cluster"),
                 "region": metadata.get("region"),
                 "analysis_date": metadata.get("analysis_date"),
@@ -3544,7 +3546,6 @@ class HTMLOutputFormatter(OutputFormatter):
                 "critical": 0,
                 "warning": 0,
                 "info": 0,
-                "total_findings": 0,
             },
         )
         findings = results.get("findings", {})
@@ -6691,7 +6692,8 @@ class HTMLOutputFormatter(OutputFormatter):
                             <div class="meta-value">{metadata.get("date_range", {}).get("start", "unknown").replace("T", " ")[:16]} to {metadata.get("date_range", {}).get("end", "unknown").replace("T", " ")[:16]}</div>
                         </div>
                     </div>
-                </header>
+                </div>
+            </header>
 
             <!-- Toolbar -->
             <div class="toolbar" role="toolbar" aria-label="Report controls">
@@ -6933,7 +6935,7 @@ class HTMLOutputFormatter(OutputFormatter):
                                     html += f"""
                                         <div class="command-item">
                                             <code class="command-text">{escaped_cmd}</code>
-                                            <button class="copy-btn" onclick="copyToClipboard(this, '{escaped_cmd.replace("'", "\\'")}' )" title="Copy command">📋</button>
+                                            <button class="copy-btn" onclick="copyToClipboard(this)" title="Copy command">📋</button>
                                         </div>
 """
                                 html += """
@@ -6961,7 +6963,7 @@ class HTMLOutputFormatter(OutputFormatter):
                                         html += f"""
                                         <div class="command-item">
                                             <code class="command-text">{escaped_cmd}</code>
-                                            <button class="copy-btn" onclick="copyToClipboard(this, '{escaped_cmd.replace("'", "\\'")}' )" title="Copy command">📋</button>
+                                            <button class="copy-btn" onclick="copyToClipboard(this)" title="Copy command">📋</button>
                                         </div>
 """
                                 html += """
@@ -7350,7 +7352,9 @@ class HTMLOutputFormatter(OutputFormatter):
             document.querySelectorAll('.summary-block.collapsible').forEach(b => b.classList.add('collapsed'));
         }
         
-        function copyToClipboard(button, text) {
+        function copyToClipboard(button) {
+            // Get text from previous sibling (the <code> element)
+            const text = button.previousElementSibling.textContent;
             navigator.clipboard.writeText(text).then(() => {
                 const originalText = button.textContent;
                 button.textContent = '✓';
@@ -7442,20 +7446,6 @@ class HTMLOutputFormatter(OutputFormatter):
                 } else {
                     item.style.display = 'none';
                 }
-            });
-        }
-        
-        function copyToClipboard(text, button) {
-            navigator.clipboard.writeText(text).then(() => {
-                const originalText = button.innerHTML;
-                button.innerHTML = '✓';
-                button.classList.add('copied');
-                setTimeout(() => {
-                    button.innerHTML = originalText;
-                    button.classList.remove('copied');
-                }, 2000);
-            }).catch(err => {
-                console.error('Failed to copy:', err);
             });
         }
         
@@ -14231,15 +14221,25 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 if aws_confirmed:
                     # AWS API confirmed upgrade = HIGH confidence
-                    corr["confidence_5d"] = {
-                        "temporal": 1.0,  # AWS API provides timestamp
+                    # Calculate composite from 5D scores for transparency
+                    scores = {
+                        "temporal": 1.0,  # AWS API provides exact timestamp
                         "spatial": 0.8,  # Upgrade affects all nodes
                         "mechanism": 1.0,  # Upgrade is a known cause
                         "exclusivity": 0.9,  # Only plausible cause for mass events
                         "reproducibility": 0.0,  # Single event
                     }
-                    corr["composite_confidence"] = 0.92  # High confidence
-                    corr["confidence_tier"] = "high"
+                    weights = {
+                        "temporal": 0.30,
+                        "spatial": 0.20,
+                        "mechanism": 0.25,
+                        "exclusivity": 0.15,
+                        "reproducibility": 0.10,
+                    }
+                    composite = sum(scores[k] * weights[k] for k in scores)
+                    corr["confidence_5d"] = scores
+                    corr["composite_confidence"] = round(composite, 2)
+                    corr["confidence_tier"] = "high" if composite >= 0.75 else "medium"
                     corr["temporal_evidence"] = {"confidence": 1.0, "source": "aws_api"}
                     corr["spatial_evidence"] = {"overlap_score": 0.8, "scope": "cluster-wide"}
                 elif total_findings >= 10:

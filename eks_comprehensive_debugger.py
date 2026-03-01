@@ -3650,7 +3650,7 @@ class HTMLOutputFormatter(OutputFormatter):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EKS Debug Report - {metadata["cluster"]}</title>
+    <title>EKS Debug Report - {metadata.get("cluster", "unknown")}</title>
     <style>
         :root {{
             --primary: #667eea;
@@ -6676,23 +6676,22 @@ class HTMLOutputFormatter(OutputFormatter):
                     <div class="header-meta">
                         <div class="meta-item">
                             <div class="meta-label">Cluster</div>
-                            <div class="meta-value">{metadata["cluster"]}</div>
+                            <div class="meta-value">{metadata.get("cluster", "unknown")}</div>
                         </div>
                         <div class="meta-item">
                             <div class="meta-label">Region</div>
-                            <div class="meta-value">{metadata["region"]}</div>
+                            <div class="meta-value">{metadata.get("region", "unknown")}</div>
                         </div>
                         <div class="meta-item">
                             <div class="meta-label">Analysis Date</div>
-                            <div class="meta-value">{metadata["analysis_date"].split("T")[0]}</div>
+                            <div class="meta-value">{metadata.get("analysis_date", "unknown").split("T")[0] if metadata.get("analysis_date") else "unknown"}</div>
                         </div>
                         <div class="meta-item">
                             <div class="meta-label">Time Range ({metadata.get("timezone", "UTC")})</div>
-                            <div class="meta-value">{metadata["date_range"]["start"].replace("T", " ")[:16]} to {metadata["date_range"]["end"].replace("T", " ")[:16]}</div>
+                            <div class="meta-value">{metadata.get("date_range", {}).get("start", "unknown").replace("T", " ")[:16]} to {metadata.get("date_range", {}).get("end", "unknown").replace("T", " ")[:16]}</div>
                         </div>
                     </div>
-                </div>
-            </header>
+                </header>
 
             <!-- Toolbar -->
             <div class="toolbar" role="toolbar" aria-label="Report controls">
@@ -6750,7 +6749,7 @@ class HTMLOutputFormatter(OutputFormatter):
                         <span class="finding-type-title">Historical Events</span>
                     </div>
                     <div class="finding-type-count">{summary.get("historical_event_count", 0)}</div>
-                    <div class="finding-type-desc">Within date range ({metadata["date_range"]["start"].replace("T", " ")[:16]} to {metadata["date_range"]["end"].replace("T", " ")[:16]})</div>
+                    <div class="finding-type-desc">Within date range ({metadata.get("date_range", {}).get("start", "N/A").replace("T", " ")[:16]} to {metadata.get("date_range", {}).get("end", "N/A").replace("T", " ")[:16]})</div>
                     <div class="finding-type-critical">🔴 {summary.get("historical_event_critical", 0)} critical</div>
                 </div>
                 <div class="finding-type-card current">
@@ -6841,11 +6840,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             <div class="finding-type-legend">
                                 <div class="legend-item">
                                     <span class="legend-badge historical">📅 Historical</span>
-                                    <span class="legend-desc">Events that occurred within the scan window ("""
-                + metadata["date_range"]["start"].replace("T", " ")[:16]
-                + """ to """
-                + metadata["date_range"]["end"].replace("T", " ")[:16]
-                + """)</span>
+                                    <span class="legend-desc">Events that occurred within the scan window ({metadata.get("date_range", {}).get("start", "N/A"} to {metadata.get("date_range", {}).get("end", "N/A")})</span>
                                 </div>
                                 <div class="legend-item">
                                     <span class="legend-badge current">🔄 Current</span>
@@ -7292,7 +7287,7 @@ class HTMLOutputFormatter(OutputFormatter):
             <!-- Footer -->
             <footer class="page-footer">
                 <p>Generated with <a href="{REPO_URL}" class="footer-link" target="_blank" rel="noopener">EKS Comprehensive Debugger v{VERSION}</a></p>
-                <p>Analysis Date: {metadata["analysis_date"]}</p>
+                <p>Analysis Date: {metadata.get("analysis_date", "unknown")}</p>
             </footer>
         </main>
     </div>

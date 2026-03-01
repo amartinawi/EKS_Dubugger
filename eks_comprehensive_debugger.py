@@ -199,7 +199,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 VERSION = "3.7.2"
-REPO_URL = "https://github.com/aws-samples/amazon-eks-troubleshooting-tools"
+REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
 MAX_API_RETRIES = 3

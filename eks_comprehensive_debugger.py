@@ -1488,8 +1488,8 @@ class LLMJSONOutputFormatter(OutputFormatter):
 
     def format(self, results):
         """Format results as LLM-ready JSON with finding type classification"""
-        metadata = results["metadata"]
-        summary = results["summary"]
+        metadata = results.get("metadata", {})
+        summary = results.get("summary", {})
         findings = results.get("findings", {})
         correlations = results.get("correlations", [])
         timeline = results.get("timeline", [])
@@ -3527,8 +3527,26 @@ class HTMLOutputFormatter(OutputFormatter):
 
     def format(self, results):
         """Format results as interactive HTML"""
-        metadata = results["metadata"]
-        summary = results["summary"]
+        metadata = results.get(
+            "metadata",
+            {
+                "cluster": "unknown",
+                "region": "unknown",
+                "analysis_date": "unknown",
+                "date_range": {"start": "unknown", "end": "unknown"},
+                "namespace": "all",
+            },
+        )
+        summary = results.get(
+            "summary",
+            {
+                "total_issues": 0,
+                "critical": 0,
+                "warning": 0,
+                "info": 0,
+                "total_findings": 0,
+            },
+        )
         findings = results.get("findings", {})
         recommendations = results.get("recommendations", [])
         errors = results.get("errors", [])

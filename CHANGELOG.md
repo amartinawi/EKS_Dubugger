@@ -6,7 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-## [3.7.0] - 2026-03-01
+## [3.7.1] - 2026-03-01
+
+### Fixed
+- Fixed `KeyError: 'metadata'` when results dict is missing metadata or summary keys
+  - Both `HTMLOutputFormatter.format()` and `LLMJSONOutputFormatter.format()` now use `.get()` with proper defaults
+- Ensures graceful degradation when results are incomplete
 
 ### Added
 - **Remediation Commands** - Each finding now includes actionable diagnostic and fix commands

@@ -11031,8 +11031,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             for api_version, info in DEPRECATED_APIS.items():
                 removed_in_minor = int(info["removed_in"].split(".")[1])
 
-                # Only warn if the removal version is within 2 minor versions
-                if removed_in_minor - cp_minor <= 2:
+                # Only warn if cluster version is approaching removal (within 2 versions)
+                # Skip APIs already removed in older versions
+                if cp_minor <= removed_in_minor + 2:
                     for resource in info["resources"]:
                         # Try to list resources with this API version
                         resource_check = self.safe_kubectl_call(
@@ -11430,7 +11431,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 return
             pods = json.loads(pods_json).get("items", [])
 
-            SENSITIVE_HOST_PATHS = ["/", "/etc", "/var/run/docker.sock", "/var/run/containerd", "/var/lib/docker"]
+            # Exact match for root paths, prefix match for subdirectories
+            SENSITIVE_HOST_PATHS_EXACT = {"/", "/etc", "/var/run/docker.sock", "/var/run/containerd", "/var/lib/docker"}
+            SENSITIVE_HOST_PREFIXES = ["/etc/", "/var/run/", "/var/lib/docker", "/proc", "/sys"]
 
             for pod in pods:
                 pod_name = pod.get("metadata", {}).get("name", "")
@@ -11485,7 +11488,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         path = volume["hostPath"].get("path", "")
                         volume_name = volume.get("name", "")
 
-                        if path in SENSITIVE_HOST_PATHS or any(s in path for s in SENSITIVE_HOST_PATHS):
+                        # Use exact match for root paths, prefix match for subdirectories
+                        is_sensitive = path in SENSITIVE_HOST_PATHS_EXACT or any(
+                            path.startswith(prefix) for prefix in SENSITIVE_HOST_PREFIXES
+                        )
+                        if is_sensitive:
                             self._add_finding(
                                 "rbac_issues",
                                 f"Pod {namespace}/{pod_name} mounts sensitive host path: {path}",
@@ -13161,13 +13168,16 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 spatial_matches["pod_matches"] += 1
                 matched_resources["pods"].add(pod_key)
 
-        # Calculate overlap score (weighted: node=0.5, namespace=0.3, pod=0.2)
+        # Calculate overlap score (weighted: pod=0.5, node=0.35, namespace=0.15)
+        # Pod match is strongest evidence (same pod = definite causal link)
+        # Node match is strong (same node = likely related)
+        # Namespace match is weaker (just same logical grouping)
         total_effects = len(effect_events) if effect_events else 1
         node_score = spatial_matches["node_matches"] / total_effects
         ns_score = spatial_matches["namespace_matches"] / total_effects
         pod_score = spatial_matches["pod_matches"] / total_effects
 
-        overlap_score = min(1.0, (node_score * 0.5) + (ns_score * 0.3) + (pod_score * 0.2))
+        overlap_score = min(1.0, (pod_score * 0.5) + (node_score * 0.35) + (ns_score * 0.15))
 
         return {
             "overlap_score": round(overlap_score, 3),

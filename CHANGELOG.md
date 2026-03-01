@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.6.1] - 2026-03-01
+
+### Fixed
+- `analyze_deprecated_apis` condition now correctly checks if cluster is approaching removal version (was checking all already-removed APIs)
+- `analyze_workload_security_posture` hostPath detection now uses exact match + prefix matching (was matching every path due to `/` substring)
+- Spatial correlation weighting corrected: pod=50%, node=35%, namespace=15% (was inverted)
+
 ## [3.6.0] - 2026-03-01
 
 ### Security
@@ -52,9 +59,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `low` (<0.50 composite) - Weak correlation, investigate further
 
 #### Spatial Correlation
-- Node overlap scoring (50% weight)
-- Namespace overlap scoring (30% weight)
-- Pod overlap scoring (20% weight)
+- Pod overlap scoring (50% weight - strongest evidence)
+- Node overlap scoring (35% weight)
+- Namespace overlap scoring (15% weight)
 - Returns matched resources for evidence
 
 #### Enhanced Cluster Upgrade Detection

@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fixed `KeyError: 'metadata'` when results dict is missing metadata or summary keys
   - Both `HTMLOutputFormatter.format()` and `LLMJSONOutputFormatter.format()` now use `.get()` with proper defaults
 - Ensures graceful degradation when results are incomplete
+- Fixed `KeyError: '"metadata"'` in remediation commands - escaped braces in JSON strings (`{{...}}`) so Python's `.format()` doesn't interpret them as placeholders
+  - Fixed "Understanding Finding Types" section showing raw `{metadata.get(...)}` instead of actual date range values in HTML output
 
 ### Added
 - **Remediation Commands** - Each finding now includes actionable diagnostic and fix commands

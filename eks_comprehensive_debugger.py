@@ -198,7 +198,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.6.0"
+VERSION = "3.7.1"
 REPO_URL = "https://github.com/aws-samples/amazon-eks-troubleshooting-tools"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -868,7 +868,7 @@ REMEDIATION_COMMANDS = {
         "fix": [
             "# Check image exists and credentials are valid",
             "kubectl create secret docker-registry regcred --docker-server=<registry> --docker-username=<user> --docker-password=<pass> -n {namespace}",
-            'kubectl patch serviceaccount default -n {namespace} -p \'{"imagePullSecrets": [{"name": "regcred"}]}\'',
+            'kubectl patch serviceaccount default -n {namespace} -p \'{{"imagePullSecrets": [{{"name": "regcred"}}]}}\'',
         ],
         "aws_doc": "https://repost.aws/knowledge-center/eks-ecr ErrImagePull",
     },
@@ -979,7 +979,7 @@ REMEDIATION_COMMANDS = {
         ],
         "fix": [
             "# Set default storage class",
-            'kubectl patch storageclass {sc} -p \'{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}\'',
+            'kubectl patch storageclass {sc} -p \'{{"metadata": {{"annotations":{{"storageclass.kubernetes.io/is-default-class":"true"}}}}}}\'',
             "# Or specify storageClassName in PVC",
         ],
         "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-pvc-pending",
@@ -6814,9 +6814,12 @@ class HTMLOutputFormatter(OutputFormatter):
 
         all_findings_json = []
 
+        # Extract date range for display
+        date_start = metadata.get("date_range", {}).get("start", "N/A")
+        date_end = metadata.get("date_range", {}).get("end", "N/A")
+
         if findings:
-            html += (
-                """
+            html += f"""
             <!-- All Findings Section -->
             <section class="section" id="all-findings" role="region" aria-label="All findings">
                 <div class="section-header" onclick="toggleSection(this)">
@@ -6825,9 +6828,7 @@ class HTMLOutputFormatter(OutputFormatter):
                         <span>All Findings</span>
                     </div>
                     <div class="section-meta">
-                        <span class="section-count">"""
-                + str(summary["total_issues"])
-                + """</span>
+                        <span class="section-count">{summary["total_issues"]}</span>
                         <span class="section-toggle">▼</span>
                     </div>
                 </div>
@@ -6840,7 +6841,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             <div class="finding-type-legend">
                                 <div class="legend-item">
                                     <span class="legend-badge historical">📅 Historical</span>
-                                    <span class="legend-desc">Events that occurred within the scan window ({metadata.get("date_range", {}).get("start", "N/A"} to {metadata.get("date_range", {}).get("end", "N/A")})</span>
+                                    <span class="legend-desc">Events that occurred within the scan window ({date_start} to {date_end})</span>
                                 </div>
                                 <div class="legend-item">
                                     <span class="legend-badge current">🔄 Current</span>
@@ -6850,7 +6851,6 @@ class HTMLOutputFormatter(OutputFormatter):
                         </div>
                     </div>
 """
-            )
 
             for cat, items in findings.items():
                 if items:
@@ -19895,7 +19895,10 @@ def output_results(results, cluster_name: str, timezone_name: str = "UTC", outpu
         json_file = json_filename
 
     # Add timezone to metadata
-    results["metadata"]["timezone"] = timezone_name
+    if "metadata" in results:
+        results["metadata"]["timezone"] = timezone_name
+    elif "analysis_context" in results:
+        results["analysis_context"]["timezone"] = timezone_name
 
     success = True
 

@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.7.0] - 2026-03-01
+
+### Added
+- **Remediation Commands** - Each finding now includes actionable diagnostic and fix commands
+  - Diagnostic commands to investigate the issue
+  - Fix commands to resolve the issue
+  - AWS documentation links for detailed guidance
+  - One-click copy buttons for easy command execution
+- 30+ remediation patterns covering all major issue types:
+  - Pod issues (CrashLoopBackOff, OOMKilled, ImagePullBackOff, Evicted)
+  - Node issues (NotReady, MemoryPressure, DiskPressure)
+  - Network issues (DNS, CNI, IP exhaustion)
+  - Storage issues (PVC pending, volume attachment)
+  - IAM/RBAC issues (access denied, IRSA)
+  - Security issues (security groups, privileged containers)
+  - Autoscaling issues (HPA, Cluster Autoscaler)
+  - And more...
+
+### Changed
+- Enhanced HTML report with remediation section styling
+- Added copyToClipboard JavaScript function for command copying
+- Improved dark mode support for remediation sections
+
 ## [3.6.1] - 2026-03-01
 
 ### Fixed

@@ -6,9 +6,10 @@ Guidelines for AI coding agents working in the EKS Health Check Dashboard codeba
 
 Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
 
-**Version:** 3.6.0  
-**Lines of Code:** ~19,000  
+**Version:** 3.7.0  
+**Lines of Code:** ~20,000  
 **Analysis Methods:** 72  
+**Remediation Patterns:** 30+  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)  
 **Unit Tests:** 158 tests
 
@@ -273,6 +274,56 @@ CONTROL_PLANE_ERROR_PATTERNS = [
 | `_calculate_5d_confidence(...)` | 5-dimensional confidence scoring for correlations |
 | `_score_spatial_correlation(...)` | Spatial overlap detection between cause/effect |
 | `_score_temporal_causality(...)` | Temporal precedence scoring |
+
+### Remediation Commands (v3.7.0)
+
+The debugger automatically generates actionable remediation commands for each finding:
+
+**REMEDIATION_COMMANDS Dictionary:**
+```python
+REMEDIATION_COMMANDS = {
+    "crashloopbackoff": {
+        "diagnostic": [
+            "kubectl logs -n {namespace} {pod} --previous",
+            "kubectl describe pod -n {namespace} {pod}",
+            "kubectl get events -n {namespace} --field-selector involvedObject.name={pod}",
+        ],
+        "fix": [
+            "kubectl rollout restart deployment/{deployment} -n {namespace}",
+            "# Check logs for application errors, OOM, missing dependencies",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-pod-crashloopbackoff",
+    },
+    "oomkilled": {...},
+    "imagepullbackoff": {...},
+    # ... 30+ patterns
+}
+```
+
+**Pattern Matching:**
+- `get_remediation_commands(summary, details)` matches finding patterns
+- Extracts context variables (namespace, pod, node, etc.) from details
+- Formats commands with extracted context
+- Returns diagnostic commands, fix commands, and AWS doc link
+
+**HTML Rendering:**
+- Remediation section appears after finding details
+- Green-tinted background for visibility
+- One-click copy buttons for each command
+- AWS documentation link for detailed guidance
+
+**Coverage:**
+| Category | Patterns |
+|----------|----------|
+| Pod Issues | CrashLoopBackOff, OOMKilled, ImagePullBackOff, Evicted |
+| Node Issues | NotReady, MemoryPressure, DiskPressure |
+| Network Issues | DNS, CNI, IP exhaustion, NetworkNotReady |
+| Storage Issues | PVC pending, volume attachment |
+| IAM/RBAC | Access denied, IRSA, credentials |
+| Security | Security groups, privileged containers, host paths |
+| Autoscaling | HPA, Cluster Autoscaler |
+| Control Plane | API server, etcd issues |
+| Addons | metrics-server, Container Insights |
 
 ### Performance Architecture (v3.3.0+)
 

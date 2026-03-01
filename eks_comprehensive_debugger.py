@@ -832,6 +832,480 @@ CONTROL_PLANE_ERROR_PATTERNS = [
     "authentication failed",
 ]
 
+# Remediation commands for findings - maps patterns to diagnostic and fix commands
+REMEDIATION_COMMANDS = {
+    # Pod Issues
+    "crashloopbackoff": {
+        "diagnostic": [
+            "kubectl logs -n {namespace} {pod} --previous",
+            "kubectl describe pod -n {namespace} {pod}",
+            "kubectl get events -n {namespace} --field-selector involvedObject.name={pod}",
+        ],
+        "fix": [
+            "kubectl rollout restart deployment/{deployment} -n {namespace}",
+            "# Check logs for application errors, OOM, missing dependencies",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-pod-crashloopbackoff",
+    },
+    "oomkilled": {
+        "diagnostic": [
+            "kubectl describe pod -n {namespace} {pod}",
+            "kubectl top pods -n {namespace}",
+            "kubectl get pod -n {namespace} {pod} -o jsonpath='{{.spec.containers[*].resources}}'",
+        ],
+        "fix": [
+            "# Increase memory limits in deployment",
+            'kubectl patch deployment {deployment} -n {namespace} --type=\'json\' -p=\'[{"op": "replace", "path": "/spec/template/spec/containers/0/resources/limits/memory", "value":"512Mi"}]\'',
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-memory-pressure",
+    },
+    "imagepullbackoff": {
+        "diagnostic": [
+            "kubectl describe pod -n {namespace} {pod}",
+            "kubectl get secret -n {namespace} | grep docker",
+            "aws ecr describe-images --repository-name {repo} --image-ids imageTag={tag}",
+        ],
+        "fix": [
+            "# Check image exists and credentials are valid",
+            "kubectl create secret docker-registry regcred --docker-server=<registry> --docker-username=<user> --docker-password=<pass> -n {namespace}",
+            'kubectl patch serviceaccount default -n {namespace} -p \'{"imagePullSecrets": [{"name": "regcred"}]}\'',
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-ecr ErrImagePull",
+    },
+    "evicted": {
+        "diagnostic": [
+            "kubectl describe node {node}",
+            "kubectl get node {node} -o jsonpath='{{.status.conditions[?(@.type==\"MemoryPressure\")].status}}'",
+            "kubectl get node {node} -o jsonpath='{{.status.conditions[?(@.type==\"DiskPressure\")].status}}'",
+        ],
+        "fix": [
+            "# Address node pressure before rescheduling",
+            "kubectl delete pod -n {namespace} {pod} --force --grace-period=0",
+            "# Consider adding pod anti-affinity or resource requests",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-disk-pressure",
+    },
+    # Node Issues
+    "notready": {
+        "diagnostic": [
+            "kubectl describe node {node}",
+            "kubectl get node {node} -o yaml",
+            "ssh -o ProxyCommand='aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p' {node}",
+        ],
+        "fix": [
+            "# Check kubelet logs on the node",
+            "sudo journalctl -u kubelet -f",
+            "# Restart kubelet if needed",
+            "sudo systemctl restart kubelet",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-worker-node-status-notready",
+    },
+    "memorypressure": {
+        "diagnostic": [
+            "kubectl describe node {node}",
+            "kubectl top nodes",
+            "kubectl top pods --all-namespaces --sort-by=memory | head -20",
+        ],
+        "fix": [
+            "# Evict low-priority pods or add node to cluster",
+            "kubectl taint nodes {node} memory-pressure=true:NoSchedule",
+            "# Consider vertical pod autoscaling or node scaling",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-memory-pressure",
+    },
+    "diskpressure": {
+        "diagnostic": [
+            "kubectl describe node {node}",
+            "df -h # (on node via SSM)",
+            "sudo crictl images # check for unused images",
+        ],
+        "fix": [
+            "# Clean up unused container images",
+            "sudo crictl rmi --prune",
+            "# Clean up old logs",
+            "sudo journalctl --vacuum-time=1d",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-disk-pressure",
+    },
+    # Network Issues
+    "networknotready": {
+        "diagnostic": [
+            "kubectl get pods -n kube-system -l k8s-app=aws-node",
+            "kubectl logs -n kube-system -l k8s-app=aws-node --tail=100",
+            "kubectl describe ds aws-node -n kube-system",
+        ],
+        "fix": [
+            "# Restart VPC CNI",
+            "kubectl rollout restart ds aws-node -n kube-system",
+            "# Check IAM permissions for VPC CNI",
+            "kubectl describe clusterrole aws-node",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html",
+    },
+    "dns.*resolution|coredns": {
+        "diagnostic": [
+            "kubectl get pods -n kube-system -l k8s-app=kube-dns",
+            "kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100",
+            "kubectl exec -it {pod} -n {namespace} -- nslookup kubernetes.default",
+        ],
+        "fix": [
+            "# Restart CoreDNS",
+            "kubectl rollout restart deployment coredns -n kube-system",
+            "# Check CoreDNS configmap",
+            "kubectl get configmap coredns -n kube-system -o yaml",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-troubleshoot-dns-failures",
+    },
+    "ip.*exhaustion|no available cidr": {
+        "diagnostic": [
+            "kubectl get pods -n kube-system -l k8s-app=aws-node",
+            "aws ec2 describe-subnets --subnet-ids {subnet_id}",
+            "kubectl get node {node} -o jsonpath='{{.spec.podCIDR}}'",
+        ],
+        "fix": [
+            "# Add secondary CIDR block to VPC",
+            "aws ec2 create-subnet --vpc-id {vpc_id} --cidr-block 100.64.0.0/16",
+            "# Or enable custom networking in VPC CNI",
+            "kubectl set env daemonset aws-node -n kube-system AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG=true",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/cni-increase-ip-addresses.html",
+    },
+    # Storage Issues
+    "pvc.*pending|pending.*pvc": {
+        "diagnostic": [
+            "kubectl describe pvc -n {namespace} {pvc}",
+            "kubectl get storageclass",
+            "kubectl get pv",
+        ],
+        "fix": [
+            "# Set default storage class",
+            'kubectl patch storageclass {sc} -p \'{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}\'',
+            "# Or specify storageClassName in PVC",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-pvc-pending",
+    },
+    "volume.*attach|attach.*volume": {
+        "diagnostic": [
+            "kubectl describe pvc -n {namespace} {pvc}",
+            "kubectl logs -n kube-system -l app=ebs-csi-controller --tail=100",
+            "aws ec2 describe-volumes --volume-ids {volume_id}",
+        ],
+        "fix": [
+            "# Check EBS CSI driver is installed",
+            "kubectl get pods -n kube-system -l app=ebs-csi-controller",
+            "# Check IAM role for EBS CSI",
+            "kubectl describe sa ebs-csi-controller-sa -n kube-system",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html",
+    },
+    # Scheduling Issues
+    "failedscheduling|insufficient.*resource": {
+        "diagnostic": [
+            "kubectl describe pod -n {namespace} {pod}",
+            "kubectl top nodes",
+            "kubectl get nodes -o custom-columns='NAME:.metadata.name,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory'",
+        ],
+        "fix": [
+            "# Scale cluster or add node group",
+            "aws eks update-nodegroup-version --cluster-name {cluster} --nodegroup-name {nodegroup}",
+            "# Or reduce pod resource requests",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-pod-scheduling-cluster-autoscaler",
+    },
+    "affinity|toleration|taint": {
+        "diagnostic": [
+            "kubectl describe pod -n {namespace} {pod}",
+            "kubectl get nodes -o custom-columns='NAME:.metadata.name,TAINTS:.spec.taints'",
+            "kubectl get nodes --show-labels",
+        ],
+        "fix": [
+            "# Add toleration to pod spec",
+            "# Or remove taint from node",
+            "kubectl taint nodes {node} {taint_key}:NoSchedule-",
+        ],
+        "aws_doc": "https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/",
+    },
+    # IAM/RBAC Issues
+    "access denied|forbidden|unauthorized": {
+        "diagnostic": [
+            "kubectl auth can-i --list --as=system:serviceaccount:{namespace}:{sa}",
+            "kubectl describe rolebinding,clusterrolebinding -n {namespace}",
+            "aws iam get-role --role-name {role_name}",
+        ],
+        "fix": [
+            "# Create role binding",
+            "kubectl create rolebinding {name} --clusterrole=admin --serviceaccount={namespace}:{sa} -n {namespace}",
+            "# For IRSA issues, check annotation",
+            "kubectl annotate sa {sa} -n {namespace} eks.amazonaws.com/role-arn={role_arn}",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html",
+    },
+    "irsa|pod identity|credential": {
+        "diagnostic": [
+            "kubectl get sa -n {namespace} {sa} -o yaml",
+            "aws iam get-role --role-name {role_name}",
+            "aws sts assume-role --role-arn {role_arn} --role-session-name test",
+        ],
+        "fix": [
+            "# Add IRSA annotation to service account",
+            "kubectl annotate serviceaccount {sa} -n {namespace} eks.amazonaws.com/role-arn={role_arn}",
+            "# Verify OIDC provider exists",
+            "aws iam list-open-id-connect-providers",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html",
+    },
+    # Control Plane Issues
+    "control plane|api server|etcd": {
+        "diagnostic": [
+            "aws eks describe-cluster --name {cluster} --query 'cluster.status'",
+            "aws logs filter-log-events --log-group-name /aws/eks/{cluster}/cluster",
+            "kubectl get --raw='/readyz?verbose'",
+        ],
+        "fix": [
+            "# Control plane issues require AWS support",
+            "aws support create-case",
+            "# Check for ongoing maintenance",
+            "aws eks describe-update --name {cluster} --update-id {update_id}",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
+    },
+    # Security Issues
+    "security group|0.0.0.0/0": {
+        "diagnostic": [
+            "aws ec2 describe-security-groups --group-ids {sg_id}",
+            "aws ec2 describe-network-interfaces --filters Name=group-id,Values={sg_id}",
+        ],
+        "fix": [
+            "# Revoke overly permissive rule",
+            "aws ec2 revoke-security-group-ingress --group-id {sg_id} --protocol all --cidr 0.0.0.0/0",
+            "# Add specific CIDR",
+            "aws ec2 authorize-security-group-ingress --group-id {sg_id} --protocol tcp --port 443 --cidr {allowed_cidr}",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/sec-group-reqs.html",
+    },
+    "privileged.*container|host.*path|hostpath": {
+        "diagnostic": [
+            "kubectl get pod -n {namespace} {pod} -o jsonpath='{{.spec.containers[*].securityContext}}'",
+            "kubectl get pod -n {namespace} {pod} -o jsonpath='{{.spec.volumes[*].hostPath}}'",
+            "kubectl auth can-i create pods --as=system:serviceaccount:{namespace}:{sa}",
+        ],
+        "fix": [
+            "# Enforce Pod Security Standards",
+            "kubectl label namespace {namespace} pod-security.kubernetes.io/enforce=restricted",
+            "# Remove privileged flag from deployment",
+        ],
+        "aws_doc": "https://kubernetes.io/docs/concepts/security/pod-security-standards/",
+    },
+    # Addon Issues
+    "metrics.*server|metrics-server": {
+        "diagnostic": [
+            "kubectl get pods -n kube-system -l k8s-app=metrics-server",
+            "kubectl logs -n kube-system -l k8s-app=metrics-server --tail=50",
+            "kubectl top pods --all-namespaces",
+        ],
+        "fix": [
+            "# Deploy metrics-server",
+            "kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml",
+            "# For EKS, use managed addon",
+            "aws eks create-addon --cluster-name {cluster} --addon-name metrics-server",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/metrics-server.html",
+    },
+    "container insights|cloudwatch": {
+        "diagnostic": [
+            "aws eks describe-addon --cluster-name {cluster} --addon-name amazon-cloudwatch-observability",
+            "kubectl get pods -n amazon-cloudwatch",
+            "aws logs describe-log-groups --log-group-name-prefix /aws/containerinsights/{cluster}",
+        ],
+        "fix": [
+            "# Enable Container Insights",
+            "aws eks create-addon --cluster-name {cluster} --addon-name amazon-cloudwatch-observability",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html",
+    },
+    # Autoscaling Issues
+    "hpa|horizontal.*pod.*autoscaler": {
+        "diagnostic": [
+            "kubectl get hpa -n {namespace}",
+            "kubectl describe hpa -n {namespace} {hpa}",
+            "kubectl api-resources | grep metrics",
+        ],
+        "fix": [
+            "# Ensure metrics-server is running",
+            "kubectl get pods -n kube-system -l k8s-app=metrics-server",
+            "# Check HPA can access metrics",
+            "kubectl describe hpa -n {namespace} {hpa}",
+        ],
+        "aws_doc": "https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/",
+    },
+    "cluster autoscaler|cluster-autoscaler": {
+        "diagnostic": [
+            "kubectl get pods -n kube-system -l app=cluster-autoscaler",
+            "kubectl logs -n kube-system -l app=cluster-autoscaler --tail=100",
+            "kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml",
+        ],
+        "fix": [
+            "# Check IAM permissions",
+            "kubectl describe sa cluster-autoscaler -n kube-system",
+            "# Check ASG tags",
+            "aws autoscaling describe-auto-scaling-groups --auto-scaling-group-name {asg_name}",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/cluster-autoscaler.html",
+    },
+    # Deprecated APIs
+    "deprecated.*api|api.*removed": {
+        "diagnostic": [
+            "kubectl api-resources | grep -i {api_version}",
+            "kubectl get {resource} --all-namespaces -o yaml | grep apiVersion",
+        ],
+        "fix": [
+            "# Update manifest to stable API version",
+            "# extensions/v1beta1 -> networking.k8s.io/v1",
+            "# policy/v1beta1 -> policy/v1",
+            "# rbac.authorization.k8s.io/v1beta1 -> rbac.authorization.k8s.io/v1",
+        ],
+        "aws_doc": "https://kubernetes.io/docs/reference/using-api/deprecation-guide/",
+    },
+    # Ingress Issues
+    "ingress.*backend|missing.*backend": {
+        "diagnostic": [
+            "kubectl get ingress -n {namespace} {ingress} -o yaml",
+            "kubectl get svc -n {namespace} {service}",
+            "kubectl get endpoints -n {namespace} {service}",
+        ],
+        "fix": [
+            "# Ensure backend service exists",
+            "kubectl get svc -n {namespace} {service}",
+            "# Check service selector matches pods",
+            "kubectl describe svc -n {namespace} {service}",
+        ],
+        "aws_doc": "https://kubernetes.io/docs/concepts/services-networking/ingress/",
+    },
+    # PDB Issues
+    "pdb.*blocking|pod.*disruption.*budget": {
+        "diagnostic": [
+            "kubectl get pdb -n {namespace}",
+            "kubectl describe pdb -n {namespace} {pdb}",
+            "kubectl get pods -n {namespace} -l {selector}",
+        ],
+        "fix": [
+            "# Adjust PDB minAvailable",
+            'kubectl patch pdb {pdb} -n {namespace} --type=\'json\' -p=\'[{"op": "replace", "path": "/spec/minAvailable", "value":1}]\'',
+            "# Or delete PDB temporarily for maintenance",
+        ],
+        "aws_doc": "https://kubernetes.io/docs/tasks/run-application/configure-pdb/",
+    },
+    # Resource Quota Issues
+    "quota.*exceeded|resourcequota": {
+        "diagnostic": [
+            "kubectl get resourcequota -n {namespace}",
+            "kubectl describe resourcequota -n {namespace}",
+            "kubectl top pods -n {namespace}",
+        ],
+        "fix": [
+            "# Increase quota limits",
+            'kubectl patch resourcequota {quota} -n {namespace} --type=\'json\' -p=\'[{"op": "replace", "path": "/spec/hard/requests.cpu", "value":"4"}]\'',
+            "# Or delete unused resources",
+        ],
+        "aws_doc": "https://kubernetes.io/docs/concepts/policy/resource-quotas/",
+    },
+    # Init Container Issues
+    "init.*container|initcontainer": {
+        "diagnostic": [
+            "kubectl describe pod -n {namespace} {pod}",
+            "kubectl logs -n {namespace} {pod} -c {init_container}",
+            "kubectl get events -n {namespace} --field-selector involvedObject.name={pod}",
+        ],
+        "fix": [
+            "# Check init container logs for errors",
+            "kubectl logs -n {namespace} {pod} -c {init_container} --previous",
+            "# Fix dependency or configuration issue",
+        ],
+        "aws_doc": "https://kubernetes.io/docs/concepts/workloads/pods/init-containers/",
+    },
+    # Liveness/Readiness Probe Issues
+    "probe.*failed|liveness.*readiness": {
+        "diagnostic": [
+            "kubectl describe pod -n {namespace} {pod}",
+            "kubectl get pod -n {namespace} {pod} -o jsonpath='{{.spec.containers[*].livenessProbe}}'",
+            "kubectl get pod -n {namespace} {pod} -o jsonpath='{{.spec.containers[*].readinessProbe}}'",
+        ],
+        "fix": [
+            "# Adjust probe timing",
+            'kubectl patch deployment {deployment} -n {namespace} --type=\'json\' -p=\'[{"op": "replace", "path": "/spec/template/spec/containers/0/livenessProbe/initialDelaySeconds", "value":60}]\'',
+        ],
+        "aws_doc": "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
+    },
+}
+
+
+def get_remediation_commands(summary: str, details: dict) -> dict | None:
+    """Get remediation commands for a finding based on summary and details.
+
+    Args:
+        summary: Finding summary text
+        details: Finding details dictionary
+
+    Returns:
+        Dict with 'diagnostic', 'fix', and 'aws_doc' keys, or None if no match
+    """
+    summary_lower = summary.lower()
+
+    # Extract context variables from details
+    context = {
+        "namespace": details.get("namespace", "default"),
+        "pod": details.get("pod", "<pod>"),
+        "node": details.get("node", "<node>"),
+        "service": details.get("service", "<service>"),
+        "deployment": details.get("deployment", "<deployment>"),
+        "pvc": details.get("pvc", "<pvc>"),
+        "sa": details.get("service_account", "default"),
+        "cluster": details.get("cluster", "<cluster>"),
+        "sg_id": details.get("sg_id", "<sg-id>"),
+        "volume_id": details.get("volume_id", "<volume-id>"),
+        "hpa": details.get("hpa", "<hpa>"),
+        "pdb": details.get("pdb", "<pdb>"),
+        "ingress": details.get("ingress", "<ingress>"),
+        "init_container": details.get("init_container", "<init-container>"),
+        "role_arn": details.get("role_arn", "<role-arn>"),
+        "role_name": details.get("role_name", "<role-name>"),
+        "asg_name": details.get("asg_name", "<asg-name>"),
+        "subnet_id": details.get("subnet_id", "<subnet-id>"),
+        "vpc_id": details.get("vpc_id", "<vpc-id>"),
+        "repo": details.get("repository", "<repo>"),
+        "tag": details.get("tag", "<tag>"),
+        "sc": details.get("storage_class", "<storage-class>"),
+        "api_version": details.get("api_version", "<api-version>"),
+        "resource": details.get("resource", "<resource>"),
+        "quota": details.get("quota", "<quota>"),
+        "allowed_cidr": "10.0.0.0/8",
+        "taint_key": details.get("taint_key", "<taint-key>"),
+        "update_id": details.get("update_id", "<update-id>"),
+        "selector": details.get("selector", "<selector>"),
+        "nodegroup": details.get("nodegroup", "<nodegroup>"),
+    }
+
+    # Try to extract deployment from pod name (common pattern)
+    if context["pod"] != "<pod>" and context["deployment"] == "<deployment>":
+        # Try to extract deployment name from pod (e.g., my-app-abc123 -> my-app)
+        pod_parts = context["pod"].rsplit("-", 2)
+        if len(pod_parts) >= 2:
+            context["deployment"] = "-".join(pod_parts[:-2]) if len(pod_parts) > 2 else pod_parts[0]
+
+    # Find matching pattern
+    for pattern, commands in REMEDIATION_COMMANDS.items():
+        if re.search(pattern, summary_lower):
+            # Format commands with context
+            formatted = {
+                "diagnostic": [cmd.format(**context) for cmd in commands.get("diagnostic", [])],
+                "fix": [cmd.format(**context) for cmd in commands.get("fix", [])],
+                "aws_doc": commands.get("aws_doc", ""),
+            }
+            return formatted
+
+    return None
+
+
 # === SECTION 2: EXCEPTION CLASSES ===
 
 
@@ -5298,6 +5772,158 @@ class HTMLOutputFormatter(OutputFormatter):
             text-decoration: underline;
         }}
         
+        /* Remediation Section */
+        .remediation-section {{
+            margin-top: 1rem;
+            background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%);
+            border: 1px solid #86efac;
+            border-radius: 8px;
+            padding: 1rem;
+        }}
+        
+        [data-theme="dark"] .remediation-section {{
+            background: linear-gradient(135deg, #052e16 0%, #14532d 100%);
+            border-color: #166534;
+        }}
+        
+        .remediation-header {{
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 600;
+            color: #166534;
+            margin-bottom: 0.75rem;
+            font-size: 0.9rem;
+        }}
+        
+        [data-theme="dark"] .remediation-header {{
+            color: #86efac;
+        }}
+        
+        .remediation-icon {{
+            font-size: 1rem;
+        }}
+        
+        .remediation-block {{
+            margin-bottom: 0.75rem;
+        }}
+        
+        .remediation-block:last-child {{
+            margin-bottom: 0;
+        }}
+        
+        .remediation-label {{
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: #15803d;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 0.5rem;
+        }}
+        
+        [data-theme="dark"] .remediation-label {{
+            color: #4ade80;
+        }}
+        
+        .remediation-commands {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }}
+        
+        .command-item {{
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: white;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            padding: 0.5rem 0.75rem;
+            transition: all 0.2s;
+        }}
+        
+        [data-theme="dark"] .command-item {{
+            background: #1f2937;
+            border-color: #374151;
+        }}
+        
+        .command-item:hover {{
+            border-color: var(--primary);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        
+        .command-text {{
+            flex: 1;
+            font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+            font-size: 0.8rem;
+            color: #374151;
+            background: transparent;
+            word-break: break-all;
+            white-space: pre-wrap;
+        }}
+        
+        [data-theme="dark"] .command-text {{
+            color: #e5e7eb;
+        }}
+        
+        .command-comment .command-text {{
+            color: #6b7280;
+            font-style: italic;
+        }}
+        
+        [data-theme="dark"] .command-comment .command-text {{
+            color: #9ca3af;
+        }}
+        
+        .copy-btn {{
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+            opacity: 0.6;
+        }}
+        
+        .copy-btn:hover {{
+            background: #f3f4f6;
+            opacity: 1;
+        }}
+        
+        [data-theme="dark"] .copy-btn:hover {{
+            background: #374151;
+        }}
+        
+        .copy-btn.copied {{
+            opacity: 1;
+            transform: scale(1.1);
+        }}
+        
+        .remediation-doc {{
+            margin-top: 0.75rem;
+            padding-top: 0.75rem;
+            border-top: 1px dashed #d1d5db;
+        }}
+        
+        [data-theme="dark"] .remediation-doc {{
+            border-top-color: #374151;
+        }}
+        
+        .remediation-doc a {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            color: var(--primary);
+            text-decoration: none;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }}
+        
+        .remediation-doc a:hover {{
+            text-decoration: underline;
+        }}
+        
         /* View All Modal */
         .modal {{
             display: none;
@@ -6270,6 +6896,77 @@ class HTMLOutputFormatter(OutputFormatter):
 """
                         html += """
                             </div>
+"""
+
+                        # Add remediation commands
+                        remediation = get_remediation_commands(item.get("summary", ""), item.get("details", {}))
+                        if remediation:
+                            html += """
+                            <div class="remediation-section">
+                                <div class="remediation-header">
+                                    <span class="remediation-icon">🔧</span>
+                                    <span>Remediation</span>
+                                </div>
+"""
+                            # Diagnostic commands
+                            if remediation.get("diagnostic"):
+                                html += """
+                                <div class="remediation-block">
+                                    <div class="remediation-label">Diagnostic Commands</div>
+                                    <div class="remediation-commands">
+"""
+                                for cmd in remediation["diagnostic"][:3]:  # Max 3 diagnostic commands
+                                    escaped_cmd = self._escape_html(cmd)
+                                    html += f"""
+                                        <div class="command-item">
+                                            <code class="command-text">{escaped_cmd}</code>
+                                            <button class="copy-btn" onclick="copyToClipboard(this, '{escaped_cmd.replace("'", "\\'")}' )" title="Copy command">📋</button>
+                                        </div>
+"""
+                                html += """
+                                    </div>
+                                </div>
+"""
+                            # Fix commands
+                            if remediation.get("fix"):
+                                html += """
+                                <div class="remediation-block">
+                                    <div class="remediation-label">Fix Commands</div>
+                                    <div class="remediation-commands">
+"""
+                                for cmd in remediation["fix"][:2]:  # Max 2 fix commands
+                                    escaped_cmd = self._escape_html(cmd)
+                                    # Check if it's a comment
+                                    is_comment = cmd.strip().startswith("#")
+                                    if is_comment:
+                                        html += f"""
+                                        <div class="command-item command-comment">
+                                            <code class="command-text">{escaped_cmd}</code>
+                                        </div>
+"""
+                                    else:
+                                        html += f"""
+                                        <div class="command-item">
+                                            <code class="command-text">{escaped_cmd}</code>
+                                            <button class="copy-btn" onclick="copyToClipboard(this, '{escaped_cmd.replace("'", "\\'")}' )" title="Copy command">📋</button>
+                                        </div>
+"""
+                                html += """
+                                    </div>
+                                </div>
+"""
+                            # AWS Documentation link
+                            if remediation.get("aws_doc"):
+                                html += f"""
+                                <div class="remediation-doc">
+                                    <a href="{self._escape_html(remediation["aws_doc"])}" target="_blank" rel="noopener noreferrer">📖 AWS Documentation</a>
+                                </div>
+"""
+                            html += """
+                            </div>
+"""
+
+                        html += """
                         </div>
                     </div>
 """
@@ -6638,6 +7335,31 @@ class HTMLOutputFormatter(OutputFormatter):
             document.querySelectorAll('.section').forEach(s => s.classList.add('collapsed'));
             document.querySelectorAll('.finding-item').forEach(f => f.classList.remove('expanded'));
             document.querySelectorAll('.summary-block.collapsible').forEach(b => b.classList.add('collapsed'));
+        }
+        
+        function copyToClipboard(button, text) {
+            navigator.clipboard.writeText(text).then(() => {
+                const originalText = button.textContent;
+                button.textContent = '✓';
+                button.classList.add('copied');
+                setTimeout(() => {
+                    button.textContent = originalText;
+                    button.classList.remove('copied');
+                }, 2000);
+            }).catch(err => {
+                console.error('Failed to copy:', err);
+                // Fallback for older browsers
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+                button.textContent = '✓';
+                setTimeout(() => {
+                    button.textContent = '📋';
+                }, 2000);
+            });
         }
         
         function filterFindings() {

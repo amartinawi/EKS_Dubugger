@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.7.3] - 2026-03-04
+
+### Fixed
+- **CloudTrail pagination** - `lookup_events` now paginates through all results instead of stopping at first 50 events
+  - Prevents missing IAM access denied events in busy accounts
+  - Added `_paginated_cloudtrail_lookup()` helper method for reuse
+- **EC2 client reuse** - EC2 client now created once at initialization instead of per-call
+  - Reduces session overhead in `analyze_subnet_health()` and `analyze_security_groups()`
+  - Added `self.ec2_client` and `self.cloudtrail_client` to `__init__`
+
+### Changed
+- CloudTrail client now initialized once at startup (like other AWS clients)
+
 ## [3.7.2] - 2026-03-01
 
 ### Fixed

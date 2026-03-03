@@ -198,7 +198,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.7.2"
+VERSION = "3.7.3"
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -7667,6 +7667,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.logs_client = self.session.client("logs")
             self.cloudwatch_client = self.session.client("cloudwatch")
             self.sts_client = self.session.client("sts")
+            self.ec2_client = self.session.client("ec2")
+            self.cloudtrail_client = self.session.client("cloudtrail")
         except Exception as e:
             raise AWSAuthenticationError(f"Failed to initialize AWS session: {e}")
 
@@ -8793,6 +8795,43 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             if required:
                 raise
             return None
+
+    def _paginated_cloudtrail_lookup(self, lookup_attributes: list[dict], max_results_per_page: int = 50) -> list[dict]:
+        """Execute paginated CloudTrail lookup_events call.
+
+        Args:
+            lookup_attributes: List of lookup attribute dicts for filtering
+            max_results_per_page: Max results per page (default 50)
+
+        Returns:
+            List of all events across all pages
+        """
+        all_events = []
+        next_token = None
+
+        while True:
+            params = {
+                "LookupAttributes": lookup_attributes,
+                "StartTime": self.start_date,
+                "EndTime": self.end_date,
+                "MaxResults": max_results_per_page,
+            }
+            if next_token:
+                params["NextToken"] = next_token
+
+            success, response = self.safe_api_call(self.cloudtrail_client.lookup_events, **params)
+
+            if not success or not response:
+                break
+
+            events = response.get("Events", [])
+            all_events.extend(events)
+
+            next_token = response.get("NextToken")
+            if not next_token:
+                break
+
+        return all_events
 
     def _build_kubectl_events_cmd(self, reason: str) -> str:
         """Build kubectl events command with namespace handling."""
@@ -10857,85 +10896,16 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             # CloudTrail correlation for IRSA/Pod Identity failures
             try:
-                cloudtrail_client = self.session.client("cloudtrail", region_name=self.region)
-
-                success, response = self.safe_api_call(
-                    cloudtrail_client.lookup_events,
-                    LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "AssumeRole"}],
-                    StartTime=self.start_date,
-                    EndTime=self.end_date,
-                    MaxResults=50,
+                events = self._paginated_cloudtrail_lookup(
+                    lookup_attributes=[{"AttributeKey": "EventName", "AttributeValue": "AssumeRole"}]
                 )
 
-                if success:
-                    for event in response.get("Events", []):
-                        event_name = event.get("EventName", "")
-                        resources = event.get("Resources", [])
-                        username = event.get("Username", "")
+                for event in events:
+                    event_name = event.get("EventName", "")
+                    resources = event.get("Resources", [])
+                    username = event.get("Username", "")
 
-                        if event_name == "AssumeRole":
-                            cloud_trail_event = event.get("CloudTrailEvent", "{}")
-                            try:
-                                ct_data = (
-                                    json.loads(cloud_trail_event)
-                                    if isinstance(cloud_trail_event, str)
-                                    else cloud_trail_event
-                                )
-                                error_code = ct_data.get("errorCode", "")
-                                error_message = ct_data.get("errorMessage", "")
-
-                                if error_code in ["AccessDenied", "UnauthorizedAccess"]:
-                                    role_arn = ""
-                                    for res in resources:
-                                        if res.get("ResourceType") == "AWS::IAM::Role":
-                                            role_arn = res.get("ResourceName", "")
-
-                                    self._add_finding_dict(
-                                        "rbac_issues",
-                                        {
-                                            "summary": f"CloudTrail: AssumeRole failed for {role_arn or 'unknown role'}",
-                                            "details": {
-                                                "event_name": event_name,
-                                                "role_arn": role_arn,
-                                                "username": username,
-                                                "error_code": error_code,
-                                                "error_message": error_message[:300] if error_message else "N/A",
-                                                "event_time": str(event.get("EventTime", "Unknown")),
-                                                "severity": "critical",
-                                                "root_causes": [
-                                                    "IAM role trust policy does not allow OIDC provider",
-                                                    "Service account missing eks.amazonaws.com/role-arn annotation",
-                                                    "Pod Identity agent not configured correctly",
-                                                    "Node IAM role missing AssumeRoleForPodIdentity permission",
-                                                ],
-                                                "finding_type": FindingType.HISTORICAL_EVENT,
-                                            },
-                                        },
-                                    )
-                            except (json.JSONDecodeError, TypeError):
-                                pass
-            except Exception:
-                self.progress.info("CloudTrail access not available for IAM correlation")
-
-            # Check for AssumeRoleForPodIdentity events (EKS Pod Identity)
-            try:
-                cloudtrail_client = self.session.client("cloudtrail", region_name=self.region)
-
-                success, response = self.safe_api_call(
-                    cloudtrail_client.lookup_events,
-                    LookupAttributes=[
-                        {
-                            "AttributeKey": "EventName",
-                            "AttributeValue": "AssumeRoleForPodIdentity",
-                        }
-                    ],
-                    StartTime=self.start_date,
-                    EndTime=self.end_date,
-                    MaxResults=50,
-                )
-
-                if success:
-                    for event in response.get("Events", []):
+                    if event_name == "AssumeRole":
                         cloud_trail_event = event.get("CloudTrailEvent", "{}")
                         try:
                             ct_data = (
@@ -10944,31 +10914,84 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 else cloud_trail_event
                             )
                             error_code = ct_data.get("errorCode", "")
+                            error_message = ct_data.get("errorMessage", "")
 
-                            if error_code:
-                                username = event.get("Username", "")
+                            if error_code in ["AccessDenied", "UnauthorizedAccess"]:
+                                role_arn = ""
+                                for res in resources:
+                                    if res.get("ResourceType") == "AWS::IAM::Role":
+                                        role_arn = res.get("ResourceName", "")
+
                                 self._add_finding_dict(
                                     "rbac_issues",
                                     {
-                                        "summary": f"CloudTrail: AssumeRoleForPodIdentity failed for {username}",
+                                        "summary": f"CloudTrail: AssumeRole failed for {role_arn or 'unknown role'}",
                                         "details": {
-                                            "event_name": "AssumeRoleForPodIdentity",
+                                            "event_name": event_name,
+                                            "role_arn": role_arn,
                                             "username": username,
                                             "error_code": error_code,
-                                            "error_message": ct_data.get("errorMessage", "N/A")[:300],
+                                            "error_message": error_message[:300] if error_message else "N/A",
                                             "event_time": str(event.get("EventTime", "Unknown")),
                                             "severity": "critical",
                                             "root_causes": [
-                                                "EKS Pod Identity agent not running",
-                                                "IAM role trust policy incorrect",
-                                                "Pod Identity association not configured",
+                                                "IAM role trust policy does not allow OIDC provider",
+                                                "Service account missing eks.amazonaws.com/role-arn annotation",
+                                                "Pod Identity agent not configured correctly",
+                                                "Node IAM role missing AssumeRoleForPodIdentity permission",
                                             ],
-                                            "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html",
+                                            "finding_type": FindingType.HISTORICAL_EVENT,
                                         },
                                     },
                                 )
                         except (json.JSONDecodeError, TypeError):
                             pass
+            except Exception:
+                self.progress.info("CloudTrail access not available for IAM correlation")
+
+            # Check for AssumeRoleForPodIdentity events (EKS Pod Identity)
+            try:
+                events = self._paginated_cloudtrail_lookup(
+                    lookup_attributes=[
+                        {
+                            "AttributeKey": "EventName",
+                            "AttributeValue": "AssumeRoleForPodIdentity",
+                        }
+                    ]
+                )
+
+                for event in events:
+                    cloud_trail_event = event.get("CloudTrailEvent", "{}")
+                    try:
+                        ct_data = (
+                            json.loads(cloud_trail_event) if isinstance(cloud_trail_event, str) else cloud_trail_event
+                        )
+                        error_code = ct_data.get("errorCode", "")
+
+                        if error_code:
+                            username = event.get("Username", "")
+                            self._add_finding_dict(
+                                "rbac_issues",
+                                {
+                                    "summary": f"CloudTrail: AssumeRoleForPodIdentity failed for {username}",
+                                    "details": {
+                                        "event_name": "AssumeRoleForPodIdentity",
+                                        "username": username,
+                                        "error_code": error_code,
+                                        "error_message": ct_data.get("errorMessage", "N/A")[:300],
+                                        "event_time": str(event.get("EventTime", "Unknown")),
+                                        "severity": "critical",
+                                        "root_causes": [
+                                            "EKS Pod Identity agent not running",
+                                            "IAM role trust policy incorrect",
+                                            "Pod Identity association not configured",
+                                        ],
+                                        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html",
+                                    },
+                                },
+                            )
+                    except (json.JSONDecodeError, TypeError):
+                        pass
             except Exception:
                 pass
 
@@ -15324,8 +15347,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Analyzing subnet health...")
 
         try:
-            ec2_client = self.session.client("ec2")
-
             cmd = "kubectl get nodes -o jsonpath='{.items[*].spec.providerID}' || echo 'not found'"
             output = self.safe_kubectl_call(cmd)
 
@@ -15342,7 +15363,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     instance_ids.append(provider_id.split("/")[-1])
 
             if instance_ids:
-                success, response = self.safe_api_call(ec2_client.describe_instances, InstanceIds=instance_ids[:10])
+                success, response = self.safe_api_call(
+                    self.ec2_client.describe_instances, InstanceIds=instance_ids[:10]
+                )
 
                 if success and response:
                     for reservation in response.get("Reservations", []):
@@ -15352,7 +15375,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 subnet_ids.add(subnet_id)
 
             for subnet_id in subnet_ids:
-                success, response = self.safe_api_call(ec2_client.describe_subnets, SubnetIds=[subnet_id])
+                success, response = self.safe_api_call(self.ec2_client.describe_subnets, SubnetIds=[subnet_id])
 
                 if success and response:
                     for subnet in response.get("Subnets", []):
@@ -15758,16 +15781,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.progress.step("Analyzing security groups...")
 
         try:
-            ec2_client = self.session.client("ec2")
-
             success, response = self.safe_api_call(
-                ec2_client.describe_security_groups,
+                self.ec2_client.describe_security_groups,
                 Filters=[{"Name": "tag:aws:eks:cluster-name", "Values": [self.cluster_name]}],
             )
 
             if not success or not response.get("SecurityGroups"):
                 success, response = self.safe_api_call(
-                    ec2_client.describe_vpcs,
+                    self.ec2_client.describe_vpcs,
                     Filters=[
                         {
                             "Name": "tag:alpha.eksctl.io/cluster-name",

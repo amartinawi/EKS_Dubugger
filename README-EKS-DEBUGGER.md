@@ -4,11 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![AWS EKS](https://img.shields.io/badge/AWS-EKS-orange.svg)](https://aws.amazon.com/eks/)
 [![Catalog Coverage](https://img.shields.io/badge/catalog%20coverage-100%25-green.svg)](#catalog-coverage)
-[![Tests](https://img.shields.io/badge/tests-158%20passing-brightgreen.svg)](#unit-tests)
+[![Tests](https://img.shields.io/badge/tests-183%20passing-brightgreen.svg)](#unit-tests)
 
 A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 3.7.4 | **Analysis Methods:** 72 | **Catalog Coverage:** 100% | **Tests:** 158
+**Version:** 3.7.5 | **Analysis Methods:** 72 | **Catalog Coverage:** 100% | **Tests:** 183
 
 ---
 
@@ -119,9 +119,20 @@ Each finding is classified as either:
 - **Parallel Analysis** - 72 methods run concurrently using ThreadPoolExecutor
 - **Shared Data Pre-fetching** - CloudWatch log groups and kubectl data fetched once
 - **API Response Caching** - TTL-based cache for AWS API calls (5-minute default)
-- **kubectl Output Caching** - Reuses kubectl command results across methods
+- **kubectl Output Caching** - LRU eviction with 100-entry limit (v3.7.5)
 - **Performance Metrics** - Reports slowest methods and cache statistics
 - **Pagination Support** - Handles >100 clusters via nextToken (v3.6.0)
+- **CloudWatch Rate Limiting** - Token bucket algorithm prevents burst throttling (v3.7.5)
+
+### Smart False Positive Detection (v3.7.5)
+- **Alternative Monitoring Detection** - Skips Container Insights check if Prometheus, Grafana, Datadog detected
+- **StatefulSet Scale-Down Detection** - Ignores intentionally scaled-down StatefulSets (spec.replicas: 0)
+- **Retryable Error Classification** - Distinguishes throttling from permanent failures (AccessDenied, NotFound)
+
+### LLM Integration Features (v3.7.5)
+- **JSON Schema Definition** - Full JSON Schema specification for LLM output validation
+- **Schema Reference** - `$schema` field in JSON output for automated validation
+- **ISO 8601 Timestamps** - All timestamps in standardized format for LLM consumption
 
 ### Security Features (v3.4.0+)
 - **Input Validation** - All CLI parameters validated with strict regex patterns (max 256 chars)

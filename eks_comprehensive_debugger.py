@@ -198,7 +198,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.7.3"
+VERSION = "3.7.4"
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -855,7 +855,7 @@ REMEDIATION_COMMANDS = {
         ],
         "fix": [
             "# Increase memory limits in deployment",
-            'kubectl patch deployment {deployment} -n {namespace} --type=\'json\' -p=\'[{"op": "replace", "path": "/spec/template/spec/containers/0/resources/limits/memory", "value":"512Mi"}]\'',
+            'kubectl patch deployment {deployment} -n {namespace} --type=\'json\' -p=\'[{{"op": "replace", "path": "/spec/template/spec/containers/0/resources/limits/memory", "value":"512Mi"}}]\'',
         ],
         "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-memory-pressure",
     },
@@ -1190,7 +1190,7 @@ REMEDIATION_COMMANDS = {
         ],
         "fix": [
             "# Adjust PDB minAvailable",
-            'kubectl patch pdb {pdb} -n {namespace} --type=\'json\' -p=\'[{"op": "replace", "path": "/spec/minAvailable", "value":1}]\'',
+            'kubectl patch pdb {pdb} -n {namespace} --type=\'json\' -p=\'[{{"op": "replace", "path": "/spec/minAvailable", "value":1}}]\'',
             "# Or delete PDB temporarily for maintenance",
         ],
         "aws_doc": "https://kubernetes.io/docs/tasks/run-application/configure-pdb/",
@@ -1204,7 +1204,7 @@ REMEDIATION_COMMANDS = {
         ],
         "fix": [
             "# Increase quota limits",
-            'kubectl patch resourcequota {quota} -n {namespace} --type=\'json\' -p=\'[{"op": "replace", "path": "/spec/hard/requests.cpu", "value":"4"}]\'',
+            'kubectl patch resourcequota {quota} -n {namespace} --type=\'json\' -p=\'[{{"op": "replace", "path": "/spec/hard/requests.cpu", "value":"4"}}]\'',
             "# Or delete unused resources",
         ],
         "aws_doc": "https://kubernetes.io/docs/concepts/policy/resource-quotas/",
@@ -1232,7 +1232,7 @@ REMEDIATION_COMMANDS = {
         ],
         "fix": [
             "# Adjust probe timing",
-            'kubectl patch deployment {deployment} -n {namespace} --type=\'json\' -p=\'[{"op": "replace", "path": "/spec/template/spec/containers/0/livenessProbe/initialDelaySeconds", "value":60}]\'',
+            'kubectl patch deployment {deployment} -n {namespace} --type=\'json\' -p=\'[{{"op": "replace", "path": "/spec/template/spec/containers/0/livenessProbe/initialDelaySeconds", "value":60}}]\'',
         ],
         "aws_doc": "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
     },

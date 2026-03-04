@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.7.4] - 2026-03-04
+
+### Fixed
+- **HTML report crash** - Fixed `KeyError: '"op"'` when generating HTML reports
+  - Escaped JSON braces in kubectl patch commands in REMEDIATION_COMMANDS
+  - Commands with `{"op": "replace", ...}` now use `{{"op": "replace", ...}}` to avoid Python format string interpretation
+  - Affected 4 remediation patterns: memory limits, PDB, resource quotas, probe timing
+
 ## [3.7.3] - 2026-03-04
 
 ### Fixed

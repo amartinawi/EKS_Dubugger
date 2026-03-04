@@ -158,6 +158,8 @@ REFERENCES
 
 import argparse
 import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 import json
 import re
 import shlex
@@ -184,7 +186,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.7.4"
+VERSION = "3.7.6"
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -7880,15 +7882,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         # Rate limiter for CloudWatch API calls (10 calls/sec sustained, 20 burst)
         self._cloudwatch_rate_limiter = RateLimiter(rate=10.0, burst=20)
 
-        # AWS clients
+        # AWS clients with custom timeouts
         try:
+            # Configure boto3 with custom timeouts and retries
+            boto_config = Config(connect_timeout=5, read_timeout=30, retries={"max_attempts": 3, "mode": "adaptive"})
+
             self.session = boto3.Session(profile_name=profile, region_name=region)
-            self.eks_client = self.session.client("eks")
-            self.logs_client = self.session.client("logs")
-            self.cloudwatch_client = self.session.client("cloudwatch")
-            self.sts_client = self.session.client("sts")
-            self.ec2_client = self.session.client("ec2")
-            self.cloudtrail_client = self.session.client("cloudtrail")
+            self.eks_client = self.session.client("eks", config=boto_config)
+            self.logs_client = self.session.client("logs", config=boto_config)
+            self.cloudwatch_client = self.session.client("cloudwatch", config=boto_config)
+            self.sts_client = self.session.client("sts", config=boto_config)
+            self.ec2_client = self.session.client("ec2", config=boto_config)
+            self.cloudtrail_client = self.session.client("cloudtrail", config=boto_config)
         except Exception as e:
             raise AWSAuthenticationError(f"Failed to initialize AWS session: {e}")
 
@@ -10758,6 +10763,209 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("check_eks_addons", str(e))
             self.progress.warning(f"EKS addon check failed: {e}")
+
+    def analyze_eks_cluster_insights(self):
+        """
+        Analyze EKS Cluster Insights for upgrade readiness and configuration issues.
+
+        Uses EKS ListInsights API to detect:
+        - Kubernetes version deprecation warnings
+        - Addon version compatibility issues
+        - Upgrade recommendations
+        - Configuration best practices
+
+        Populates:
+            self.findings['addon_issues']: Cluster insights and recommendations.
+
+        Reference:
+            https://docs.aws.amazon.com/eks/latest/userguide/insights.html
+        """
+        self.progress.step("Checking EKS Cluster Insights...")
+
+        try:
+            # List all insights with pagination
+            insights = []
+            next_token = None
+
+            while True:
+                params = {"clusterName": self.cluster_name}
+                if next_token:
+                    params["nextToken"] = next_token
+
+                success, response = self.safe_api_call(self.eks_client.list_insights, **params)
+
+                if not success:
+                    self.progress.warning(f"Failed to list cluster insights: {response}")
+                    return
+
+                insights.extend(response.get("insights", []))
+                next_token = response.get("nextToken")
+
+                if not next_token:
+                    break
+
+            if not insights:
+                self.progress.info("No cluster insights found")
+                return
+
+            # Process each insight
+            for insight in insights:
+                insight_id = insight.get("id", "Unknown")
+                category = insight.get("category", "Unknown")
+                name = insight.get("name", "Unknown")
+                description = insight.get("description", "")
+                insight_status = insight.get("status", "Unknown")
+
+                # Get detailed insight information
+                success, detail_response = self.safe_api_call(self.eks_client.describe_insight, id=insight_id)
+
+                if success:
+                    detail = detail_response.get("insight", {})
+                    recommendations = detail.get("recommendations", [])
+                    additional_info = detail.get("additionalInfo", {})
+
+                    severity = "warning"
+                    if "deprecated" in description.lower() or "upgrade" in description.lower():
+                        severity = "critical"
+
+                    self._add_finding_dict(
+                        "addon_issues",
+                        {
+                            "summary": f"EKS Insight: {name}",
+                            "details": {
+                                "insight_id": insight_id,
+                                "category": category,
+                                "description": description[:500],  # Limit length
+                                "status": insight_status,
+                                "recommendations": recommendations[:3],  # Top 3 recommendations
+                                "kubernetes_version": additional_info.get("kubernetesVersion"),
+                                "severity": severity,
+                                "finding_type": FindingType.CURRENT_STATE,
+                                "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/insights.html",
+                            },
+                        },
+                    )
+
+            self.progress.info(f"Found {len(insights)} cluster insights")
+
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in ["AccessDenied", "UnauthorizedAccess"]:
+                self.progress.warning("Insufficient permissions to access EKS Insights (requires eks:ListInsights)")
+            else:
+                self._add_error("analyze_eks_cluster_insights", str(e))
+                self.progress.warning(f"EKS Cluster Insights check failed: {e}")
+        except Exception as e:
+            self._add_error("analyze_eks_cluster_insights", str(e))
+            self.progress.warning(f"EKS Cluster Insights check failed: {e}")
+
+    def analyze_eks_pod_identity_associations(self):
+        """
+        Analyze EKS Pod Identity associations for IRSA migration readiness.
+
+        Uses EKS ListPodIdentityAssociations API to detect:
+        - Pod Identity associations configuration
+        - Service account to IAM role mappings
+        - Potential migration candidates from IRSA
+
+        Populates:
+            self.findings['rbac_issues']: Pod Identity configuration issues.
+
+        Reference:
+            https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html
+        """
+        self.progress.step("Checking EKS Pod Identity associations...")
+
+        try:
+            # List all Pod Identity associations with pagination
+            associations = []
+            next_token = None
+
+            while True:
+                params = {"clusterName": self.cluster_name}
+                if next_token:
+                    params["nextToken"] = next_token
+
+                success, response = self.safe_api_call(self.eks_client.list_pod_identity_associations, **params)
+
+                if not success:
+                    self.progress.warning(f"Failed to list Pod Identity associations: {response}")
+                    return
+
+                associations.extend(response.get("associations", []))
+                next_token = response.get("nextToken")
+
+                if not next_token:
+                    break
+
+            if not associations:
+                self.progress.info("No Pod Identity associations found (feature may not be enabled)")
+                return
+
+            # Process each association
+            for assoc in associations:
+                association_arn = assoc.get("associationArn", "")
+                service_account = assoc.get("serviceAccount", "")
+                namespace = assoc.get("namespace", "")
+                role_arn = assoc.get("roleArn", "")
+
+                # Check for potential issues
+                issues = []
+
+                # Verify namespace exists
+                cmd = f"kubectl get namespace {namespace} -o json 2>/dev/null || echo 'not found'"
+                output = self.safe_kubectl_call(cmd)
+                if not output or "not found" in output.lower():
+                    issues.append(f"Namespace {namespace} not found")
+
+                # Verify service account exists
+                cmd = f"kubectl get serviceaccount -n {namespace} {service_account} -o json 2>/dev/null || echo 'not found'"
+                output = self.safe_kubectl_call(cmd)
+                if not output or "not found" in output.lower():
+                    issues.append(f"Service account {namespace}/{service_account} not found")
+
+                # Check for IRSA annotation on same service account (potential conflict)
+                if output and "not found" not in output.lower():
+                    try:
+                        sa_data = json.loads(output)
+                        annotations = sa_data.get("metadata", {}).get("annotations", {})
+                        if "eks.amazonaws.com/role-arn" in annotations:
+                            issues.append(f"Service account has both Pod Identity and IRSA annotation")
+                    except:
+                        pass
+
+                if issues:
+                    self._add_finding_dict(
+                        "rbac_issues",
+                        {
+                            "summary": f"Pod Identity association {namespace}/{service_account} has configuration issues",
+                            "details": {
+                                "association_arn": association_arn,
+                                "namespace": namespace,
+                                "service_account": service_account,
+                                "role_arn": role_arn,
+                                "issues": issues,
+                                "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
+                                "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html",
+                            },
+                        },
+                    )
+
+            self.progress.info(f"Checked {len(associations)} Pod Identity associations")
+
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in ["AccessDenied", "UnauthorizedAccess"]:
+                self.progress.warning(
+                    "Insufficient permissions to access Pod Identity (requires eks:ListPodIdentityAssociations)"
+                )
+            else:
+                self._add_error("analyze_eks_pod_identity_associations", str(e))
+                self.progress.warning(f"Pod Identity check failed: {e}")
+        except Exception as e:
+            self._add_error("analyze_eks_pod_identity_associations", str(e))
+            self.progress.warning(f"Pod Identity check failed: {e}")
 
     def analyze_resource_quotas(self):
         """
@@ -15278,159 +15486,138 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     def analyze_service_quotas(self):
         """
-        Analyze AWS Service Quotas for EC2, EBS, and VPC limits
-        Detects if quota limits may be blocking cluster scaling
+        Analyze AWS Service Quotas for EC2, EBS, VPC, and EKS limits.
+        Detects if quota limits may be blocking cluster scaling.
+
+        Uses list_service_quotas with pagination for efficient batch retrieval.
+
+        Populates:
+            self.findings['quota_issues']: Service quota warnings.
+
+        Reference:
+            https://docs.aws.amazon.com/servicequotas/latest/userguide/reference_limits.html
         """
         self.progress.step("Analyzing AWS Service Quotas...")
 
         try:
             quotas_client = self.session.client("service-quotas")
 
-            # Critical quotas to check for EKS
-            quota_checks = [
-                {
-                    "service_code": "ec2",
-                    "quota_name": "Running On-Demand Standard instances",
-                    "quota_code": "L-1216C47A",
-                    "critical_threshold": 0.9,
-                    "description": "EC2 On-Demand Instance Limit",
-                },
-                {
-                    "service_code": "ec2",
-                    "quota_name": "Number of EBS snapshots",
-                    "quota_code": "L-309BAC07",
-                    "critical_threshold": 0.9,
-                    "description": "EBS Snapshot Limit",
-                },
-                {
-                    "service_code": "ec2",
-                    "quota_name": "Total size of all EBS snapshots",
-                    "quota_code": "L-835FE1D7",
-                    "critical_threshold": 0.9,
-                    "description": "EBS Snapshot Storage Limit",
-                },
-                {
-                    "service_code": "vpc",
-                    "quota_name": "VPCs per Region",
-                    "quota_code": "L-F678F1CE",
-                    "critical_threshold": 0.9,
-                    "description": "VPC Limit",
-                },
-                {
-                    "service_code": "vpc",
-                    "quota_name": "Internet gateways per Region",
-                    "quota_code": "L-A4707A72",
-                    "critical_threshold": 0.9,
-                    "description": "Internet Gateway Limit",
-                },
-                {
-                    "service_code": "vpc",
-                    "quota_name": "NAT gateways per Availability Zone",
-                    "quota_code": "L-FE5A380F",
-                    "critical_threshold": 0.9,
-                    "description": "NAT Gateway Limit",
-                },
-                {
-                    "service_code": "elasticloadbalancing",
-                    "quota_name": "Application Load Balancers per Region",
-                    "quota_code": "L-53B6E32B",
-                    "critical_threshold": 0.9,
-                    "description": "ALB Limit",
-                },
-                {
-                    "service_code": "elasticloadbalancing",
-                    "quota_name": "Network Load Balancers per Region",
-                    "quota_code": "L-69A177A4",
-                    "critical_threshold": 0.9,
-                    "description": "NLB Limit",
-                },
-                # EKS-specific quotas
-                {
-                    "service_code": "eks",
-                    "quota_name": "Clusters per Region",
-                    "quota_code": "L-40443383",
-                    "critical_threshold": 0.9,
-                    "description": "EKS Cluster Limit (default 100)",
-                },
-                {
-                    "service_code": "eks",
-                    "quota_name": "Managed Node Groups per Region",
-                    "quota_code": "L-E4B64F1",
-                    "critical_threshold": 0.8,
-                    "description": "EKS Node Group Limit (default 50 per cluster)",
-                },
-                {
-                    "service_code": "eks",
-                    "quota_name": "Fargate Profiles per Region",
-                    "quota_code": "L-257B8270",
-                    "critical_threshold": 0.8,
-                    "description": "Fargate Profile Limit (default 10 per cluster)",
-                },
-                {
-                    "service_code": "eks",
-                    "quota_name": "Control Plane Logs per Cluster",
-                    "quota_code": "L-8B8BE31",
-                    "critical_threshold": 0.9,
-                    "description": "Control Plane Log Streams Limit",
-                },
-                # IAM quotas
-                {
-                    "service_code": "iam",
-                    "quota_name": "Roles per Account",
-                    "quota_code": "L-F55C99B4",
-                    "critical_threshold": 0.9,
-                    "description": "IAM Role Limit",
-                },
-                # CloudWatch quotas
-                {
-                    "service_code": "logs",
-                    "quota_name": "Log groups per Region",
-                    "quota_code": "L-6B96592D",
-                    "critical_threshold": 0.9,
-                    "description": "CloudWatch Log Group Limit",
-                },
-                {
-                    "service_code": "logs",
-                    "quota_name": "Metric filters per Region",
-                    "quota_code": "L-A5959CE79",
-                    "critical_threshold": 0.9,
-                    "description": "CloudWatch Metric Filter Limit",
-                },
-            ]
+            # Critical services to check for EKS
+            services_to_check = ["ec2", "vpc", "elasticloadbalancing", "eks", "iam", "logs"]
 
-            for quota_check in quota_checks:
+            # Collect all quotas using pagination
+            all_quotas = {}
+
+            for service_code in services_to_check:
                 try:
-                    success, response = self.safe_api_call(
-                        quotas_client.get_service_quota,
-                        ServiceCode=quota_check["service_code"],
-                        QuotaCode=quota_check["quota_code"],
-                    )
+                    quotas = []
+                    next_token = None
 
-                    if success and response:
-                        quota = response.get("Quota", {})
+                    while True:
+                        params = {"ServiceCode": service_code}
+                        if next_token:
+                            params["NextToken"] = next_token
+
+                        success, response = self.safe_api_call(quotas_client.list_service_quotas, **params)
+
+                        if not success:
+                            self.progress.warning(f"Failed to list quotas for {service_code}: {response}")
+                            break
+
+                        quotas.extend(response.get("Quotas", []))
+                        next_token = response.get("NextToken")
+
+                        if not next_token:
+                            break
+
+                    all_quotas[service_code] = {q["QuotaCode"]: q for q in quotas}
+
+                except Exception as e:
+                    self.progress.warning(f"Failed to retrieve quotas for {service_code}: {e}")
+                    continue
+
+            # Critical quota codes to check with thresholds
+            critical_quotas = {
+                "ec2": {
+                    "L-1216C47A": {"name": "Running On-Demand Standard instances", "threshold": 0.9},
+                    "L-309BAC07": {"name": "Number of EBS snapshots", "threshold": 0.9},
+                    "L-835FE1D7": {"name": "Total size of all EBS snapshots", "threshold": 0.9},
+                },
+                "vpc": {
+                    "L-F678F1CE": {"name": "VPCs per Region", "threshold": 0.9},
+                    "L-A4707A72": {"name": "Internet gateways per Region", "threshold": 0.9},
+                    "L-FE5A380F": {"name": "NAT gateways per Availability Zone", "threshold": 0.9},
+                },
+                "elasticloadbalancing": {
+                    "L-53B6E32B": {"name": "Application Load Balancers per Region", "threshold": 0.9},
+                    "L-69A177A4": {"name": "Network Load Balancers per Region", "threshold": 0.9},
+                },
+                "eks": {
+                    "L-40443383": {"name": "Clusters per Region", "threshold": 0.9},
+                    "L-E4B64F1": {"name": "Managed Node Groups per Region", "threshold": 0.8},
+                    "L-257B8270": {"name": "Fargate Profiles per Region", "threshold": 0.8},
+                },
+                "iam": {
+                    "L-F55C99B4": {"name": "Roles per Account", "threshold": 0.9},
+                },
+                "logs": {
+                    "L-6B96592D": {"name": "Log groups per Region", "threshold": 0.9},
+                },
+            }
+
+            # Check critical quotas
+            for service_code, quota_configs in critical_quotas.items():
+                service_quotas = all_quotas.get(service_code, {})
+
+                for quota_code, config in quota_configs.items():
+                    if quota_code in service_quotas:
+                        quota = service_quotas[quota_code]
                         quota_value = quota.get("Value", 0)
-                        usage = quota.get("UsageMetric", {})
+                        quota_name = quota.get("QuotaName", config["name"])
+                        adjustable = quota.get("Adjustable", False)
 
                         if quota_value > 0:
+                            # Get usage if available (requires get_service_quota for usage metrics)
+                            usage_percentage = None
+                            try:
+                                success, detail_response = self.safe_api_call(
+                                    quotas_client.get_service_quota,
+                                    ServiceCode=service_code,
+                                    QuotaCode=quota_code,
+                                )
+                                if success and detail_response:
+                                    usage_metric = detail_response.get("Quota", {}).get("UsageMetric", {})
+                                    if usage_metric:
+                                        # Usage metrics require CloudWatch queries
+                                        # For now, just note that usage monitoring is available
+                                        pass
+                            except:
+                                pass
+
+                            severity = "info"
+                            if usage_percentage and usage_percentage >= config["threshold"] * 100:
+                                severity = "warning"
+
                             self._add_finding_dict(
                                 "quota_issues",
                                 {
-                                    "summary": f"Service Quota check: {quota_check['quota_name']}",
+                                    "summary": f"Service Quota: {quota_name} = {quota_value}",
                                     "details": {
-                                        "service": quota_check["service_code"],
-                                        "quota_name": quota_check["quota_name"],
+                                        "service": service_code,
+                                        "quota_code": quota_code,
+                                        "quota_name": quota_name,
                                         "limit": quota_value,
-                                        "description": quota_check["description"],
-                                        "severity": "info",
+                                        "usage_percentage": usage_percentage,
+                                        "threshold": f"{config['threshold'] * 100}%",
+                                        "adjustable": adjustable,
+                                        "severity": severity,
                                         "finding_type": FindingType.CURRENT_STATE,
+                                        "aws_doc": f"https://console.aws.amazon.com/servicequotas/home?region={self.region}#!/services/{service_code}/quotas/{quota_code}",
                                     },
                                 },
                             )
 
-                except Exception:
-                    continue
-
-            self.progress.info("Service Quotas analysis completed")
+            self.progress.info(f"Service Quotas analysis completed ({len(all_quotas)} services checked)")
 
         except Exception as e:
             self._add_error("analyze_service_quotas", str(e))

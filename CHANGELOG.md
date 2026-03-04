@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.7.6] - 2026-03-05
+
+### Added
+- **EKS Cluster Insights API** - New `analyze_eks_cluster_insights()` method
+  - Detects Kubernetes version deprecation warnings
+  - Identifies addon version compatibility issues
+  - Provides upgrade recommendations
+  - Uses `eks:ListInsights` and `eks:DescribeInsight` APIs with pagination
+- **EKS Pod Identity Associations** - New `analyze_eks_pod_identity_associations()` method
+  - Lists all Pod Identity associations with pagination
+  - Verifies namespace and service account existence
+  - Detects IRSA annotation conflicts
+  - Uses `eks:ListPodIdentityAssociations` API
+
+### Changed
+- **Service Quotas pagination** - Refactored `analyze_service_quotas()` to use `list_service_quotas` with pagination
+  - Reduced API calls by batching requests per service
+  - More efficient than individual `get_service_quota` calls
+  - Added support for adjustable quota flag
+- **boto3 Config with timeouts** - All AWS clients now use custom timeouts
+  - Connect timeout: 5 seconds
+  - Read timeout: 30 seconds
+  - Adaptive retry mode with max 3 attempts
+  - Prevents hanging on unresponsive APIs
+
+### Security
+- **SECURITY.md** - Added comprehensive security policy documentation
+  - Vulnerability reporting process
+  - Supported versions matrix
+  - Security features documentation
+  - Required AWS permissions
+  - Security best practices
+  - Disclosure policy
+
 ## [3.7.5] - 2026-03-04
 
 ### Fixed

@@ -202,6 +202,139 @@ CACHE_DIR = os.path.expanduser("~/.eks-debugger-cache")
 KUBECTL_CACHE_MAX_SIZE = 100  # LRU eviction limit for kubectl output cache
 
 
+# LLM JSON Schema Definition
+# This schema describes the structure of the LLM-optimized JSON output
+# for AI analysis and validation purposes.
+LLM_JSON_SCHEMA = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/amartinawi/EKS_Dubugger/schemas/llm-output-v1.json",
+  "title": "EKS Debugger LLM Output",
+  "description": "LLM-optimized JSON output from EKS Health Check Dashboard for AI analysis",
+  "type": "object",
+  "required": ["metadata", "summary", "findings"],
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "required": ["version", "schema_version", "cluster", "region", "analysis_date"],
+      "properties": {
+        "version": {"type": "string", "description": "EKS Debugger version"},
+        "schema_version": {"type": "string", "const": "1.0"},
+        "cluster": {"type": "string", "description": "EKS cluster name"},
+        "region": {"type": "string", "description": "AWS region"},
+        "analysis_date": {"type": "string", "format": "date-time"},
+        "date_range": {
+          "type": "object",
+          "properties": {
+            "start": {"type": "string"},
+            "end": {"type": "string"}
+          }
+        },
+        "timezone": {"type": "string", "default": "UTC"},
+        "namespace": {"type": ["string", "null"]}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["total_issues", "critical", "warning", "info"],
+      "properties": {
+        "total_issues": {"type": "integer", "minimum": 0},
+        "critical": {"type": "integer", "minimum": 0},
+        "warning": {"type": "integer", "minimum": 0},
+        "info": {"type": "integer", "minimum": 0},
+        "historical_events": {"type": "integer", "minimum": 0},
+        "current_state_issues": {"type": "integer", "minimum": 0},
+        "categories": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "category", "severity", "finding_type", "summary"],
+        "properties": {
+          "id": {"type": "string", "description": "Unique finding identifier (8-char UUID)"},
+          "category": {"type": "string", "description": "Finding category (e.g., pod_errors, node_issues)"},
+          "severity": {"type": "string", "enum": ["critical", "warning", "info"]},
+          "finding_type": {"type": "string", "enum": ["current_state", "historical_event"]},
+          "summary": {"type": "string", "description": "Human-readable finding summary"},
+          "details": {"type": "object", "description": "Detailed finding information"},
+          "timestamp": {"type": "string", "format": "date-time", "description": "ISO 8601 timestamp"}
+        }
+      }
+    },
+    "correlations": {
+      "type": "array",
+      "description": "Root cause correlations identified by the analyzer",
+      "items": {
+        "type": "object",
+        "properties": {
+          "correlation_type": {"type": "string"},
+          "severity": {"type": "string"},
+          "root_cause": {"type": "string"},
+          "root_cause_time": {"type": "string"},
+          "impact": {"type": "string"},
+          "recommendation": {"type": "string"},
+          "confidence_tier": {"type": "string", "enum": ["high", "medium", "low"]},
+          "composite_confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        }
+      }
+    },
+    "correlations_by_confidence_tier": {
+      "type": "object",
+      "properties": {
+        "high": {"type": "array"},
+        "medium": {"type": "array"},
+        "low": {"type": "array"}
+      }
+    },
+    "timeline": {
+      "type": "array",
+      "description": "Chronological event timeline",
+      "items": {
+        "type": "object",
+        "properties": {
+          "time_bucket": {"type": "string"},
+          "event_count": {"type": "integer"},
+          "categories": {"type": "array", "items": {"type": "string"}},
+          "severity": {"type": "string"}
+        }
+      }
+    },
+    "potential_root_causes": {
+      "type": "array",
+      "description": "Ranked potential root causes by confidence",
+      "items": {
+        "type": "object",
+        "properties": {
+          "timestamp": {"type": "string"},
+          "category": {"type": "string"},
+          "summary": {"type": "string"},
+          "correlation_type": {"type": "string"},
+          "root_cause": {"type": "string"},
+          "composite_confidence": {"type": "number"},
+          "confidence_tier": {"type": "string"}
+        }
+      }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "string"},
+          "category": {"type": "string"},
+          "priority": {"type": "string"},
+          "action": {"type": "string"},
+          "aws_doc": {"type": "string", "format": "uri"}
+        }
+      }
+    }
+  }
+}
+"""
+
+
 class PerformanceTracker:
     """Track and report performance metrics for analysis methods."""
 
@@ -268,6 +401,62 @@ class APICache:
         key_parts = [func_name, repr(args), repr(sorted(kwargs.items()))]
         key_str = "|".join(key_parts)
         return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+
+class RateLimiter:
+    """Thread-safe token bucket rate limiter for API calls.
+
+    Prevents burst throttling by limiting the rate of API calls.
+    Uses token bucket algorithm with configurable rate and burst capacity.
+    """
+
+    def __init__(self, rate: float = 10.0, burst: int = 20):
+        """Initialize rate limiter.
+
+        Args:
+            rate: Maximum sustained rate (calls per second)
+            burst: Maximum burst capacity (number of calls)
+        """
+        self._rate = rate
+        self._burst = burst
+        self._tokens = float(burst)
+        self._last_update = time.time()
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens: int = 1) -> float:
+        """Acquire tokens, blocking if necessary.
+
+        Args:
+            tokens: Number of tokens to acquire (default: 1)
+
+        Returns:
+            Wait time in seconds (0 if no wait needed)
+        """
+        with self._lock:
+            now = time.time()
+            # Refill tokens based on elapsed time
+            elapsed = now - self._last_update
+            self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
+            self._last_update = now
+
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return 0.0
+
+            # Calculate wait time
+            needed = tokens - self._tokens
+            wait_time = needed / self._rate
+            return wait_time
+
+    def wait_if_needed(self, tokens: int = 1) -> None:
+        """Block until tokens are available.
+
+        Args:
+            tokens: Number of tokens to acquire
+        """
+        wait_time = self.acquire(tokens)
+        if wait_time > 0:
+            time.sleep(wait_time)
 
 
 class TimezoneManager:
@@ -1617,6 +1806,7 @@ class LLMJSONOutputFormatter(OutputFormatter):
             )
 
         llm_output = {
+            "$schema": "https://github.com/amartinawi/EKS_Dubugger/schemas/llm-output-v1.json",
             "metadata": {
                 "version": VERSION,
                 "schema_version": "1.0",
@@ -7687,6 +7877,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         # API response cache
         self._api_cache = APICache(ttl_seconds=API_CACHE_TTL_SECONDS)
 
+        # Rate limiter for CloudWatch API calls (10 calls/sec sustained, 20 burst)
+        self._cloudwatch_rate_limiter = RateLimiter(rate=10.0, burst=20)
+
         # AWS clients
         try:
             self.session = boto3.Session(profile_name=profile, region_name=region)
@@ -7776,6 +7969,71 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cache.popitem(last=False)  # Remove first (oldest)
             cache[cmd] = output
             cache.move_to_end(cmd)  # Mark as most recently used
+
+    def _detect_alternative_monitoring(self) -> bool:
+        """Detect if alternative monitoring tools are deployed.
+
+        Checks for common observability tools that might replace CloudWatch
+        Container Insights, to avoid false positives when teams use custom
+        monitoring solutions.
+
+        Detection methods:
+        1. Prometheus: Look for prometheus.io annotations on pods/services
+        2. Grafana Agent: Check for grafana-agent DaemonSet
+        3. Datadog: Check for datadog-agent DaemonSet
+        4. New Relic: Check for newrelic-infra DaemonSet
+
+        Returns:
+            True if alternative monitoring is detected, False otherwise
+        """
+        try:
+            # Check for monitoring DaemonSets (common pattern)
+            monitoring_daemonsets = [
+                "grafana-agent",
+                "datadog-agent",
+                "newrelic-infra",
+                "prometheus-node-exporter",
+                "amazon-cloudwatch-agent",  # This is CloudWatch, not alternative
+            ]
+
+            cmd = "kubectl get daemonsets --all-namespaces -o json"
+            output = self.safe_kubectl_call(cmd)
+            if output:
+                daemonsets = json.loads(output)
+                for ds in daemonsets.get("items", []):
+                    ds_name = ds["metadata"]["name"].lower()
+                    for monitor in monitoring_daemonsets:
+                        if monitor in ds_name and monitor != "amazon-cloudwatch-agent":
+                            self.progress.info(f"Alternative monitoring detected: {ds['metadata']['name']}")
+                            return True
+
+            # Check for Prometheus annotations on services/pods
+            cmd = "kubectl get pods --all-namespaces -o json"
+            output = self.safe_kubectl_call(cmd)
+            if output:
+                pods = json.loads(output)
+                for pod in pods.get("items", [])[:100]:  # Sample first 100 pods
+                    annotations = pod.get("metadata", {}).get("annotations", {})
+                    for key in annotations:
+                        if "prometheus.io" in key:
+                            self.progress.info("Prometheus annotations detected on pods")
+                            return True
+
+            # Check for Prometheus Operator (ServiceMonitors/PodMonitors)
+            cmd = "kubectl get servicemonitors --all-namespaces -o json 2>/dev/null || echo 'not found'"
+            output = self.safe_kubectl_call(cmd)
+            if output and "not found" not in output.lower():
+                servicemonitors = json.loads(output)
+                if servicemonitors.get("items"):
+                    self.progress.info("Prometheus Operator detected (ServiceMonitors found)")
+                    return True
+
+            return False
+
+        except Exception as e:
+            # If detection fails, don't block Container Insights check
+            self.progress.warning(f"Alternative monitoring detection failed: {e}")
+            return False
 
     # === AWS Validation Methods (Reused from existing) ===
 
@@ -8807,6 +9065,15 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         for attempt in range(max_retries):
             try:
+                # Apply rate limiting for CloudWatch API calls
+                func_name = func.__name__ if hasattr(func, "__name__") else ""
+                if func_name and (
+                    "get_metric_statistics",
+                    "get_metric_data",
+                    "list_metrics",
+                ):
+                    self._cloudwatch_rate_limiter.wait_if_needed()
+
                 result = func(*args, **kwargs)
                 outcome = (True, result)
                 if use_cache and self.enable_cache and cache_key:
@@ -9447,18 +9714,27 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
     def check_container_insights_metrics(self):
         """
         Check CloudWatch Container Insights metrics for threshold violations.
-
-        Analyzes node memory, CPU, and filesystem utilization metrics from
+        Analyzes node memory, CPU, and filesystem utilization metrics through
         Container Insights to detect resource pressure.
 
+        Also checks for alternative monitoring tools (Prometheus, Grafana, Datadog)
+        to avoid false positives when teams use custom observability.
+
         Populates:
-            self.findings['memory_pressure']: High memory utilization.
-            self.findings['disk_pressure']: High disk utilization.
+            self.findings['memory_pressure']. High memory utilization.
+            self.findings['disk_pressure']. High disk utilization.
 
         Reference:
             https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html
         """
         self.progress.step("Checking CloudWatch Container Insights metrics...")
+
+        # First check for alternative monitoring tools
+        has_alternative_monitoring = self._detect_alternative_monitoring()
+
+        if has_alternative_monitoring:
+            self.progress.info(f"Alternative monitoring detected, skipping Container Insights check")
+            return
 
         metrics_config = [
             {
@@ -17872,7 +18148,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             for sts in statefulsets.get("items", []):
                 sts_name = sts["metadata"]["name"]
-                namespace = sts["metadata"]["name"]
+                namespace = sts["metadata"]["namespace"]
                 spec = sts.get("spec", {})
                 status = sts.get("status", {})
 
@@ -17881,7 +18157,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 current_replicas = status.get("currentReplicas", 0)
                 updated_replicas = status.get("updatedReplicas", 0)
 
-                # Check for replica mismatch
+                # Check for replica mismatch (skip if intentionally scaled down)
+                if replicas == 0 and ready_replicas == 0:
+                    # StatefulSet intentionally scaled down - not an issue
+                    continue
+
                 if ready_replicas < replicas:
                     self._add_finding_dict(
                         "pod_errors",

@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.7.5] - 2026-03-04
+
+### Fixed
+- **Container Insights false positive** - Added `_detect_alternative_monitoring()` to check for Prometheus, Grafana Agent, Datadog, New Relic
+  - Skips Container Insights metrics check if alternative monitoring is detected
+  - Avoids confusing warnings when teams use custom observability stacks
+- **StatefulSet false positive** - Fixed warning for intentionally scaled down StatefulSets
+  - Now correctly ignores StatefulSets with `spec.replicas: 0` and `status.readyReplicas: 0`
+  - Also fixed namespace bug where `sts["metadata"]["name"]` was incorrectly used instead of `sts["metadata"]["namespace"]`
+- **Duplicate imports** - Removed ~16 duplicate import statements (lines 157-194)
+- **kubectl cache LRU eviction** - Added `KUBECTL_CACHE_MAX_SIZE = 100` limit with OrderedDict-based LRU eviction
+  - Prevents unbounded memory growth during long-running analyses
+  - Added `_get_kubectl_cache()` and `_set_kubectl_cache()` helper methods
+- **Indiscriminate API retry** - Added `_is_retryable_error()` to distinguish retryable from non-retryable errors
+  - Retryable: Throttling, RequestLimitExceeded, ServiceUnavailable, InternalError, etc.
+  - Non-retryable: AccessDenied, NotFound, ValidationError, InvalidParameter, etc.
+  - Prevents wasted retries on permission/config errors that won't succeed
+- **Timestamp format in LLM JSON output** - Fixed timestamps to use ISO 8601 format via `TimezoneManager.to_iso_string()`
+  - Ensures consistent machine-readable timestamps for LLM consumption
+- **CloudWatch API rate limiting** - Added `RateLimiter` class with token bucket algorithm
+  - Limits CloudWatch API calls to 10/second sustained, 20 burst capacity
+  - Prevents burst throttling during metric-intensive analyses
+- **LLM JSON schema definition** - Added `LLM_JSON_SCHEMA` constant with JSON Schema specification
+  - Enables LLM validation of output structure
+  - Added `$schema` reference to LLM JSON output for schema validation
+
+### Added
+- **HTML output XSS tests** - 10 new tests for XSS prevention in HTML output
+  - Tests for script tags, event handlers, data URLs, javascript: URLs
+  - Unicode preservation tests
+  - Empty results crash prevention tests
+- **Correlation logic unit tests** - 15 new tests for root cause analysis
+  - 5D confidence scoring tests (temporal, spatial, mechanism, exclusivity, reproducibility)
+  - Confidence tier classification tests (high/medium/low)
+  - Root cause ranking prioritization tests
+  - Spatial correlation namespace weighting tests
+
 ## [3.7.4] - 2026-03-04
 
 ### Fixed

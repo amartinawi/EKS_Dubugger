@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EKS Health Check Dashboard v3.6.0
+EKS Health Check Dashboard v3.7.4
 
 A production-grade diagnostic tool for Amazon EKS cluster troubleshooting that provides
 systematic analysis of cluster health, workload issues, networking, storage, and control plane.
@@ -168,7 +168,7 @@ import html
 import threading
 import uuid
 import logging
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as date_parser
 from typing import Optional, Any, Callable
@@ -177,20 +177,6 @@ from functools import lru_cache
 import hashlib
 import os
 import json as json_module
-import pytz
-
-import logging
-
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from dateutil import parser as date_parser
-from typing import Optional, Any, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
-import hashlib
-import os
-import json as json_module
-
 import pytz
 
 # Configure module-level logger
@@ -213,6 +199,7 @@ MAX_FINDINGS_PER_CATEGORY = 500
 MAX_PARALLEL_WORKERS = 8
 API_CACHE_TTL_SECONDS = 300
 CACHE_DIR = os.path.expanduser("~/.eks-debugger-cache")
+KUBECTL_CACHE_MAX_SIZE = 100  # LRU eviction limit for kubectl output cache
 
 
 class PerformanceTracker:
@@ -1529,15 +1516,41 @@ class LLMJSONOutputFormatter(OutputFormatter):
 
                 timestamp = details.get("timestamp") or details.get("event_time")
                 if timestamp:
-                    llm_finding["timestamp"] = str(timestamp)
+                    # Convert to ISO 8601 format
+                    if isinstance(timestamp, datetime):
+                        llm_finding["timestamp"] = TimezoneManager.to_iso_string(timestamp)
+                    elif isinstance(timestamp, str):
+                        # Try to parse and re-format
+                        try:
+                            parsed = TimezoneManager.parse_iso_utc(timestamp)
+                            if parsed:
+                                llm_finding["timestamp"] = TimezoneManager.to_iso_string(parsed)
+                            else:
+                                llm_finding["timestamp"] = timestamp
+                        except (ValueError, AttributeError):
+                            llm_finding["timestamp"] = timestamp
+                    else:
+                        llm_finding["timestamp"] = str(timestamp)
 
                 llm_findings.append(llm_finding)
 
         potential_root_causes = []
         if first_issue:
+            first_ts = first_issue.get("timestamp")
+            formatted_ts = first_ts
+            if first_ts:
+                if isinstance(first_ts, datetime):
+                    formatted_ts = TimezoneManager.to_iso_string(first_ts)
+                elif isinstance(first_ts, str):
+                    try:
+                        parsed = TimezoneManager.parse_iso_utc(first_ts)
+                        if parsed:
+                            formatted_ts = TimezoneManager.to_iso_string(parsed)
+                    except (ValueError, AttributeError):
+                        pass
             potential_root_causes.append(
                 {
-                    "timestamp": first_issue.get("timestamp"),
+                    "timestamp": formatted_ts,
                     "category": first_issue.get("category"),
                     "summary": first_issue.get("summary"),
                     "is_potential_root_cause": first_issue.get("potential_root_cause", False),
@@ -1547,11 +1560,25 @@ class LLMJSONOutputFormatter(OutputFormatter):
 
         for corr in correlations:
             if corr.get("root_cause"):
+                # Format root_cause_time to ISO 8601
+                rc_time = corr.get("root_cause_time")
+                formatted_rc_time = rc_time
+                if rc_time and rc_time != "Unknown":
+                    if isinstance(rc_time, datetime):
+                        formatted_rc_time = TimezoneManager.to_iso_string(rc_time)
+                    elif isinstance(rc_time, str):
+                        try:
+                            parsed = TimezoneManager.parse_iso_utc(rc_time)
+                            if parsed:
+                                formatted_rc_time = TimezoneManager.to_iso_string(parsed)
+                        except (ValueError, AttributeError):
+                            pass
                 potential_root_causes.append(
                     {
                         "correlation_type": corr.get("correlation_type"),
                         "severity": corr.get("severity"),
                         "root_cause": corr.get("root_cause"),
+                        "root_cause_time": formatted_rc_time,
                         "impact": corr.get("impact"),
                         "recommendation": corr.get("recommendation"),
                         "aws_doc": corr.get("aws_doc"),
@@ -7705,7 +7732,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self._shared_data: dict = {
             "log_groups": {},  # log_group_prefix -> logGroups response
             "log_streams": {},  # (log_group_name, limit) -> logStreams response
-            "kubectl_cache": {},  # cmd -> output
+            "kubectl_cache": OrderedDict(),  # cmd -> output (LRU with maxsize)
             "node_info": None,  # kubectl get nodes output
             "pod_info": None,  # kubectl get pods output
         }
@@ -7717,6 +7744,38 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # Performance tracking for analysis methods
         self._perf_tracker = PerformanceTracker()
+
+    def _get_kubectl_cache(self, cmd: str) -> Optional[str]:
+        """Get kubectl output from cache with LRU update.
+
+        Args:
+            cmd: kubectl command string
+
+        Returns:
+            Cached output or None if not in cache
+        """
+        with self._shared_data_lock:
+            cache = self._shared_data["kubectl_cache"]
+            if cmd in cache:
+                # Move to end (most recently used)
+                cache.move_to_end(cmd)
+                return cache[cmd]
+        return None
+
+    def _set_kubectl_cache(self, cmd: str, output: str) -> None:
+        """Set kubectl output in cache with LRU eviction.
+
+        Args:
+            cmd: kubectl command string
+            output: Command output to cache
+        """
+        with self._shared_data_lock:
+            cache = self._shared_data["kubectl_cache"]
+            # Remove oldest if at capacity
+            if len(cache) >= KUBECTL_CACHE_MAX_SIZE:
+                cache.popitem(last=False)  # Remove first (oldest)
+            cache[cmd] = output
+            cache.move_to_end(cmd)  # Mark as most recently used
 
     # === AWS Validation Methods (Reused from existing) ===
 
@@ -7889,8 +7948,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         try:
             nodes_output = self.safe_kubectl_call("kubectl get nodes -o json")
             if nodes_output:
+                self._set_kubectl_cache("kubectl get nodes -o json", nodes_output)
                 with self._shared_data_lock:
-                    self._shared_data["kubectl_cache"]["kubectl get nodes -o json"] = nodes_output
                     try:
                         self._shared_data["node_info"] = json.loads(nodes_output)
                     except json.JSONDecodeError:
@@ -7905,8 +7964,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 pods_cmd = "kubectl get pods --all-namespaces -o json"
             pods_output = self.safe_kubectl_call(pods_cmd)
             if pods_output:
+                self._set_kubectl_cache(pods_cmd, pods_output)
                 with self._shared_data_lock:
-                    self._shared_data["kubectl_cache"][pods_cmd] = pods_output
                     try:
                         self._shared_data["pod_info"] = json.loads(pods_output)
                     except json.JSONDecodeError:
@@ -7956,15 +8015,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Returns:
             Command output or None
         """
-        with self._shared_data_lock:
-            if cmd in self._shared_data["kubectl_cache"]:
-                return self._shared_data["kubectl_cache"][cmd]
+        cached = self._get_kubectl_cache(cmd)
+        if cached:
+            return cached
 
         # Not cached, execute now
         output = self.safe_kubectl_call(cmd)
         if output:
-            with self._shared_data_lock:
-                self._shared_data["kubectl_cache"][cmd] = output
+            self._set_kubectl_cache(cmd, output)
         return output
 
     def collect_cluster_statistics(self):
@@ -8533,9 +8591,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # Check cache first
         if use_cache:
-            with self._shared_data_lock:
-                if cmd in self._shared_data["kubectl_cache"]:
-                    return self._shared_data["kubectl_cache"][cmd]
+            cached = self._get_kubectl_cache(cmd)
+            if cached:
+                return cached
 
         # Parse shell fallback patterns: "cmd1 || cmd2 || echo 'fallback'"
         # Use shlex for robust quote handling
@@ -8603,16 +8661,125 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # Cache successful result
         if use_cache and output is not None:
-            with self._shared_data_lock:
-                self._shared_data["kubectl_cache"][cmd] = output
+            self._set_kubectl_cache(cmd, output)
 
         return output
+
+    def _is_retryable_error(self, error: Exception) -> bool:
+        """Check if an error is retryable (throttling, transient, network).
+
+        Non-retryable errors include: AccessDenied, ResourceNotFound, ValidationError,
+        InvalidParameter, etc.
+
+        Args:
+            error: The exception to check
+
+        Returns:
+            True if the error is retryable, False otherwise
+        """
+        error_str = str(error).lower()
+        error_type = type(error).__name__
+
+        # Check for boto3 ClientError with specific error codes
+        if hasattr(error, "response"):
+            try:
+                error_code = error.response.get("Error", {}).get("Code", "")
+                # Non-retryable error codes
+                non_retryable_codes = {
+                    "AccessDenied",
+                    "AccessDeniedException",
+                    "UnauthorizedAccess",
+                    "UnauthorizedOperation",
+                    "AuthFailure",
+                    "InvalidClientTokenId",
+                    "SignatureDoesNotMatch",
+                    "ResourceNotFoundException",
+                    "NoSuchBucket",
+                    "NoSuchKey",
+                    "NoSuchEntity",
+                    "ValidationError",
+                    "InvalidParameter",
+                    "InvalidParameterValue",
+                    "InvalidParameterCombination",
+                    "MissingParameter",
+                    "ResourceAlreadyExistsException",
+                    "ConflictException",
+                    "AlreadyExistsException",
+                }
+                if error_code in non_retryable_codes:
+                    return False
+
+                # Retryable error codes
+                retryable_codes = {
+                    "Throttling",
+                    "ThrottlingException",
+                    "RequestLimitExceeded",
+                    "TooManyRequestsException",
+                    "ServiceUnavailable",
+                    "InternalError",
+                    "InternalServerError",
+                    "InternalFailure",
+                    "ServiceException",
+                    "ProvisionedThroughputExceededException",
+                    "TransactionInProgressException",
+                    "RequestTimeout",
+                    "RequestTimeoutException",
+                    "EC2ThrottledException",
+                }
+                if error_code in retryable_codes:
+                    return True
+            except (AttributeError, TypeError):
+                pass
+
+        # Check error message for retryable patterns
+        retryable_patterns = [
+            "throttl",
+            "rate limit",
+            "rate exceeded",
+            "too many requests",
+            "service unavailable",
+            "internal error",
+            "internal server error",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection refused",
+            "temporary failure",
+            "transient",
+            "please try again",
+            "slow down",
+        ]
+        if any(pattern in error_str for pattern in retryable_patterns):
+            return True
+
+        # Non-retryable patterns
+        non_retryable_patterns = [
+            "access denied",
+            "unauthorized",
+            "forbidden",
+            "not found",
+            "does not exist",
+            "no such",
+            "invalid",
+            "validation",
+            "missing",
+            "already exists",
+            "conflict",
+            "duplicate",
+        ]
+        if any(pattern in error_str for pattern in non_retryable_patterns):
+            return False
+
+        # Default: assume non-retryable for safety
+        return False
 
     def safe_api_call(self, func: Callable, *args, use_cache: bool = True, **kwargs) -> tuple[bool, Any]:
         """
         Safely call AWS API with retry logic and optional caching.
 
         Uses exponential backoff with jitter for throttling resilience.
+        Only retries on retryable errors (throttling, transient failures).
+        Non-retryable errors (access denied, not found, validation) fail immediately.
 
         Args:
             func: The API function to call
@@ -8647,6 +8814,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 return outcome
             except Exception as e:
                 last_error = e
+
+                # Check if error is retryable
+                if not self._is_retryable_error(e):
+                    # Non-retryable error - return immediately
+                    return False, str(e)
+
                 if attempt < max_retries - 1:
                     # Exponential backoff with jitter: (2^attempt * base_delay) + random jitter
                     delay = min(base_delay * (2**attempt), max_delay)

@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.7.5] - 2026-03-04
+
+### Added
+- **EKS Cluster Insights API** - New `check_eks_cluster_insights()` method
+  - Proactive upgrade readiness checks
+  - Identifies configuration issues before they impact clusters
+  - Categories: UPGRADE_READINESS, PERFORMANCE, SECURITY, RELIABILITY
+  - API: `eks:ListInsights`, `eks:DescribeInsight`
+  - Reference: https://docs.aws.amazon.com/eks/latest/userguide/cluster-insights.html
+
+### Changed
+- Reorganized analysis methods - grouped Addons & Insights together
+
 ## [3.7.4] - 2026-03-04
 
 ### Fixed

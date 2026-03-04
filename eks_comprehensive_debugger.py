@@ -198,7 +198,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.7.4"
+VERSION = "3.7.5"
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -10310,6 +10310,99 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("check_eks_addons", str(e))
             self.progress.warning(f"EKS addon check failed: {e}")
 
+    def check_eks_cluster_insights(self):
+        """
+        Check EKS Cluster Insights for upgrade readiness and recommendations.
+
+        Uses the EKS Insights API to identify potential issues before they
+        impact the cluster or block upgrades.
+
+        API: eks:ListInsights, eks:DescribeInsight
+        Categories: UPGRADE_READINESS, PERFORMANCE, SECURITY, RELIABILITY
+
+        Reference: https://docs.aws.amazon.com/eks/latest/userguide/cluster-insights.html
+        """
+        self.progress.step("Checking EKS Cluster Insights...")
+
+        try:
+            # List all insights for the cluster
+            success, response = self.safe_api_call(
+                self.eks_client.list_insights,
+                clusterName=self.cluster_name,
+            )
+
+            if not success:
+                self.progress.info(f"Cluster Insights not available: {response}")
+                return
+
+            insight_summaries = response.get("insightSummaries", [])
+
+            if not insight_summaries:
+                self.progress.info("No cluster insights found")
+                return
+
+            for summary in insight_summaries:
+                insight_id = summary.get("id", "")
+                category = summary.get("category", "Unknown")
+                status = summary.get("status", "Unknown")
+                description = summary.get("description", "N/A")
+
+                # Get detailed insight information
+                success, detail_response = self.safe_api_call(
+                    self.eks_client.describe_insight,
+                    clusterName=self.cluster_name,
+                    id=insight_id,
+                )
+
+                if not success:
+                    continue
+
+                insight = detail_response.get("insight", {})
+                recommendations = insight.get("recommendation", "")
+                resources = insight.get("kubernetesResourceUri", [])
+
+                # Map category to severity
+                severity_map = {
+                    "UPGRADE_READINESS": "critical",
+                    "SECURITY": "critical",
+                    "RELIABILITY": "warning",
+                    "PERFORMANCE": "warning",
+                }
+                severity = severity_map.get(category, "info")
+
+                # Map category to finding category
+                category_map = {
+                    "UPGRADE_READINESS": "control_plane_issues",
+                    "SECURITY": "rbac_issues",
+                    "RELIABILITY": "node_issues",
+                    "PERFORMANCE": "pod_errors",
+                }
+                finding_category = category_map.get(category, "pod_errors")
+
+                self._add_finding_dict(
+                    finding_category,
+                    {
+                        "summary": f"EKS Insight [{category}]: {description[:100]}{'...' if len(description) > 100 else ''}",
+                        "details": {
+                            "insight_id": insight_id,
+                            "category": category,
+                            "status": status,
+                            "description": description,
+                            "recommendation": recommendations,
+                            "resources": resources[:5] if resources else [],
+                            "severity": severity,
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/cluster-insights.html",
+                        },
+                    },
+                )
+
+            self.progress.info(f"Checked {len(insight_summaries)} cluster insights")
+
+        except Exception as e:
+            self._add_error("check_eks_cluster_insights", str(e))
+            self.progress.warning(f"Cluster Insights check failed: {e}")
+
     def analyze_resource_quotas(self):
         """
         Analyze namespace resource quotas
@@ -19043,8 +19136,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             # Observability
             self.check_container_insights_metrics,
             self.analyze_cloudwatch_logging_health,
-            # Addons
+            # Addons & Insights
             self.check_eks_addons,
+            self.check_eks_cluster_insights,
             # === Enhanced Kubernetes Diagnostics (v3.6.0) ===
             # HIGH PRIORITY
             self.analyze_init_container_failures,

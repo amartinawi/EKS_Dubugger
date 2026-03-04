@@ -11094,6 +11094,87 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_iam_pod_identity", str(e))
             self.progress.warning(f"IAM and Pod Identity analysis failed: {e}")
 
+    def check_eks_pod_identity_associations(self):
+        """
+        Check EKS Pod Identity Associations configuration.
+
+        Lists all Pod Identity associations in the cluster to provide
+        complete IAM coverage visibility alongside IRSA.
+
+        API: eks:ListPodIdentityAssociations
+        Reference: https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html
+        """
+        self.progress.step("Checking EKS Pod Identity Associations...")
+
+        try:
+            # List all Pod Identity associations
+            success, response = self.safe_api_call(
+                self.eks_client.list_pod_identity_associations,
+                clusterName=self.cluster_name,
+            )
+
+            if not success:
+                self.progress.info(f"Pod Identity Associations not available: {response}")
+                return
+
+            associations = response.get("associations", [])
+
+            if not associations:
+                self.progress.info("No Pod Identity associations configured")
+                return
+
+            # Track statistics for summary
+            total_associations = len(associations)
+            namespaces_with_associations = set()
+            associations_by_service_account = {}
+
+            for association in associations:
+                namespace = association.get("namespace", "unknown")
+                service_account = association.get("serviceAccount", "unknown")
+                association_arn = association.get("associationArn", "N/A")
+                role_arn = association.get("roleArn", "N/A")
+
+                namespaces_with_associations.add(namespace)
+
+                sa_key = f"{namespace}/{service_account}"
+                if sa_key not in associations_by_service_account:
+                    associations_by_service_account[sa_key] = []
+
+                associations_by_service_account[sa_key].append(
+                    {
+                        "association_arn": association_arn,
+                        "role_arn": role_arn,
+                    }
+                )
+
+            # Check for duplicate associations (same SA with multiple roles)
+            for sa_key, roles in associations_by_service_account.items():
+                if len(roles) > 1:
+                    self._add_finding_dict(
+                        "rbac_issues",
+                        {
+                            "summary": f"Service account {sa_key} has multiple Pod Identity associations",
+                            "details": {
+                                "service_account": sa_key,
+                                "association_count": len(roles),
+                                "roles": [r["role_arn"] for r in roles],
+                                "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
+                                "recommendation": "Review if multiple associations are intentional",
+                            },
+                        },
+                    )
+
+            # Log summary for visibility
+            self.progress.info(
+                f"Found {total_associations} Pod Identity associations across "
+                f"{len(namespaces_with_associations)} namespaces"
+            )
+
+        except Exception as e:
+            self._add_error("check_eks_pod_identity_associations", str(e))
+            self.progress.warning(f"Pod Identity Associations check failed: {e}")
+
     def _extract_timestamp(self, details):
         """Extract timestamp from finding details"""
         ts = (
@@ -19139,6 +19220,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             # Addons & Insights
             self.check_eks_addons,
             self.check_eks_cluster_insights,
+            self.check_eks_pod_identity_associations,  # === Enhanced Kubernetes Diagnostics (v3.6.0) ===
             # === Enhanced Kubernetes Diagnostics (v3.6.0) ===
             # HIGH PRIORITY
             self.analyze_init_container_failures,

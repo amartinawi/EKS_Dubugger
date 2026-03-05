@@ -13831,18 +13831,21 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         # Otherwise, correlate based on event patterns
         total_indicators = len(upgrade_indicators) + len(node_ready_events) + len(ds_restarts)
 
-        # ENHANCED: Lower threshold for pattern-based detection
-        # Trigger upgrade correlation if:
-        # - AWS API confirms upgrade (highest confidence)
-        # - 2+ upgrade indicators found
-        # - Upgrade pattern score >= 2 (mass evictions, multi-node issues, high category spread)
-        # - Any node events + DaemonSet restarts
-        if (
-            aws_upgrade_info
-            or total_indicators >= 2
-            or upgrade_pattern_score >= 2
-            or (len(node_ready_events) >= 1 and len(ds_restarts) >= 1)
-        ):
+        # ENHANCED: Much stricter threshold for upgrade detection
+        # Only trigger upgrade correlation if:
+        # - AWS API explicitly confirms upgrade (VersionUpdate, multiple nodegroup updates, etc.)
+        # - OR very strong pattern evidence: upgrade_pattern_score >= 5 AND total_indicators >= 3
+        # This prevents false positives from normal cluster operations
+        should_correlate_upgrade = False
+
+        if aws_upgrade_info:
+            # AWS API confirmation is the gold standard
+            should_correlate_upgrade = True
+        elif upgrade_pattern_score >= 5 and total_indicators >= 3:
+            # Very strong pattern-based evidence only
+            should_correlate_upgrade = True
+
+        if should_correlate_upgrade:
             # Count findings by severity
             total_findings = sum(len(v) for v in self.findings.values())
             critical_findings = sum(

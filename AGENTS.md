@@ -6,9 +6,9 @@ Guidelines for AI coding agents working in the EKS Health Check Dashboard codeba
 
 Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
 
-**Version:** 3.7.4  
+**Version:** 3.7.7  
 **Lines of Code:** ~20,000  
-**Analysis Methods:** 72  
+**Analysis Methods:** 73  
 **Remediation Patterns:** 30+  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)  
 **Unit Tests:** 158 tests
@@ -523,7 +523,7 @@ python3 -m pytest tests/ -v
 
 ---
 
-## Analysis Methods (72 total)
+## Analysis Methods (73 total)
 
 ### Pod Lifecycle & Health (13 methods)
 
@@ -622,11 +622,12 @@ python3 -m pytest tests/ -v
 | `analyze_aws_lb_controller` | kubectl deployment/logs | AWS LB Controller issues |
 | `analyze_custom_controllers` | kubectl deployments/events | Custom operator failures |
 
-### Control Plane (8 methods)
+### Control Plane (9 methods)
 
 | Method | Data Source | Catalog Coverage |
 |--------|-------------|------------------|
 | `analyze_control_plane_logs` | CloudWatch Logs | Control plane errors |
+| `analyze_logs_insights_correlation` | CloudWatch Logs Insights | Cross-stream log correlation (v3.7.7) |
 | `analyze_apiserver_latency` | CloudWatch Logs/Metrics | API server high latency |
 | `analyze_apiserver_rate_limiting` | CloudWatch Logs | 429 rate limiting, throttling |
 | `analyze_apiserver_inflight` | CloudWatch Metrics | Inflight request saturation |

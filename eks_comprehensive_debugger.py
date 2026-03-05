@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-EKS Health Check Dashboard v3.7.4
+EKS Health Check Dashboard v3.7.7
 
 A production-grade diagnostic tool for Amazon EKS cluster troubleshooting that provides
 systematic analysis of cluster health, workload issues, networking, storage, and control plane.
 
-================================================================================
-FEATURES
-================================================================================
+ ================================================================================
+ FEATURES
+ ================================================================================
 
-📊 Comprehensive Issue Detection (56 Analysis Methods)
+ 📊 Comprehensive Issue Detection (57 Analysis Methods)
    • Pod & Workload: CrashLoopBackOff, ImagePullBackOff, OOMKilled, evictions, probes
    • Node Health: NotReady, DiskPressure, MemoryPressure, PIDPressure, PLEG, runtime
    • Networking: VPC CNI, CoreDNS, service endpoints, connectivity, NetworkPolicy
@@ -118,6 +118,7 @@ EKS:
 CloudWatch:
     cloudwatch:GetMetricStatistics, cloudwatch:ListMetrics
     logs:DescribeLogGroups, logs:DescribeLogStreams, logs:GetLogEvents
+    logs:StartQuery, logs:GetQueryResults (optional, for advanced log correlation)
 
 EC2:
     ec2:DescribeInstances, ec2:DescribeInstanceStatus
@@ -186,7 +187,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.7.6"
+VERSION = "3.7.7"
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -10146,6 +10147,212 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_control_plane_logs", str(e))
             self.progress.warning(f"Control plane log analysis failed: {e}")
 
+    def analyze_logs_insights_correlation(self):
+        """
+        Analyze logs using CloudWatch Logs Insights for complex cross-stream correlation.
+
+        Uses CloudWatch Logs Insights to run sophisticated queries across multiple log groups
+        (control plane, application logs, container insights) to identify patterns that span
+        multiple sources.
+
+        Correlation patterns detected:
+            - API throttling patterns across cluster
+            - Pod failures correlated with control plane events
+            - Network issues across multiple namespaces
+            - Resource exhaustion patterns
+            - Cascading failures across services
+
+        Populates:
+            self.findings['control_plane_issues']: Correlated log findings.
+
+        Reference:
+            https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_Insights-Tutorial.html
+
+        Requires:
+            logs:StartQuery, logs:GetQueryResults IAM permissions
+        """
+        self.progress.step("Running CloudWatch Logs Insights correlation analysis...")
+
+        log_groups = []
+
+        try:
+            # Collect all relevant log groups
+            control_plane_log = f"/aws/eks/{self.cluster_name}/cluster"
+            app_log = f"/aws/containerinsights/{self.cluster_name}/application"
+            host_log = f"/aws/containerinsights/{self.cluster_name}/host"
+
+            # Check which log groups exist
+            for log_group in [control_plane_log, app_log, host_log]:
+                response = self._get_cached_log_group(log_group)
+                if response and response.get("logGroups"):
+                    log_groups.append(log_group)
+
+            if not log_groups:
+                self.progress.info("No CloudWatch log groups found for Insights correlation")
+                return
+
+            # Define correlation queries
+            queries = [
+                {
+                    "name": "api_throttling_pattern",
+                    "description": "Detect API throttling patterns across the cluster",
+                    "query": f"""
+                        fields @timestamp, @message, @logStream
+                        | filter @message like /Throttling|RequestLimitExceeded|429/
+                        | stats count() as throttle_count by bin(@timestamp, 5m)
+                        | sort @timestamp desc
+                        | limit 20
+                    """,
+                    "severity": "warning",
+                },
+                {
+                    "name": "pod_failure_cascade",
+                    "description": "Detect pod failures correlated with control plane events",
+                    "query": f"""
+                        fields @timestamp, @message, @logStream
+                        | filter @message like /Error|Failed|CrashLoopBackOff|OOMKilled/
+                        | stats count() as error_count by bin(@timestamp, 5m), @logStream
+                        | sort error_count desc
+                        | limit 30
+                    """,
+                    "severity": "critical",
+                },
+                {
+                    "name": "network_connectivity_issues",
+                    "description": "Detect network connectivity issues across services",
+                    "query": f"""
+                        fields @timestamp, @message
+                        | filter @message like /Connection refused|timeout|network|DNS/
+                        | stats count() as network_errors by bin(@timestamp, 10m)
+                        | sort network_errors desc
+                        | limit 20
+                    """,
+                    "severity": "warning",
+                },
+                {
+                    "name": "resource_exhaustion_pattern",
+                    "description": "Detect resource exhaustion patterns (memory/CPU pressure)",
+                    "query": f"""
+                        fields @timestamp, @message
+                        | filter @message like /OOMKilled|memory|MemoryPressure|DiskPressure|evict/
+                        | stats count() as resource_issues by bin(@timestamp, 10m)
+                        | sort resource_issues desc
+                        | limit 20
+                    """,
+                    "severity": "critical",
+                },
+                {
+                    "name": "authentication_failures",
+                    "description": "Detect authentication and authorization failures",
+                    "query": f"""
+                        fields @timestamp, @message, @logStream
+                        | filter @message like /Unauthorized|Forbidden|AccessDenied|authentication failed/
+                        | stats count() as auth_failures by bin(@timestamp, 10m), @logStream
+                        | sort auth_failures desc
+                        | limit 20
+                    """,
+                    "severity": "warning",
+                },
+            ]
+
+            correlation_findings = []
+
+            for query_def in queries:
+                try:
+                    # Start the query
+                    start_query_params = {
+                        "logGroupNames": log_groups,
+                        "startTime": int(self.start_date.timestamp()),
+                        "endTime": int(self.end_date.timestamp()),
+                        "queryString": query_def["query"],
+                    }
+
+                    success, start_response = self.safe_api_call(self.logs_client.start_query, **start_query_params)
+
+                    if not success:
+                        self.progress.warning(f"Failed to start query: {query_def['name']}")
+                        continue
+
+                    query_id = start_response.get("queryId")
+                    if not query_id:
+                        continue
+
+                    # Poll for query results (with timeout)
+                    import time
+
+                    max_wait = 30  # seconds
+                    waited = 0
+                    query_results = None
+
+                    while waited < max_wait:
+                        success, results_response = self.safe_api_call(
+                            self.logs_client.get_query_results, queryId=query_id
+                        )
+
+                        if success:
+                            status = results_response.get("status")
+                            if status == "Complete":
+                                query_results = results_response.get("results", [])
+                                break
+                            elif status in ["Failed", "Cancelled"]:
+                                self.progress.warning(f"Query {query_def['name']} {status.lower()}")
+                                break
+
+                        time.sleep(2)
+                        waited += 2
+
+                    if not query_results:
+                        continue
+
+                    # Process query results
+                    if query_results:
+                        for result in query_results[:5]:  # Top 5 results
+                            timestamp_field = next((f for f in result if f["field"] == "@timestamp"), None)
+                            message_field = next((f for f in result if f["field"] == "@message"), None)
+
+                            if timestamp_field and message_field:
+                                correlation_findings.append(
+                                    {
+                                        "query_name": query_def["name"],
+                                        "description": query_def["description"],
+                                        "timestamp": timestamp_field["value"],
+                                        "message": message_field["value"][:200],
+                                        "severity": query_def["severity"],
+                                    }
+                                )
+
+                except Exception as e:
+                    self.progress.warning(f"Failed to run Insights query {query_def['name']}: {e}")
+                    continue
+
+            # Add correlation findings
+            for finding in correlation_findings[:20]:  # Limit to top 20
+                self._add_finding_dict(
+                    "control_plane_issues",
+                    {
+                        "summary": f"Logs Insights correlation: {finding['query_name']}",
+                        "details": {
+                            "correlation_type": finding["query_name"],
+                            "description": finding["description"],
+                            "timestamp": finding["timestamp"],
+                            "message": finding["message"],
+                            "severity": finding["severity"],
+                            "source": "CloudWatch Logs Insights",
+                            "aws_doc": "https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_Insights-Tutorial.html",
+                            "finding_type": FindingType.HISTORICAL_EVENT,
+                        },
+                    },
+                )
+
+            if correlation_findings:
+                self.progress.info(f"Found {len(correlation_findings)} correlated log patterns via Insights")
+            else:
+                self.progress.info("No significant log correlations found via Insights")
+
+        except Exception as e:
+            self._add_error("analyze_logs_insights_correlation", str(e))
+            self.progress.warning(f"Logs Insights correlation failed: {e}")
+
     def analyze_pod_scheduling_failures(self):
         """
         Analyze pod scheduling failures from FailedScheduling events.
@@ -19580,7 +19787,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             ClusterNotFoundError: If the cluster doesn't exist.
             KubectlNotAvailableError: If kubectl is not in PATH.
         """
-        self.progress.set_total_steps(76)
+        self.progress.set_total_steps(77)
 
         # Step 1-3: Basic setup
         try:
@@ -19673,6 +19880,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.analyze_custom_controllers,
             # Control Plane
             self.analyze_control_plane_logs,
+            self.analyze_logs_insights_correlation,
             self.analyze_apiserver_latency,
             self.analyze_apiserver_rate_limiting,
             self.analyze_apiserver_inflight,

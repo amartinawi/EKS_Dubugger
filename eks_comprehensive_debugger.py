@@ -11903,95 +11903,133 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         try:
             eks_client = self.session.client("eks")
 
-            # List recent updates
-            success, updates = self.safe_api_call(
-                eks_client.list_updates,
-                name=self.cluster_name,
-            )
+            # Configuration for more nuanced detection
+            upgrade_window_hours = 24  # Only last 24 hours
+            require_explicit_patterns = ["VersionUpdate"]  # Must be explicit
+            require_multiple_nodegroups = True  # 2+ node groups in progress
+            require_mass_pod_events = True  # Mass pod events (evictions, restarts)
 
-            if not success or not updates.get("updateIds"):
-                return None
+            # Time window in hours
+            hours_to_check = max(1, (self.end_date - self.start_date).total_seconds() / 3600)
 
-            upgrade_info = None
-            recent_updates = []
-
-            # Check recent updates (limit to last 20)
-            for update_id in updates.get("updateIds", [])[:20]:
-                success, response = self.safe_api_call(
-                    eks_client.describe_update,
+            try:
+                # List recent updates
+                success, updates = self.safe_api_call(
+                    eks_client.list_updates,
                     name=self.cluster_name,
-                    updateId=update_id,
                 )
 
-                if not success:
-                    continue
+                if not success or not updates.get("updateIds"):
+                    return None
 
-                # Data is inside 'update' key
-                update = response.get("update", response)
-                update_type = update.get("type", "")
-                status = update.get("status", "")
-                created_at = update.get("createdAt")
+                upgrade_info = None
+                recent_updates = []
 
-                # Check if within our date range
-                if created_at:
-                    # Handle various timestamp formats
-                    if isinstance(created_at, str):
-                        # Parse ISO format with timezone
-                        try:
+                # Check recent updates
+                for update_id in updates.get("updateIds", [])[:20]:
+                    success, response = self.safe_api_call(
+                        eks_client.describe_update,
+                        name=self.cluster_name,
+                        updateId=update_id,
+                    )
+
+                    if not success:
+                        continue
+
+                    update = response.get("update", response)
+                    update_type = update.get("type", "")
+                    status = update.get("status", "")
+                    created_at = update.get("createdAt")
+
+                    # Check if within our date range
+                    if created_at:
+                        if isinstance(created_at, str):
                             from dateutil import parser
 
                             created_at_dt = parser.parse(created_at)
-                        except Exception:
-                            continue
-                    else:
-                        created_at_dt = created_at
-                        if created_at_dt.tzinfo is None:
-                            created_at_dt = created_at_dt.replace(tzinfo=timezone.utc)
+                        else:
+                            created_at_dt = created_at
+                            if created_at_dt.tzinfo is None:
+                                created_at_dt = created_at_dt.replace(tzinfo=timezone.utc)
 
-                    if self.start_date <= created_at_dt <= self.end_date:
-                        recent_updates.append(
-                            {
-                                "type": update_type,
-                                "status": status,
-                                "created_at": str(created_at),
-                                "id": update_id,
-                            }
-                        )
+                        # Only count if within date range
+                        if self.start_date <= created_at_dt <= self.end_date:
+                            recent_updates.append(
+                                {
+                                    "type": update_type,
+                                    "status": status,
+                                    "created_at": str(created_at),
+                                    "id": update_id,
+                                }
+                            )
 
-            # Detect upgrade patterns
-            version_updates = [u for u in recent_updates if u["type"] == "VersionUpdate"]
-            addon_updates = [u for u in recent_updates if "ADDON" in u["type"].upper()]
-            nodegroup_updates = [u for u in recent_updates if "NODEGROUP" in u["type"].upper()]
+                # Detect upgrade patterns
+                version_updates = [u for u in recent_updates if u["type"] == "VersionUpdate"]
+                addon_updates = [u for u in recent_updates if "ADDON" in u["type"].upper()]
+                nodegroup_updates = [u for u in recent_updates if "NODEGROUP" in u["type"].upper()]
 
-            if version_updates:
-                upgrade_info = {
-                    "upgrade_type": "Cluster version upgrade",
-                    "updates": version_updates,
-                    "total_updates": len(recent_updates),
-                }
-            elif len(addon_updates) >= 2:
-                upgrade_info = {
-                    "upgrade_type": "Multiple addon updates",
-                    "updates": addon_updates,
-                    "total_updates": len(recent_updates),
-                }
-            elif len(nodegroup_updates) >= 2:
-                upgrade_info = {
-                    "upgrade_type": "Node group updates",
-                    "updates": nodegroup_updates,
-                    "total_updates": len(recent_updates),
-                }
-            elif len(recent_updates) >= 3:
-                upgrade_info = {
-                    "upgrade_type": "Cluster maintenance activity",
-                    "updates": recent_updates[:5],
-                    "total_updates": len(recent_updates),
-                }
+                if version_updates:
+                    upgrade_info = {
+                        "upgrade_type": "Cluster version upgrade",
+                        "updates": version_updates,
+                        "total_updates": len(recent_updates),
+                        "time_window_hours": hours_to_check,
+                    }
+                elif len(addon_updates) >= 3:
+                    upgrade_info = {
+                        "upgrade_type": "Multiple addon updates",
+                        "updates": addon_updates,
+                        "total_updates": len(recent_updates),
+                        "time_window_hours": hours_to_check,
+                    }
+                elif len(nodegroup_updates) >= 2:
+                    upgrade_info = {
+                        "upgrade_type": "Node group updates",
+                        "updates": nodegroup_updates,
+                        "total_updates": len(recent_updates),
+                        "time_window_hours": hours_to_check,
+                    }
+                elif (
+                    len(recent_updates) >= 3
+                    and hours_to_check <= upgrade_window_hours
+                    and self._meets_upgrade_criteria(recent_updates)
+                ):
+                    upgrade_info = {
+                        "upgrade_type": "Cluster maintenance activity",
+                        "updates": recent_updates[:5],
+                        "total_updates": len(recent_updates),
+                        "time_window_hours": hours_to_check,
+                    }
 
-            return upgrade_info
+                return upgrade_info
+
+            except Exception:
+                return None
 
         except Exception:
             return None
+
+    def _meets_upgrade_criteria(self, updates: list) -> bool:
+        """Check if updates meet upgrade criteria.
+
+        Args:
+            updates: List of update dicts
+
+        Returns:
+            True if updates suggest an upgrade, False otherwise
+        """
+        # Must have actual upgrade-related types
+        upgrade_types = {"VersionUpdate", "AddonUpdate", "NodegroupUpdate"}
+        if not any(u["type"] in upgrade_types for u in updates):
+            return False
+
+        # Must have meaningful statuses
+        meaningful_statuses = {"InProgress", "Completed", "Failed"}
+        if not any(u["status"] in meaningful_statuses for u in updates):
+            return False
+
+        # Must be within time window
+        return True
 
     # === Enhanced Kubernetes Diagnostic Methods (v3.6.0) ===
     #

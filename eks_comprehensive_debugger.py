@@ -7451,7 +7451,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             or escaped_step.startswith("helm ")
                         )
                         if is_command:
-                            html += f'                                <li><code class="diagnostic-command">{escaped_step}</code> <button class="copy-btn" onclick="copyToClipboard(this.previousElementSibling.textContent, this)" title="Copy command">📋</button></li>\n'
+                            html += f'                                <li><code class="diagnostic-command">{escaped_step}</code> <button class="copy-btn" onclick="copyToClipboard(this)" title="Copy command">📋</button></li>\n'
                         else:
                             html += f'                                <li><span class="diagnostic-instruction">{escaped_step}</span></li>\n'
                     html += """                            </ol>
@@ -10286,8 +10286,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         continue
 
                     # Poll for query results (with timeout)
-                    import time
-
                     max_wait = 30  # seconds
                     waited = 0
                     query_results = None
@@ -11032,7 +11030,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 insight_status = insight.get("status", "Unknown")
 
                 # Get detailed insight information
-                success, detail_response = self.safe_api_call(self.eks_client.describe_insight, id=insight_id)
+                success, detail_response = self.safe_api_call(
+                    self.eks_client.describe_insight, clusterName=self.cluster_name, id=insight_id
+                )
 
                 if success:
                     detail = detail_response.get("insight", {})
@@ -11146,7 +11146,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         annotations = sa_data.get("metadata", {}).get("annotations", {})
                         if "eks.amazonaws.com/role-arn" in annotations:
                             issues.append(f"Service account has both Pod Identity and IRSA annotation")
-                    except:
+                    except Exception:
                         pass
 
                 if issues:
@@ -19949,6 +19949,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.analyze_cloudwatch_logging_health,
             # Addons
             self.check_eks_addons,
+            self.analyze_eks_cluster_insights,
+            self.analyze_eks_pod_identity_associations,
             # === Enhanced Kubernetes Diagnostics (v3.6.0) ===
             # HIGH PRIORITY
             self.analyze_init_container_failures,

@@ -54,10 +54,10 @@ all = [
 eks-debugger = "eks_comprehensive_debugger:main"
 
 [project.urls]
-Homepage = "https://github.com/your-org/eks-comprehensive-debugger"
-Documentation = "https://github.com/your-org/eks-comprehensive-debugger#readme"
-Repository = "https://github.com/your-org/eks-comprehensive-debugger"
-Issues = "https://github.com/your-org/eks-comprehensive-debugger/issues"
+Homepage = "https://github.com/amartinawi/EKS_Dubugger"
+Documentation = "https://github.com/amartinawi/EKS_Dubugger#readme"
+Repository = "https://github.com/amartinawi/EKS_Dubugger"
+Issues = "https://github.com/amartinawi/EKS_Dubugger/issues"
 
 [tool.setuptools]
 py-modules = ["eks_comprehensive_debugger"]
@@ -108,7 +108,7 @@ pretty = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --tb=short --cov=eks_comprehensive_debugger --cov-report=term-missing --cov-fail-under=14"
+addopts = "-v --tb=short --cov=eks_comprehensive_debugger --cov-report=term-missing --cov-fail-under=40"
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]

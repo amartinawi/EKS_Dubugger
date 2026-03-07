@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.7.8] - 2026-03-07
+
+### Added
+- **Time-based TTL for kubectl cache** - Enhanced cache with 10-minute expiration
+  - Added `KUBECTL_CACHE_TTL_SECONDS = 600` constant
+  - Cache entries now store `(output, timestamp)` tuples
+  - `_get_kubectl_cache()` checks expiration and auto-removes stale entries
+  - Combines LRU eviction (size-based) with TTL (time-based) for optimal freshness
+  - Mirrors `APICache` TTL pattern for consistency
+- **JSON schema validation in CI/CD** - Automated schema validation in GitHub Actions
+  - Added `schema-validation` job to `.github/workflows/ci.yml`
+  - Validates `schemas/output_schema.json` against JSON Schema Draft-07
+  - Validates embedded `LLM_JSON_SCHEMA` in code
+  - Uses `jsonschema.Draft7Validator.check_schema()` for compliance
+  - Catches schema syntax errors before deployment
+- **Integration tests expansion** - Increased test coverage from 4 to 24 tests (500% increase)
+  - `TestPodAnalysisMethods` - Tests for pod evictions, OOM events, CrashLoopBackOff
+  - `TestNodeAnalysisMethods` - Tests for NotReady, MemoryPressure node conditions
+  - `TestControlPlaneAnalysis` - Tests for CloudWatch log analysis
+  - `TestKubectlCacheTTL` - Tests for cache timestamp storage, retrieval, expiration
+  - `TestSeverityClassification` - Tests for critical/warning/info severity detection
+  - All tests use mocked kubectl/AWS services for isolation
+
+### Changed
+- **Type hints coverage** - Increased from 39% to 81.8% (42.8% improvement)
+  - Added return type hints to 72 methods (all `analyze_*` and `check_*` methods)
+  - Total methods with type hints: 153 out of 187
+  - Enables better IDE autocomplete and type checking
+  - Improves code documentation and maintainability
+- **Kubectl cache structure** - Updated to support TTL
+  - Changed from `OrderedDict[str, str]` to `OrderedDict[str, tuple[str, float]]`
+  - Entries now include timestamp for expiration checking
+
+### Fixed
+- **Missing type hint colons** - Fixed 72 method definitions missing colons after `-> None`
+
+### Security
+- **Schema validation** - Prevents deployment of malformed JSON schemas
+  - Ensures output format compatibility with consumers
+  - Validates schema structure against JSON Schema standards
+
 ## [3.7.6] - 2026-03-05
 
 ### Added

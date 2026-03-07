@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EKS Health Check Dashboard v3.7.7
+EKS Health Check Dashboard v3.7.8
 
 A production-grade diagnostic tool for Amazon EKS cluster troubleshooting that provides
 systematic analysis of cluster health, workload issues, networking, storage, and control plane.
@@ -187,7 +187,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.7.7"
+VERSION = "3.7.8"
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -203,6 +203,7 @@ MAX_PARALLEL_WORKERS = 8
 API_CACHE_TTL_SECONDS = 300
 CACHE_DIR = os.path.expanduser("~/.eks-debugger-cache")
 KUBECTL_CACHE_MAX_SIZE = 100  # LRU eviction limit for kubectl output cache
+KUBECTL_CACHE_TTL_SECONDS = 600  # Time-based TTL for kubectl cache entries (10 minutes)
 
 
 # LLM JSON Schema Definition
@@ -7931,7 +7932,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self._shared_data: dict = {
             "log_groups": {},  # log_group_prefix -> logGroups response
             "log_streams": {},  # (log_group_name, limit) -> logStreams response
-            "kubectl_cache": OrderedDict(),  # cmd -> output (LRU with maxsize)
+            "kubectl_cache": OrderedDict(),  # cmd -> (output, timestamp) (LRU with TTL)
             "node_info": None,  # kubectl get nodes output
             "pod_info": None,  # kubectl get pods output
         }
@@ -7945,24 +7946,30 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self._perf_tracker = PerformanceTracker()
 
     def _get_kubectl_cache(self, cmd: str) -> Optional[str]:
-        """Get kubectl output from cache with LRU update.
+        """Get kubectl output from cache with TTL-based expiration and LRU update.
 
         Args:
             cmd: kubectl command string
 
         Returns:
-            Cached output or None if not in cache
+            Cached output or None if not in cache or expired
         """
         with self._shared_data_lock:
             cache = self._shared_data["kubectl_cache"]
             if cmd in cache:
-                # Move to end (most recently used)
-                cache.move_to_end(cmd)
-                return cache[cmd]
+                output, timestamp = cache[cmd]
+                # Check if entry has expired
+                if time.time() - timestamp < KUBECTL_CACHE_TTL_SECONDS:
+                    # Move to end (most recently used)
+                    cache.move_to_end(cmd)
+                    return output
+                else:
+                    # Entry expired, remove it
+                    del cache[cmd]
         return None
 
     def _set_kubectl_cache(self, cmd: str, output: str) -> None:
-        """Set kubectl output in cache with LRU eviction.
+        """Set kubectl output in cache with LRU eviction and timestamp.
 
         Args:
             cmd: kubectl command string
@@ -7973,7 +7980,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             # Remove oldest if at capacity
             if len(cache) >= KUBECTL_CACHE_MAX_SIZE:
                 cache.popitem(last=False)  # Remove first (oldest)
-            cache[cmd] = output
+            # Store with timestamp for TTL-based expiration
+            cache[cmd] = (output, time.time())
             cache.move_to_end(cmd)  # Mark as most recently used
 
     def _detect_alternative_monitoring(self) -> bool:
@@ -9391,7 +9399,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     # === Existing Analysis Methods (Enhanced with date filtering) ===
 
-    def analyze_pod_evictions(self):
+    def analyze_pod_evictions(self) -> None:
         """
         Analyze pod evictions within the configured date range.
 
@@ -9457,7 +9465,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_pod_evictions", str(e))
             self.progress.warning(f"Pod eviction analysis failed: {e}")
 
-    def analyze_node_conditions(self):
+    def analyze_node_conditions(self) -> None:
         """
         Analyze node health conditions following AWS EKS best practices.
 
@@ -9664,7 +9672,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_node_conditions", str(e))
             self.progress.warning(f"Node condition analysis failed: {e}")
 
-    def check_oom_events(self):
+    def check_oom_events(self) -> None:
         """
         Check for OOMKilled (Out of Memory) events within the date range.
 
@@ -9717,7 +9725,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("check_oom_events", str(e))
             self.progress.warning(f"OOM event check failed: {e}")
 
-    def check_container_insights_metrics(self):
+    def check_container_insights_metrics(self) -> None:
         """
         Check CloudWatch Container Insights metrics for threshold violations.
         Analyzes node memory, CPU, and filesystem utilization metrics through
@@ -9817,7 +9825,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             except Exception as e:
                 self._add_error(f"check_container_insights_metrics_{metric['name']}", str(e))
 
-    def analyze_cloudwatch_logging_health(self):
+    def analyze_cloudwatch_logging_health(self) -> None:
         """
         Analyze CloudWatch logging health for EKS
         Checks: Control plane logs, Container Insights logs, Prometheus metrics
@@ -10047,7 +10055,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     # === NEW: Comprehensive Analysis Methods ===
 
-    def analyze_control_plane_logs(self):
+    def analyze_control_plane_logs(self) -> None:
         """
         Analyze EKS control plane CloudWatch logs for errors.
 
@@ -10147,7 +10155,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_control_plane_logs", str(e))
             self.progress.warning(f"Control plane log analysis failed: {e}")
 
-    def analyze_logs_insights_correlation(self):
+    def analyze_logs_insights_correlation(self) -> None:
         """
         Analyze logs using CloudWatch Logs Insights for complex cross-stream correlation.
 
@@ -10353,7 +10361,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_logs_insights_correlation", str(e))
             self.progress.warning(f"Logs Insights correlation failed: {e}")
 
-    def analyze_pod_scheduling_failures(self):
+    def analyze_pod_scheduling_failures(self) -> None:
         """
         Analyze pod scheduling failures from FailedScheduling events.
 
@@ -10426,7 +10434,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_pod_scheduling_failures", str(e))
             self.progress.warning(f"Scheduling failure analysis failed: {e}")
 
-    def analyze_network_issues(self):
+    def analyze_network_issues(self) -> None:
         """
         Analyze network-related issues from kubectl events.
 
@@ -10510,7 +10518,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_network_issues", str(e))
             self.progress.warning(f"Network issue analysis failed: {e}")
 
-    def analyze_rbac_issues(self):
+    def analyze_rbac_issues(self) -> None:
         """
         Analyze RBAC and authorization failures.
 
@@ -10567,7 +10575,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_rbac_issues", str(e))
             self.progress.warning(f"RBAC analysis failed: {e}")
 
-    def analyze_pvc_issues(self):
+    def analyze_pvc_issues(self) -> None:
         """
         Analyze Persistent Volume Claim and Persistent Volume issues.
 
@@ -10837,7 +10845,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_pvc_issues", str(e))
             self.progress.warning(f"PVC analysis failed: {e}")
 
-    def analyze_image_pull_failures(self):
+    def analyze_image_pull_failures(self) -> None:
         """
         Analyze image pull failures from kubectl events.
 
@@ -10910,7 +10918,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_image_pull_failures", str(e))
             self.progress.warning(f"Image pull failure analysis failed: {e}")
 
-    def check_eks_addons(self):
+    def check_eks_addons(self) -> None:
         """
         Check EKS managed addon health status.
 
@@ -10971,7 +10979,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("check_eks_addons", str(e))
             self.progress.warning(f"EKS addon check failed: {e}")
 
-    def analyze_eks_cluster_insights(self):
+    def analyze_eks_cluster_insights(self) -> None:
         """
         Analyze EKS Cluster Insights for upgrade readiness and configuration issues.
 
@@ -11066,7 +11074,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_eks_cluster_insights", str(e))
             self.progress.warning(f"EKS Cluster Insights check failed: {e}")
 
-    def analyze_eks_pod_identity_associations(self):
+    def analyze_eks_pod_identity_associations(self) -> None:
         """
         Analyze EKS Pod Identity associations for IRSA migration readiness.
 
@@ -11174,7 +11182,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_eks_pod_identity_associations", str(e))
             self.progress.warning(f"Pod Identity check failed: {e}")
 
-    def analyze_resource_quotas(self):
+    def analyze_resource_quotas(self) -> None:
         """
         Analyze namespace resource quotas
         Detects quota exceeded errors
@@ -11241,7 +11249,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_resource_quotas", str(e))
             self.progress.warning(f"Resource quota analysis failed: {e}")
 
-    def analyze_pod_health_deep(self):
+    def analyze_pod_health_deep(self) -> None:
         """
         Deep analysis of pod health issues using knowledge base
         Detects CrashLoopBackOff, CreateContainerConfigError, and other issues
@@ -11532,7 +11540,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_pod_health_deep", str(e))
             self.progress.warning(f"Deep pod health analysis failed: {e}")
 
-    def analyze_vpc_cni_health(self):
+    def analyze_vpc_cni_health(self) -> None:
         """
         Analyze VPC CNI health and IP address allocation
         """
@@ -11605,7 +11613,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_vpc_cni_health", str(e))
             self.progress.warning(f"VPC CNI health analysis failed: {e}")
 
-    def analyze_coredns_health(self):
+    def analyze_coredns_health(self) -> None:
         """
         Analyze CoreDNS health and configuration
         """
@@ -11689,7 +11697,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_coredns_health", str(e))
             self.progress.warning(f"CoreDNS health analysis failed: {e}")
 
-    def analyze_iam_pod_identity(self):
+    def analyze_iam_pod_identity(self) -> None:
         """
         Analyze IAM permissions and Pod Identity issues
 
@@ -12038,7 +12046,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     # --- HIGH PRIORITY METHODS ---
 
-    def analyze_init_container_failures(self):
+    def analyze_init_container_failures(self) -> None:
         """
         Analyze init container failures directly from pod status.
 
@@ -12139,7 +12147,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_init_container_failures", str(e))
 
-    def analyze_pdb_violations(self):
+    def analyze_pdb_violations(self) -> None:
         """
         Analyze Pod Disruption Budget violations.
 
@@ -12219,7 +12227,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_pdb_violations", str(e))
 
-    def analyze_sidecar_health(self):
+    def analyze_sidecar_health(self) -> None:
         """
         Analyze service mesh and sidecar container health.
 
@@ -12309,7 +12317,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_sidecar_health", str(e))
 
-    def analyze_node_resource_saturation(self):
+    def analyze_node_resource_saturation(self) -> None:
         """
         Analyze nodes approaching resource limits before pressure triggers.
 
@@ -12418,7 +12426,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_node_resource_saturation", str(e))
 
-    def analyze_version_skew(self):
+    def analyze_version_skew(self) -> None:
         """
         Analyze kubelet version skew between control plane and nodes.
 
@@ -12490,7 +12498,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_version_skew", str(e))
 
-    def analyze_ingress_health(self):
+    def analyze_ingress_health(self) -> None:
         """
         Analyze Ingress resource misconfigurations.
 
@@ -12563,7 +12571,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_ingress_health", str(e))
 
-    def analyze_hpa_metrics_source(self):
+    def analyze_hpa_metrics_source(self) -> None:
         """
         Analyze HPA metrics source availability.
 
@@ -12641,7 +12649,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_hpa_metrics_source", str(e))
 
-    def analyze_deprecated_apis(self):
+    def analyze_deprecated_apis(self) -> None:
         """
         Analyze deprecated API usage for upgrade readiness.
 
@@ -12737,7 +12745,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     # --- MEDIUM PRIORITY METHODS ---
 
-    def analyze_topology_spread(self):
+    def analyze_topology_spread(self) -> None:
         """
         Analyze topology spread constraint violations.
 
@@ -12798,7 +12806,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_topology_spread", str(e))
 
-    def analyze_node_ami_age(self):
+    def analyze_node_ami_age(self) -> None:
         """
         Analyze node AMI age for security patch status.
 
@@ -12867,7 +12875,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_node_ami_age", str(e))
 
-    def analyze_endpointslice_health(self):
+    def analyze_endpointslice_health(self) -> None:
         """
         Analyze EndpointSlice readiness (newer API replacing Endpoints).
 
@@ -12933,7 +12941,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_endpointslice_health", str(e))
 
-    def analyze_dns_configuration(self):
+    def analyze_dns_configuration(self) -> None:
         """
         Analyze pod DNS configuration for performance issues.
 
@@ -12997,7 +13005,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_dns_configuration", str(e))
 
-    def analyze_karpenter_drift(self):
+    def analyze_karpenter_drift(self) -> None:
         """
         Analyze Karpenter NodeClaim drift.
 
@@ -13062,7 +13070,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_karpenter_drift", str(e))
 
-    def analyze_workload_security_posture(self):
+    def analyze_workload_security_posture(self) -> None:
         """
         Analyze workload security posture.
 
@@ -13162,7 +13170,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     # --- LOW PRIORITY METHODS ---
 
-    def analyze_ephemeral_containers(self):
+    def analyze_ephemeral_containers(self) -> None:
         """
         Analyze ephemeral containers (debug containers).
 
@@ -13213,7 +13221,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_ephemeral_containers", str(e))
 
-    def analyze_volume_snapshots(self):
+    def analyze_volume_snapshots(self) -> None:
         """
         Analyze VolumeSnapshot health.
 
@@ -15281,7 +15289,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         # Build dependency chains
         self.dependency_chains = self._build_dependency_chains(self.correlations)
 
-    def analyze_cpu_throttling(self):
+    def analyze_cpu_throttling(self) -> None:
         """
         Analyze CPU throttling via CloudWatch Container Insights
         Detects containers hitting CPU limits
@@ -15365,7 +15373,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_cpu_throttling", str(e))
             self.progress.warning(f"CPU throttling analysis failed: {e}")
 
-    def analyze_service_health(self):
+    def analyze_service_health(self) -> None:
         """
         Analyze Kubernetes services, endpoints, and load balancers
         Detects services without endpoints, failed load balancers, connectivity issues
@@ -15532,7 +15540,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_service_health", str(e))
             self.progress.warning(f"Service health analysis failed: {e}")
 
-    def analyze_eks_nodegroup_health(self):
+    def analyze_eks_nodegroup_health(self) -> None:
         """
         Analyze EKS managed node groups via EKS API
         Detects degraded, unhealthy node groups
@@ -15594,7 +15602,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_eks_nodegroup_health", str(e))
             self.progress.warning(f"EKS node group analysis failed: {e}")
 
-    def analyze_probe_failures(self):
+    def analyze_probe_failures(self) -> None:
         """
         Analyze liveness and readiness probe failures
         Detects pods failing health checks
@@ -15655,7 +15663,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_probe_failures", str(e))
             self.progress.warning(f"Probe failure analysis failed: {e}")
 
-    def analyze_ebs_csi_health(self):
+    def analyze_ebs_csi_health(self) -> None:
         """
         Analyze EBS CSI driver health
         Detects driver issues affecting volume operations
@@ -15732,7 +15740,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_ebs_csi_health", str(e))
             self.progress.warning(f"EBS CSI driver analysis failed: {e}")
 
-    def analyze_service_quotas(self):
+    def analyze_service_quotas(self) -> None:
         """
         Analyze AWS Service Quotas for EC2, EBS, VPC, and EKS limits.
         Detects if quota limits may be blocking cluster scaling.
@@ -15761,12 +15769,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     quotas = []
                     next_token = None
 
+                    # IAM is a global service - use us-east-1 for quota queries
+                    if service_code == "iam" and self.region != "us-east-1":
+                        iam_client = self.session.client("service-quotas", region_name="us-east-1")
+                        client_to_use = iam_client
+                    else:
+                        client_to_use = quotas_client
+
                     while True:
                         params = {"ServiceCode": service_code}
                         if next_token:
                             params["NextToken"] = next_token
 
-                        success, response = self.safe_api_call(quotas_client.list_service_quotas, **params)
+                        success, response = self.safe_api_call(client_to_use.list_service_quotas, **params)
 
                         if not success:
                             self.progress.warning(f"Failed to list quotas for {service_code}: {response}")
@@ -15871,7 +15886,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_service_quotas", str(e))
             self.progress.warning(f"Service Quotas analysis failed: {e}")
 
-    def analyze_cluster_autoscaler(self):
+    def analyze_cluster_autoscaler(self) -> None:
         """
         Analyze Cluster Autoscaler health and configuration
         Detects scale-up failures and misconfigurations
@@ -15968,7 +15983,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_cluster_autoscaler", str(e))
             self.progress.warning(f"Cluster Autoscaler analysis failed: {e}")
 
-    def analyze_hpa_vpa(self):
+    def analyze_hpa_vpa(self) -> None:
         """
         Analyze Horizontal/Vertical Pod Autoscaler health
         Detects autoscaling failures and metric issues
@@ -16059,7 +16074,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_hpa_vpa", str(e))
             self.progress.warning(f"HPA/VPA analysis failed: {e}")
 
-    def analyze_certificate_expiry(self):
+    def analyze_certificate_expiry(self) -> None:
         """
         Analyze certificate expiration for kubelet and control plane
         Detects certificates approaching expiration
@@ -16136,7 +16151,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_certificate_expiry", str(e))
             self.progress.warning(f"Certificate expiration analysis failed: {e}")
 
-    def analyze_aws_lb_controller(self):
+    def analyze_aws_lb_controller(self) -> None:
         """
         Analyze AWS Load Balancer Controller health
         Detects issues with ALB/NLB provisioning
@@ -16223,7 +16238,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_aws_lb_controller", str(e))
             self.progress.warning(f"AWS LB Controller analysis failed: {e}")
 
-    def analyze_subnet_health(self):
+    def analyze_subnet_health(self) -> None:
         """
         Analyze VPC subnet health and IP availability
         Detects subnet exhaustion issues
@@ -16311,7 +16326,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_subnet_health", str(e))
             self.progress.warning(f"Subnet health analysis failed: {e}")
 
-    def analyze_karpenter(self):
+    def analyze_karpenter(self) -> None:
         """
         Analyze Karpenter autoscaler health (alternative to Cluster Autoscaler)
         Detects provisioning failures
@@ -16383,7 +16398,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_karpenter", str(e))
             self.progress.warning(f"Karpenter health analysis failed: {e}")
 
-    def analyze_efs_csi_health(self):
+    def analyze_efs_csi_health(self) -> None:
         """
         Analyze EFS CSI driver health
         Detects issues with EFS volume mounting
@@ -16453,7 +16468,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_efs_csi_health", str(e))
             self.progress.warning(f"EFS CSI driver analysis failed: {e}")
 
-    def analyze_gpu_scheduling(self):
+    def analyze_gpu_scheduling(self) -> None:
         """
         Analyze GPU scheduling issues for ML/AI workloads
         Detects GPU resource constraints
@@ -16564,7 +16579,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_gpu_scheduling", str(e))
             self.progress.warning(f"GPU scheduling analysis failed: {e}")
 
-    def analyze_windows_nodes(self):
+    def analyze_windows_nodes(self) -> None:
         """
         Analyze Windows node health and scheduling issues
         Detects Windows-specific problems
@@ -16657,7 +16672,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_windows_nodes", str(e))
             self.progress.warning(f"Windows node analysis failed: {e}")
 
-    def analyze_security_groups(self):
+    def analyze_security_groups(self) -> None:
         """
         Analyze security group issues affecting EKS connectivity
         Detects common misconfigurations
@@ -16757,7 +16772,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_security_groups", str(e))
             self.progress.warning(f"Security group analysis failed: {e}")
 
-    def analyze_fargate_health(self):
+    def analyze_fargate_health(self) -> None:
         """
         Analyze Fargate profile health for serverless workloads
         Detects profile issues and scheduling failures
@@ -16845,7 +16860,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_fargate_health", str(e))
             self.progress.warning(f"Fargate health analysis failed: {e}")
 
-    def analyze_apiserver_latency(self):
+    def analyze_apiserver_latency(self) -> None:
         """
         Analyze API Server latency and request patterns
         Detects slow requests, inflight saturation, rate limiting (429)
@@ -16989,7 +17004,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_apiserver_latency", str(e))
             self.progress.warning(f"API Server latency analysis failed: {e}")
 
-    def analyze_apiserver_rate_limiting(self):
+    def analyze_apiserver_rate_limiting(self) -> None:
         """
         Analyze API Server rate limiting (429 errors)
         Catalog 1.2: Detects HTTP 429 responses, client-side throttling, APF saturation
@@ -17169,7 +17184,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_apiserver_rate_limiting", str(e))
             self.progress.warning(f"API Server rate limiting analysis failed: {e}")
 
-    def analyze_etcd_health(self):
+    def analyze_etcd_health(self) -> None:
         """
         Analyze etcd health from control plane logs and kubectl events
         Detects slow fdatasync, quota issues, leader changes
@@ -17445,7 +17460,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_etcd_health", str(e))
             self.progress.warning(f"etcd health analysis failed: {e}")
 
-    def analyze_controller_manager(self):
+    def analyze_controller_manager(self) -> None:
         """
         Analyze kube-controller-manager health
         Detects reconciliation failures, panics, rate limiting
@@ -17566,7 +17581,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_controller_manager", str(e))
             self.progress.warning(f"Controller Manager analysis failed: {e}")
 
-    def analyze_admission_webhooks(self):
+    def analyze_admission_webhooks(self) -> None:
         """
         Analyze admission webhook health
         Detects timeouts, failures, certificate issues
@@ -17659,7 +17674,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_admission_webhooks", str(e))
             self.progress.warning(f"Admission webhook analysis failed: {e}")
 
-    def analyze_pleg_health(self):
+    def analyze_pleg_health(self) -> None:
         """
         Analyze PLEG (Pod Lifecycle Event Generator) health
         Detects PLEG not healthy issues
@@ -17742,7 +17757,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_pleg_health", str(e))
             self.progress.warning(f"PLEG health analysis failed: {e}")
 
-    def analyze_container_runtime(self):
+    def analyze_container_runtime(self) -> None:
         """
         Analyze container runtime (containerd) health
         Detects runtime unresponsive issues
@@ -17832,7 +17847,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_container_runtime", str(e))
             self.progress.warning(f"Container Runtime analysis failed: {e}")
 
-    def analyze_pause_image_issues(self):
+    def analyze_pause_image_issues(self) -> None:
         """
         Analyze pause container image issues
         Catalog: CNI Misconfiguration - pause image missing/garbage-collected
@@ -18006,7 +18021,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_pause_image_issues", str(e))
             self.progress.warning(f"Pause image analysis failed: {e}")
 
-    def analyze_pods_terminating(self):
+    def analyze_pods_terminating(self) -> None:
         """
         Analyze pods stuck in Terminating state
         Detects finalizers, volume detach issues
@@ -18087,7 +18102,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_pods_terminating", str(e))
             self.progress.warning(f"Stuck Terminating pods analysis failed: {e}")
 
-    def analyze_deployment_rollouts(self):
+    def analyze_deployment_rollouts(self) -> None:
         """
         Analyze deployment rollout issues
         Detects stuck rollouts, ProgressDeadlineExceeded
@@ -18196,7 +18211,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_deployment_rollouts", str(e))
             self.progress.warning(f"Deployment rollout analysis failed: {e}")
 
-    def analyze_jobs_cronjobs(self):
+    def analyze_jobs_cronjobs(self) -> None:
         """
         Analyze Job and CronJob failures
         Detects BackoffLimitExceeded, missed schedules
@@ -18334,7 +18349,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_jobs_cronjobs", str(e))
             self.progress.warning(f"Jobs/CronJobs analysis failed: {e}")
 
-    def analyze_network_policies(self):
+    def analyze_network_policies(self) -> None:
         """
         Analyze NetworkPolicies for potential blocking issues
         Detects policies that might block critical traffic
@@ -18427,7 +18442,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_network_policies", str(e))
             self.progress.warning(f"NetworkPolicy analysis failed: {e}")
 
-    def analyze_alb_health(self):
+    def analyze_alb_health(self) -> None:
         """
         Analyze AWS Load Balancer Controller and ALB health
         Detects 5xx errors, unhealthy targets
@@ -18563,7 +18578,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_alb_health", str(e))
             self.progress.warning(f"ALB health analysis failed: {e}")
 
-    def analyze_statefulset_issues(self):
+    def analyze_statefulset_issues(self) -> None:
         """
         Analyze StatefulSet-specific issues
         Detects PVC pending, ordinal failures
@@ -18667,7 +18682,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_statefulset_issues", str(e))
             self.progress.warning(f"StatefulSet analysis failed: {e}")
 
-    def analyze_conntrack_health(self):
+    def analyze_conntrack_health(self) -> None:
         """
         Analyze conntrack table health
         Detects conntrack table full, dropping packet issues
@@ -18805,7 +18820,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_conntrack_health", str(e))
             self.progress.warning(f"Conntrack health analysis failed: {e}")
 
-    def analyze_custom_controllers(self):
+    def analyze_custom_controllers(self) -> None:
         """
         Analyze custom controllers and operators for issues
         Detects reconciliation failures, watch errors, panics
@@ -18981,7 +18996,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_custom_controllers", str(e))
             self.progress.warning(f"Custom controller analysis failed: {e}")
 
-    def analyze_psa_violations(self):
+    def analyze_psa_violations(self) -> None:
         """
         Analyze Pod Security Admission violations
         Detects pods rejected by PSA policies
@@ -19159,7 +19174,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_psa_violations", str(e))
             self.progress.warning(f"PSA analysis failed: {e}")
 
-    def analyze_missing_config_resources(self):
+    def analyze_missing_config_resources(self) -> None:
         """
         Analyze missing ConfigMaps and Secrets referenced by pods
         Catalog 8.2: Missing ConfigMap or Secret
@@ -19426,7 +19441,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_missing_config_resources", str(e))
             self.progress.warning(f"ConfigMap/Secret analysis failed: {e}")
 
-    def analyze_apiserver_inflight(self):
+    def analyze_apiserver_inflight(self) -> None:
         """
         Analyze API Server inflight requests
         Detects request saturation
@@ -19503,7 +19518,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_apiserver_inflight", str(e))
             self.progress.warning(f"API Server inflight analysis failed: {e}")
 
-    def analyze_scheduler_health(self):
+    def analyze_scheduler_health(self) -> None:
         """
         Analyze kube-scheduler health
         Detects scheduling latency and errors
@@ -19661,7 +19676,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_scheduler_health", str(e))
             self.progress.warning(f"Scheduler health analysis failed: {e}")
 
-    def analyze_limits_requests(self):
+    def analyze_limits_requests(self) -> None:
         """
         Analyze resource limits and requests configuration
         Detects pods without limits/requests, QoS issues

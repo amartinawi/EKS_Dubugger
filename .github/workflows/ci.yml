@@ -87,6 +87,64 @@ jobs:
         run: bandit -r eks_comprehensive_debugger.py -ll -q
         continue-on-error: true
 
+  schema-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install JSON schema validator
+        run: pip install jsonschema
+
+      - name: Validate output schema
+        run: |
+          python -c "
+          import json
+          import jsonschema
+          from pathlib import Path
+          
+          # Validate schema file is valid JSON
+          schema_path = Path('schemas/output_schema.json')
+          if not schema_path.exists():
+              raise FileNotFoundError(f'Schema file not found: {schema_path}')
+          
+          with open(schema_path) as f:
+              schema = json.load(f)
+          
+          # Validate schema structure
+          if '\$schema' not in schema:
+              raise ValueError('Schema missing \$schema property')
+          
+          # Validate with meta-schema
+          jsonschema.Draft7Validator.check_schema(schema)
+          
+          print('✅ JSON schema validation passed')
+          "
+
+      - name: Validate LLM JSON schema
+        run: |
+          python -c "
+          import json
+          
+          # Extract and validate LLM JSON schema from code
+          with open('eks_comprehensive_debugger.py') as f:
+              content = f.read()
+          
+          # Find LLM_JSON_SCHEMA definition
+          import re
+          match = re.search(r'LLM_JSON_SCHEMA = \"\"\"(.+?)\"\"\"', content, re.DOTALL)
+          if match:
+              schema_str = match.group(1)
+              schema = json.loads(schema_str)
+              print('✅ LLM JSON schema is valid')
+          else:
+              print('⚠️  LLM_JSON_SCHEMA not found in code')
+          "
+
   build:
     runs-on: ubuntu-latest
     needs: [test, lint]

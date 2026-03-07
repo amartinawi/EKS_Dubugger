@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eks-comprehensive-debugger"
-version = "3.7.8"
+version = "3.7.9"
 description = "Production-grade diagnostic tool for Amazon EKS cluster troubleshooting"
 readme = "README.md"
 license = {text = "MIT"}

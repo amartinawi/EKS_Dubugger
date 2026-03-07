@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.7.9] - 2026-03-07
+
+### Added
+- **Two new EKS analysis methods** - Registered and integrated into analysis pipeline
+  - `analyze_eks_cluster_insights()` - Detects Kubernetes version deprecation warnings
+  - Identifies addon version compatibility issues
+  - Provides upgrade recommendations
+  - Uses `eks:ListInsights` and `eks:DescribeInsight` APIs with pagination
+  - `analyze_eks_pod_identity_associations()` - Lists all Pod Identity associations with pagination
+  - Verifies namespace and service account existence
+  - Detects IRSA annotation conflicts
+  - Uses `eks:ListPodIdentityAssociations` API
+
+### Changed
+- **Code quality improvements** - Addressed all audit-reported issues
+  - Registered 2 orphaned EKS analysis methods in `analysis_methods` list
+  - Added missing `clusterName` parameter to `describe_insight` API call
+  - Fixed recommendations copy button onclick handler
+  - Replaced bare `except:` with `except Exception:` for better error handling
+  - Removed redundant `import time` statement inside function
+- **Project configuration updates**
+  - Updated `project.urls` in `pyproject.toml` with actual repository URLs
+  - Raised `cov-fail-under` threshold from 14% to 40% for better test coverage
+
+### Fixed
+- **API parameter bug** - `describe_insight` now correctly passes `clusterName` parameter
+- **JavaScript bug** - Recommendations copy button now correctly calls `copyToClipboard(this)`
+- **Error handling** - Bare except statements replaced with proper exception handling
+
 ## [3.7.8] - 2026-03-07
 
 ### Added

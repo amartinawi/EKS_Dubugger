@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EKS Health Check Dashboard v3.7.8
+EKS Health Check Dashboard v3.7.9
 
 A production-grade diagnostic tool for Amazon EKS cluster troubleshooting that provides
 systematic analysis of cluster health, workload issues, networking, storage, and control plane.
@@ -187,7 +187,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.7.8"
+VERSION = "3.7.9"
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30

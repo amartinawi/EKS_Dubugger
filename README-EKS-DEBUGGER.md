@@ -8,7 +8,7 @@
 
 A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 3.7.8 | **Analysis Methods:** 73 | **Catalog Coverage:** 100% | **Tests:** 207
+**Version:** 3.7.9 | **Analysis Methods:** 73 | **Catalog Coverage:** 100% | **Tests:** 207
 
 ---
 

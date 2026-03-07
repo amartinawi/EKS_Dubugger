@@ -4,11 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![AWS EKS](https://img.shields.io/badge/AWS-EKS-orange.svg)](https://aws.amazon.com/eks/)
 [![Catalog Coverage](https://img.shields.io/badge/catalog%20coverage-100%25-green.svg)](#catalog-coverage)
-[![Tests](https://img.shields.io/badge/tests-183%20passing-brightgreen.svg)](#unit-tests)
+[![Tests](https://img.shields.io/badge/tests-207%20passing-brightgreen.svg)](#unit-tests)
 
 A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 3.7.7 | **Analysis Methods:** 73 | **Catalog Coverage:** 100% | **Tests:** 183
+**Version:** 3.7.8 | **Analysis Methods:** 73 | **Catalog Coverage:** 100% | **Tests:** 207
 
 ---
 

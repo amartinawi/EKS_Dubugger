@@ -6,12 +6,12 @@ Guidelines for AI coding agents working in the EKS Health Check Dashboard codeba
 
 Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
 
-**Version:** 3.7.7  
+**Version:** 3.7.8  
 **Lines of Code:** ~20,000  
 **Analysis Methods:** 73  
 **Remediation Patterns:** 30+  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)  
-**Unit Tests:** 158 tests
+**Unit Tests:** 207 tests
 
 ## Quick Commands
 

@@ -8,32 +8,31 @@ systematic analysis of cluster health,"""
 from __future__ import annotations
 
 # === SECTION 1: IMPORTS & CONSTANTS ===
-
 import argparse
-import boto3
+import hashlib
+import html
 import json
+import json as json_module
+import logging
+import os
+import random
 import re
 import shlex
 import subprocess
 import sys
-import time
-import html
 import threading
+import time
 import uuid
-import logging
-
-from botocore.exceptions import ClientError, BotoCoreError, ProfileNotFound, PartialCredentialsError, NoRegionError
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from dateutil import parser as date_parser
-from typing import Optional, Any
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import hashlib
-import os
-import json as json_module
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import boto3
 import pytz
-import random
+from botocore.exceptions import BotoCoreError, ClientError, NoRegionError, PartialCredentialsError, ProfileNotFound
+from dateutil import parser as date_parser
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
@@ -101,7 +100,7 @@ class APICache:
         self._ttl = ttl_seconds
         self._lock = threading.Lock()
 
-    def get(self, key: str) -> Optional[tuple]:
+    def get(self, key: str) -> tuple | None:
         with self._lock:
             if key in self._cache:
                 data, timestamp = self._cache[key]
@@ -141,7 +140,7 @@ class TimezoneManager:
         return datetime.now(TimezoneManager.UTC)
 
     @staticmethod
-    def parse_iso_utc(iso_str: str) -> Optional[datetime]:
+    def parse_iso_utc(iso_str: str) -> datetime | None:
         try:
             dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
             return TimezoneManager.ensure_utc(dt)
@@ -177,7 +176,7 @@ class ConfigLoader:
     def load(config_path: str | None = None, env_mapping: dict[str, str] | None = None) -> dict:
         config: dict = {}
         if config_path and os.path.exists(config_path):
-            with open(config_path, "r") as f:
+            with open(config_path) as f:
                 content = f.read()
                 if config_path.endswith((".yaml", ".yml")):
                     try:
@@ -226,7 +225,7 @@ class IncrementalCache:
         """
         if os.path.exists(self.cache_file):
             try:
-                with open(self.cache_file, "r") as f:
+                with open(self.cache_file) as f:
                     data = json_module.load(f)
                     if time.time() - data.get("timestamp", 0) < 86400:
                         return data.get("results")
@@ -370,8 +369,11 @@ def timed_input(prompt: str, timeout: int = 60, default: str | None = None) -> s
 
 
 # Pre-compiled regex patterns for severity classification
+# Note: "network not ready" is specifically handled as info, not critical
 _CRITICAL_PATTERN = re.compile(r"\b(?:oom|killed|crash(?:ed)?|critical|(?<!shut)down|unhealthy)\b")
-_WARNING_PATTERN = re.compile(r"\b(?:warning|warn|degraded|pressure|evicted|pending|timeout|error|failed?)\b")
+_WARNING_PATTERN = re.compile(
+    r"\b(?:warning|warn|degraded|pressure|evicted|pending|timeout|error|failed?|restart|notready)\b"
+)
 _INFO_PATTERN = re.compile(r"\b(?:info|notice|fallback)\b|network not ready")
 _COMPOUND_CRITICAL = ("oomkilled", "crashloopbackoff", "imagepullbackoff")
 
@@ -1658,7 +1660,7 @@ class ExecutiveSummaryGenerator:
 
         return all_findings[:limit]
 
-    def _analyze_root_causes(self, correlations: list, first_issue: Optional[dict]) -> dict:
+    def _analyze_root_causes(self, correlations: list, first_issue: dict | None) -> dict:
         """Analyze root causes from correlations and first issue"""
         root_causes = []
 
@@ -1737,7 +1739,7 @@ class ExecutiveSummaryGenerator:
             "trend": trend,
         }
 
-    def _calculate_trend(self, timeline: list) -> Optional[dict]:
+    def _calculate_trend(self, timeline: list) -> dict | None:
         """
         Calculate trend from last 2 time buckets.
 
@@ -1984,7 +1986,7 @@ class ExecutiveSummaryGenerator:
 
         return actions[:10]  # Top 10 actions
 
-    def _generate_correlation_narrative(self, correlations: list, first_issue: Optional[dict], findings: dict) -> dict:
+    def _generate_correlation_narrative(self, correlations: list, first_issue: dict | None, findings: dict) -> dict:
         """
         Generate a human-readable narrative from correlations (Phase 3 - #5).
 
@@ -2018,7 +2020,7 @@ class ExecutiveSummaryGenerator:
                     narrative_parts.append(
                         f"📊 **Memory/Disk Pressure Cascade**: {root_cause}. This triggered a cascade where {impact}."
                     )
-                    short_summary = f"Node pressure caused cascading failures"
+                    short_summary = "Node pressure caused cascading failures"
 
             elif corr_type == "cni_cascade":
                 narrative_parts.append(
@@ -2377,7 +2379,7 @@ class HTMLOutputFormatter(OutputFormatter):
     """Modern HTML output with interactive features"""
 
     @staticmethod
-    def _escape_html(text: Optional[str]) -> str:
+    def _escape_html(text: str | None) -> str:
         """Escape HTML special characters to prevent XSS attacks"""
         if text is None:
             return ""
@@ -2609,7 +2611,7 @@ class HTMLOutputFormatter(OutputFormatter):
             """
 
         # Collapsible Key Findings (Phase 1 - #10)
-        html += f"""
+        html += """
                     <!-- Key Findings - Collapsible -->
                     <div class="summary-block collapsible">
                         <div class="summary-block-header" onclick="toggleSummaryBlock(this)">
@@ -7481,7 +7483,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         namespace: str | None = None,
-        progress: "ProgressTracker | None" = None,
+        progress: ProgressTracker | None = None,
         kube_context: str | None = None,
         pagination_limit: int = 1000,
     ) -> None:
@@ -7567,9 +7569,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.correlations = []
         self.timeline = []
         self.first_issue = None
-        self._incremental_cache: Optional[IncrementalCache] = None
-        self._previous_results: Optional[dict] = None
-        self.delta_report: Optional[dict] = None
+        self._incremental_cache: IncrementalCache | None = None
+        self._previous_results: dict | None = None
+        self.delta_report: dict | None = None
 
         # Pre-fetched shared data for performance (populated before parallel analysis)
         self._shared_data: dict = {
@@ -7811,7 +7813,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             cache_stats += f", {len(self._shared_data['pod_info'].get('items', []))} pods"
         self.progress.info(f"Pre-fetched {cache_stats} in {elapsed:.1f}s")
 
-    def _get_cached_log_group(self, prefix: str) -> Optional[dict]:
+    def _get_cached_log_group(self, prefix: str) -> dict | None:
         """Get cached log group data or fetch if not cached.
 
         Args:
@@ -7865,6 +7867,126 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     "timestamp": now,
                 }
         return output
+
+    def _set_kubectl_cache(self, cmd: str, output: str) -> None:
+        """Store kubectl output in cache with timestamp.
+
+        Args:
+            cmd: kubectl command string
+            output: Command output to cache
+        """
+        with self._shared_data_lock:
+            # Store as tuple (output, timestamp) for compatibility
+            self._shared_data["kubectl_cache"][cmd] = (output, time.time())
+
+    def _get_kubectl_cache(self, cmd: str, max_age_seconds: int = 600) -> str | None:
+        """Get cached kubectl output with TTL validation.
+
+        Args:
+            cmd: kubectl command string
+            max_age_seconds: Maximum age of cached entry (default: 600s = 10 min)
+
+        Returns:
+            Cached output if valid, None if expired or not found
+        """
+        now = time.time()
+        with self._shared_data_lock:
+            if cmd not in self._shared_data["kubectl_cache"]:
+                return None
+
+            cached_entry = self._shared_data["kubectl_cache"][cmd]
+
+            # Handle tuple format (output, timestamp)
+            if isinstance(cached_entry, tuple) and len(cached_entry) == 2:
+                output, timestamp = cached_entry
+                if now - timestamp > max_age_seconds:
+                    del self._shared_data["kubectl_cache"][cmd]
+                    return None
+                return output
+
+            # Handle dict format {"output": ..., "timestamp": ...}
+            if isinstance(cached_entry, dict):
+                timestamp = cached_entry.get("timestamp", 0)
+                if now - timestamp > max_age_seconds:
+                    del self._shared_data["kubectl_cache"][cmd]
+                    return None
+                return cached_entry.get("output")
+
+            # Legacy format (just the string) - ignore tuples
+            if isinstance(cached_entry, str):
+                return cached_entry
+            return None
+
+    def _is_finding_in_time_window(self, finding: dict) -> bool:
+        """Check if a finding falls within the analysis time window.
+
+        Args:
+            finding: Finding dict with 'details' containing 'timestamp'
+
+        Returns:
+            True if finding is within time window or has no timestamp, False otherwise
+        """
+        if not self.start_date or not self.end_date:
+            return True
+
+        details = finding.get("details", {})
+        timestamp_str = details.get("timestamp")
+
+        if not timestamp_str:
+            # Findings without timestamp are assumed to be in window
+            return True
+
+        try:
+            # Parse timestamp
+            if isinstance(timestamp_str, str):
+                # Handle ISO format with Z suffix
+                if timestamp_str.endswith("Z"):
+                    timestamp_str = timestamp_str[:-1] + "+00:00"
+                finding_time = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+            elif isinstance(timestamp_str, datetime):
+                finding_time = timestamp_str
+            else:
+                return True
+
+            # Ensure timezone-aware comparison
+            if finding_time.tzinfo is None:
+                finding_time = finding_time.replace(tzinfo=timezone.utc)
+            start = self.start_date if self.start_date.tzinfo else self.start_date.replace(tzinfo=timezone.utc)
+            end = self.end_date if self.end_date.tzinfo else self.end_date.replace(tzinfo=timezone.utc)
+
+            return start <= finding_time <= end
+        except (ValueError, TypeError):
+            return True
+
+    def _batch_kubectl_calls(self, commands: list[str], parallel: bool = True) -> dict[str, str | None]:
+        """Execute multiple kubectl commands efficiently.
+
+        Args:
+            commands: List of kubectl commands to execute
+            parallel: Whether to execute in parallel (default: True)
+
+        Returns:
+            Dict mapping command to output (or None on failure)
+        """
+        results: dict[str, str | None] = {}
+
+        if parallel and len(commands) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(max_workers=min(len(commands), 5)) as executor:
+                future_to_cmd = {executor.submit(self.safe_kubectl_call, cmd): cmd for cmd in commands}
+                for future in as_completed(future_to_cmd):
+                    cmd = future_to_cmd[future]
+                    try:
+                        results[cmd] = future.result(timeout=30)
+                    except Exception as e:
+                        self._add_error("batch_kubectl", f"Command failed: {cmd}: {e}")
+                        results[cmd] = None
+        else:
+            for cmd in commands:
+                results[cmd] = self.safe_kubectl_call(cmd)
+
+        return results
 
     def collect_cluster_statistics(self):
         """
@@ -8389,7 +8511,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
             return True, result.stdout
         except subprocess.TimeoutExpired:
-            return False, f"Command timed out"
+            return False, "Command timed out"
         except subprocess.CalledProcessError as e:
             return False, e.stderr if e.stderr else "Command failed"
         except FileNotFoundError:
@@ -8523,7 +8645,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             Tuple of (success: bool, result: Any). On success, result is the API response.
             On failure, result is an error message string.
         """
-        import random
 
         cache_key = ""
         if use_cache and self.enable_cache:
@@ -8779,7 +8900,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             return f"kubectl get events -n {self.namespace} --field-selector reason={reason} -o json"
         return f"kubectl get events --all-namespaces --field-selector reason={reason} -o json"
 
-    def _get_filtered_events(self, reason: str) -> Optional[dict]:
+    def _get_filtered_events(self, reason: str) -> dict | None:
         """Execute kubectl command and filter events by date."""
         cmd = self._build_kubectl_events_cmd(reason)
         output = self.safe_kubectl_call(cmd)
@@ -8801,7 +8922,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self,
         category: str,
         summary: str,
-        details: Optional[dict] = None,
+        details: dict | None = None,
         finding_type: str = FindingType.CURRENT_STATE,
     ) -> bool:
         """Add finding to appropriate category with finding type classification.
@@ -8840,7 +8961,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         finding_type = details.get("finding_type", FindingType.CURRENT_STATE)
         return self._add_finding(category, summary, details, finding_type)
 
-    def _classify_severity(self, summary_text: str, details: Optional[dict]) -> str:
+    def _classify_severity(self, summary_text: str, details: dict | None) -> str:
         """Classify finding severity based on content (delegates to module-level function)."""
         return classify_severity(summary_text, details)
 
@@ -9036,7 +9157,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "Ephemeral storage limits exceeded",
                             ]
                             finding["details"]["diagnostic_steps"] = [
-                                f"SSH to node: df -h to identify full mount",
+                                "SSH to node: df -h to identify full mount",
                                 "crictl images to list container images",
                                 "crictl rmi --prune to remove unused images",
                                 "du -sh /var/log/containers/* to find large log files",
@@ -9055,7 +9176,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 "Insufficient pid_max kernel setting",
                             ]
                             finding["details"]["diagnostic_steps"] = [
-                                f"SSH to node: cat /proc/sys/kernel/pid_max",
+                                "SSH to node: cat /proc/sys/kernel/pid_max",
                                 "ps aux --sort=pid | tail -50 to find process hogs",
                                 "Check per-pod process count: crictl pods",
                                 f"kubectl describe node {node_name} | grep -A 5 'PIDPressure'",
@@ -9602,9 +9723,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     is_critical = any(pattern in message_lower for pattern in CONTROL_PLANE_ERROR_PATTERNS)
 
-                    if message.startswith("E") and len(message) > 1 and message[1].isdigit():
-                        severity = "critical"
-                    elif is_critical:
+                    if (message.startswith("E") and len(message) > 1 and message[1].isdigit()) or is_critical:
                         severity = "critical"
                     else:
                         severity = "warning"
@@ -9634,7 +9753,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self.progress.info(f"Control plane logs not accessible: {error_code}")
             else:
                 self._add_error("analyze_control_plane_logs", f"AWS API error: {e}")
-                self.progress.warning(f"Control plane log analysis failed: AWS error")
+                self.progress.warning("Control plane log analysis failed: AWS error")
         except json.JSONDecodeError as e:
             self._add_error("analyze_control_plane_logs", f"Invalid JSON in log response: {e}")
             self.progress.warning("Control plane log analysis failed: Invalid JSON")
@@ -10757,16 +10876,16 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         except json.JSONDecodeError as e:
             self._add_error("analyze_pod_health_deep", f"Invalid JSON from kubectl: {e}")
-            self.progress.warning(f"Deep pod health analysis failed: Invalid JSON")
+            self.progress.warning("Deep pod health analysis failed: Invalid JSON")
         except KeyError as e:
             self._add_error("analyze_pod_health_deep", f"Missing expected field in pod data: {e}")
-            self.progress.warning(f"Deep pod health analysis failed: Missing field")
+            self.progress.warning("Deep pod health analysis failed: Missing field")
         except subprocess.TimeoutExpired:
             self._add_error("analyze_pod_health_deep", "kubectl command timed out")
             self.progress.warning("Deep pod health analysis failed: kubectl timeout")
         except subprocess.CalledProcessError as e:
             self._add_error("analyze_pod_health_deep", f"kubectl command failed: {e}")
-            self.progress.warning(f"Deep pod health analysis failed: kubectl error")
+            self.progress.warning("Deep pod health analysis failed: kubectl error")
         except Exception as e:
             self._add_error("analyze_pod_health_deep", f"Unexpected error: {e}")
             self.progress.warning(f"Deep pod health analysis failed: {e}")
@@ -11134,10 +11253,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             error_code = e.response.get("Error", {}).get("Code", "Unknown")
             if error_code in ["AccessDenied", "UnauthorizedAccess"]:
                 self._add_error("analyze_iam_pod_identity", f"AWS permission denied: {error_code}")
-                self.progress.warning(f"IAM and Pod Identity analysis failed: AWS permission denied")
+                self.progress.warning("IAM and Pod Identity analysis failed: AWS permission denied")
             else:
                 self._add_error("analyze_iam_pod_identity", f"AWS API error: {e}")
-                self.progress.warning(f"IAM and Pod Identity analysis failed: AWS error")
+                self.progress.warning("IAM and Pod Identity analysis failed: AWS error")
         except Exception as e:
             self._add_error("analyze_iam_pod_identity", f"Unexpected error: {e}")
             self.progress.warning(f"IAM and Pod Identity analysis failed: {e}")
@@ -13613,9 +13732,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         elif category in ["network_issues", "dns_issues"]:
             return f"Potential impact: {affected_services} services may have connectivity issues"
         elif severity == "critical":
-            return f"High priority: Requires immediate attention"
+            return "High priority: Requires immediate attention"
         elif severity == "warning":
-            return f"Medium priority: Monitor and plan remediation"
+            return "Medium priority: Monitor and plan remediation"
         else:
             return "Informational: No immediate action required"
 
@@ -13660,13 +13779,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "commands": [
                             {
                                 "description": "Check current memory limits",
-                                "command": f"kubectl get pods -A -o json | jq -r '.items[] | select(.status.containerStatuses[0].state.terminated.reason==\"OOMKilled\") | {{name: .metadata.name, namespace: .metadata.namespace, limits: .spec.containers[0].resources.limits}}'",
+                                "command": "kubectl get pods -A -o json | jq -r '.items[] | select(.status.containerStatuses[0].state.terminated.reason==\"OOMKilled\") | {name: .metadata.name, namespace: .metadata.namespace, limits: .spec.containers[0].resources.limits}'",
                                 "explanation": "Lists pods with OOM kills and their current memory limits",
                                 "safe": True,
                             },
                             {
                                 "description": "Increase memory limit for affected deployment",
-                                "command": f"# For each affected pod, update its deployment:\nkubectl set resources deployment/<deployment-name> -n <namespace> --limits=memory=512Mi --requests=memory=256Mi",
+                                "command": "# For each affected pod, update its deployment:\nkubectl set resources deployment/<deployment-name> -n <namespace> --limits=memory=512Mi --requests=memory=256Mi",
                                 "explanation": "Increases memory limit. Replace <deployment-name> and <namespace> with actual values.",
                                 "safe": False,
                                 "requires_input": True,
@@ -17223,10 +17342,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     elif "pause" in message and ("not found" in message or "fail" in message):
                         is_pause_issue = True
                         issue_type = "pause_image_missing"
-                    elif "failed to create pod sandbox" in message:
-                        is_pause_issue = True
-                        issue_type = "sandbox_creation_failed"
-                    elif reason == "FailedCreatePodSandBox":
+                    elif "failed to create pod sandbox" in message or reason == "FailedCreatePodSandBox":
                         is_pause_issue = True
                         issue_type = "sandbox_creation_failed"
 
@@ -18643,7 +18759,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                                 "finding_type": FindingType.CURRENT_STATE,
                                                 "diagnostic_steps": [
                                                     f"kubectl get configmap {cm_name} -n {ns}",
-                                                    f"Create the ConfigMap or fix the pod spec",
+                                                    "Create the ConfigMap or fix the pod spec",
                                                 ],
                                             },
                                         },
@@ -19495,7 +19611,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 # Extract affected resources
                 for key in ["node", "pod", "namespace", "pvc", "service", "subnet_id"]:
-                    if key in details and details[key]:
+                    if details.get(key):
                         affected_resources.add(str(details[key]))
 
                 # Extract timestamps
@@ -20006,7 +20122,7 @@ def parse_flexible_date(date_str: str, tz_name: str = "UTC") -> datetime:
                 return datetime.now(timezone.utc) - timedelta(days=value)
             else:
                 raise ValueError(f"Unknown time unit: {unit}")
-        except (ValueError, IndexError) as e:
+        except (ValueError, IndexError):
             raise DateValidationError(f"Invalid relative date format: {date_str}. Use '-2h' or '-3d'")
 
     # Parse ISO 8601 or date-only format
@@ -20019,7 +20135,7 @@ def parse_flexible_date(date_str: str, tz_name: str = "UTC") -> datetime:
 
         # Convert to UTC
         return dt.astimezone(timezone.utc)
-    except Exception as e:
+    except Exception:
         raise DateValidationError(f"Invalid date format: {date_str}. Use ISO 8601 (2026-02-15T10:00:00Z) or YYYY-MM-DD")
 
 

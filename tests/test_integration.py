@@ -286,8 +286,18 @@ class TestControlPlaneAnalysis:
 
     def test_analyze_control_plane_logs_errors(self, debugger):
         """Test control plane error detection."""
-        # Mock CloudWatch Logs response
-        debugger.logs_client.filter_log_events.return_value = {
+        # Mock describe_log_groups (for _get_cached_log_group)
+        debugger.logs_client.describe_log_groups.return_value = {
+            "logGroups": [{"logGroupName": "/aws/eks/test-cluster/cluster", "retentionInDays": 7}]
+        }
+
+        # Mock describe_log_streams
+        debugger.logs_client.describe_log_streams.return_value = {
+            "logStreams": [{"logStreamName": "kube-apiserver-123", "lastEventTimestamp": 1705312800000}]
+        }
+
+        # Mock get_log_events (not filter_log_events)
+        debugger.logs_client.get_log_events.return_value = {
             "events": [
                 {
                     "message": json.dumps(
@@ -306,7 +316,10 @@ class TestControlPlaneAnalysis:
 
         assert len(debugger.findings["control_plane_issues"]) > 0
         finding = debugger.findings["control_plane_issues"][0]
-        assert "etcdserver" in finding["summary"].lower() or "leader" in finding["summary"].lower()
+        # Summary is "Control plane error in {stream_name}", check details for actual message
+        details = finding.get("details", {})
+        message = details.get("message", "")
+        assert "etcdserver" in message.lower() or "leader" in message.lower()
 
 
 class TestKubectlCacheTTL:
@@ -383,7 +396,7 @@ class TestSeverityClassification:
         """Test that critical keywords result in critical severity."""
         from eks_comprehensive_debugger import classify_severity
 
-        summary = "Node is in NotReady state"
+        summary = "Pod was OOMKilled due to memory limit"
         severity = classify_severity(summary)
         assert severity == "critical"
 

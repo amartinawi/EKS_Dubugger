@@ -28,9 +28,9 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import boto3
-import pytz
 from botocore.exceptions import BotoCoreError, ClientError, NoRegionError, PartialCredentialsError, ProfileNotFound
 from dateutil import parser as date_parser
 
@@ -20108,7 +20108,7 @@ def parse_flexible_date(date_str: str, tz_name: str = "UTC") -> datetime:
     if not date_str:
         raise DateValidationError("Date string cannot be empty")
 
-    tz = pytz.timezone(tz_name)
+    tz = ZoneInfo(tz_name)
 
     # Handle relative dates
     if date_str.lower() == "now":
@@ -20135,7 +20135,7 @@ def parse_flexible_date(date_str: str, tz_name: str = "UTC") -> datetime:
 
         # If no timezone info, assume the specified timezone
         if dt.tzinfo is None:
-            dt = tz.localize(dt)
+            dt = dt.replace(tzinfo=tz)
 
         # Convert to UTC
         return dt.astimezone(timezone.utc)

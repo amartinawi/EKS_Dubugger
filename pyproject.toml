@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eks-comprehensive-debugger"
-version = "3.7.9"
+version = "3.8.0"
 description = "Production-grade diagnostic tool for Amazon EKS cluster troubleshooting"
 readme = "README.md"
 license = {text = "MIT"}
@@ -34,7 +34,6 @@ classifiers = [
 dependencies = [
     "boto3>=1.26.0",
     "python-dateutil>=2.8.0",
-    "pytz>=2023.0",
 ]
 
 [project.optional-dependencies]

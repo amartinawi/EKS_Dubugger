@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoRegionError, PartialCredentialsError, ProfileNotFound
 from dateutil import parser as date_parser
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
@@ -8637,7 +8638,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         """
         Safely call AWS API with retry logic and optional caching.
 
-        Uses exponential backoff with jitter for throttling resilience.
+        Uses tenacity for exponential backoff with jitter for throttling resilience.
 
         Args:
             func: The API function to call
@@ -8657,63 +8658,55 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             if cached is not None:
                 return cached
 
-        max_retries = 3
-        base_delay = 0.5  # Base delay in seconds
-        max_delay = 30.0  # Maximum delay cap
-        last_error = None
+        # Retryable AWS error codes
+        retryable_codes = frozenset(
+            [
+                "Throttling",
+                "ThrottlingException",
+                "RequestLimitExceeded",
+                "TooManyRequestsException",
+                "ServiceUnavailable",
+                "InternalError",
+                "InternalFailure",
+                "ServiceTimeout",
+            ]
+        )
 
-        for attempt in range(max_retries):
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_random_exponential(min=0.5, max=30.0),
+            retry=retry_if_exception_type(ClientError),
+            reraise=True,
+        )
+        def _call_with_retry():
             try:
-                result = func(*args, **kwargs)
-                outcome = (True, result)
-                if use_cache and self.enable_cache and cache_key:
-                    self._api_cache.set(cache_key, outcome)
-                return outcome
-
+                return func(*args, **kwargs)
             except ClientError as e:
-                last_error = e
                 error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code not in retryable_codes:
+                    raise  # Don't retry non-retryable errors
+                self.progress.info(f"Retrying after {error_code}: {e}")
+                raise  # Let tenacity handle the retry
 
-                # Retry on throttling or transient errors
-                retryable_codes = [
-                    "Throttling",
-                    "ThrottlingException",
-                    "RequestLimitExceeded",
-                    "TooManyRequestsException",
-                    "ServiceUnavailable",
-                    "InternalError",
-                    "InternalFailure",
-                    "ServiceTimeout",
-                ]
+        try:
+            result = _call_with_retry()
+            outcome = (True, result)
+            if use_cache and self.enable_cache and cache_key:
+                self._api_cache.set(cache_key, outcome)
+            return outcome
 
-                if error_code in retryable_codes and attempt < max_retries - 1:
-                    delay = min(base_delay * (2**attempt), max_delay)
-                    jitter = random.uniform(0, delay * 0.1)
-                    total_delay = delay + jitter
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            return (False, f"AWS error {error_code}: {e}")
 
-                    # Double delay for throttling
-                    if "throttl" in error_code.lower() or "limit" in error_code.lower():
-                        total_delay *= 2
+        except (BotoCoreError, ProfileNotFound, PartialCredentialsError, NoRegionError) as e:
+            return (False, f"AWS configuration error: {e}")
 
-                    self.progress.info(f"Retry {attempt + 1}/{max_retries} after {error_code}: {e}")
-                    time.sleep(total_delay)
-                    continue
-
-                # Non-retryable ClientError
-                return (False, f"AWS error {error_code}: {e}")
-
-            except (BotoCoreError, ProfileNotFound, PartialCredentialsError, NoRegionError) as e:
-                # BotoCore/configuration errors are not retryable
-                return (False, f"AWS configuration error: {e}")
-
-            except Exception as e:
-                # Catch-all for unexpected errors - log but don't retry
-                self._add_error(
-                    "api_call", f"Unexpected error in {func.__name__ if hasattr(func, '__name__') else 'API call'}: {e}"
-                )
-                return (False, f"Unexpected error: {e}")
-
-        return (False, f"Max retries exceeded: {last_error}")
+        except Exception as e:
+            self._add_error(
+                "api_call", f"Unexpected error in {func.__name__ if hasattr(func, '__name__') else 'API call'}: {e}"
+            )
+            return (False, f"Unexpected error: {e}")
 
     def _get_all_log_streams(self, log_group_name: str, max_streams: int = MAX_LOG_STREAMS) -> list:
         """

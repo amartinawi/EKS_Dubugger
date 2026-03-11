@@ -3196,8 +3196,21 @@ class HTMLOutputFormatter(OutputFormatter):
                         </div>
                         <div class="summary-block-content">
             """
-            primary_rc = root_cause.get("identified_root_causes", [{}])[0]
-            escaped_root_cause = self._escape_html(primary_rc.get("root_cause", "Unknown"))
+            identified_root_causes = root_cause.get("identified_root_causes", [])
+            first_issue_info = root_cause.get("first_issue")
+
+            # Prefer identified root causes, fall back to first issue
+            if identified_root_causes:
+                primary_rc = identified_root_causes[0]
+                escaped_root_cause = self._escape_html(primary_rc.get("root_cause", "Unknown issue detected"))
+            elif first_issue_info:
+                # Use first issue as potential root cause
+                category = first_issue_info.get("category", "unknown").replace("_", " ").title()
+                summary = first_issue_info.get("summary", "Unknown issue")
+                escaped_root_cause = self._escape_html(f"[{category}] {summary}")
+            else:
+                escaped_root_cause = "Unknown"
+
             html += f"""
                             <div class="root-cause-item" style="margin: 0;">
                                 <div class="root-cause-text" style="font-size: 0.9rem;">{escaped_root_cause}</div>
@@ -3316,9 +3329,11 @@ class HTMLOutputFormatter(OutputFormatter):
         first_issue = results.get("first_issue")
 
         has_story = incident_story and (incident_story.get("timeline") or incident_story.get("summary"))
-        has_correlations = correlations or first_issue
+        has_correlations = bool(correlations)
+        has_first_issue = first_issue is not None
 
-        if not (has_story or has_correlations):
+        # Only generate section if there's actual content to show
+        if not (has_story or has_correlations or has_first_issue):
             return ""
 
         html = """
@@ -3356,6 +3371,21 @@ class HTMLOutputFormatter(OutputFormatter):
                         <div style="margin-top: 0.5rem; display: flex; gap: 1rem; flex-wrap: wrap; font-size: 0.9rem; color: var(--text-secondary);">
                             <span>⏰ {self._escape_html(primary.get("root_cause_time", "Unknown"))}</span>
                             {f"<span>💥 {blast.get('pods', 0)} pods, {blast.get('nodes', 0)} nodes affected</span>" if blast.get("pods") or blast.get("nodes") else ""}
+                        </div>
+                    </div>
+"""
+        elif has_first_issue:
+            # Show first issue as potential root cause when no correlations
+            category = first_issue.get("category", "unknown").replace("_", " ").title()
+            summary = first_issue.get("summary", "Unknown issue")
+            timestamp = first_issue.get("timestamp", "Unknown")
+            html += f"""
+                    <div class="root-cause-summary" style="background: var(--bg-details); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; border-left: 4px solid var(--warning);">
+                        <h3 style="margin: 0 0 0.5rem 0; color: var(--warning);">⚠️ Potential Root Cause</h3>
+                        <p style="margin: 0; font-size: 1.1rem; color: var(--text);">{self._escape_html(f"[{category}] {summary}")}</p>
+                        <div style="margin-top: 0.5rem; font-size: 0.9rem; color: var(--text-secondary);">
+                            <span>⏰ {self._escape_html(timestamp)}</span>
+                            <span style="margin-left: 0.5rem; font-style: italic;">(No correlation pattern detected - this is the earliest issue found)</span>
                         </div>
                     </div>
 """
@@ -8297,6 +8327,32 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._set_kubectl_cache(cmd, output)
         return output
 
+    def _batch_kubectl_calls(self, commands: dict[str, str]) -> dict[str, str | None]:
+        """Execute multiple kubectl calls in parallel.
+
+        Args:
+            commands: Dict mapping result key to kubectl command
+
+        Returns:
+            Dict mapping result key to command output (or None on failure)
+        """
+        results: dict[str, str | None] = {}
+
+        def execute_command(key: str, cmd: str) -> tuple[str, str | None]:
+            return key, self.safe_kubectl_call(cmd)
+
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as executor:
+            futures = {executor.submit(execute_command, key, cmd): key for key, cmd in commands.items()}
+            for future in as_completed(futures):
+                try:
+                    key, output = future.result(timeout=DEFAULT_TIMEOUT)
+                    results[key] = output
+                except Exception:
+                    key = futures[future]
+                    results[key] = None
+
+        return results
+
     def collect_cluster_statistics(self):
         """
         Collect comprehensive cluster statistics for reporting.
@@ -8325,463 +8381,299 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         }
 
         try:
-            # === Infrastructure Statistics ===
-            # Namespaces
-            ns_output = self.safe_kubectl_call("kubectl get namespaces -o json")
-            if ns_output:
+            ns_arg = f"-n {self.namespace}" if self.namespace else "--all-namespaces"
+
+            commands = {
+                "namespaces": "kubectl get namespaces -o json",
+                "nodes": "kubectl get nodes -o json",
+                "deployments": f"kubectl get deployments {ns_arg} -o json",
+                "statefulsets": f"kubectl get statefulsets {ns_arg} -o json",
+                "daemonsets": f"kubectl get daemonsets {ns_arg} -o json",
+                "jobs": f"kubectl get jobs {ns_arg} -o json",
+                "cronjobs": f"kubectl get cronjobs {ns_arg} -o json",
+                "replicasets": f"kubectl get replicasets {ns_arg} -o json",
+                "pods": f"kubectl get pods {ns_arg} -o json",
+                "services": f"kubectl get services {ns_arg} -o json",
+                "ingresses": f"kubectl get ingresses {ns_arg} -o json",
+                "networkpolicies": f"kubectl get networkpolicies {ns_arg} -o json",
+                "endpoints": f"kubectl get endpoints {ns_arg} -o json",
+                "pvc": f"kubectl get pvc {ns_arg} -o json",
+                "pv": "kubectl get pv -o json",
+                "storageclasses": "kubectl get storageclasses -o json",
+                "configmaps": f"kubectl get configmaps {ns_arg} -o json",
+                "secrets": f"kubectl get secrets {ns_arg} -o json",
+                "serviceaccounts": f"kubectl get serviceaccounts {ns_arg} -o json",
+                "roles": f"kubectl get roles {ns_arg} -o json",
+                "rolebindings": f"kubectl get rolebindings {ns_arg} -o json",
+                "clusterroles": "kubectl get clusterroles -o json",
+                "clusterrolebindings": "kubectl get clusterrolebindings -o json",
+            }
+
+            outputs = self._batch_kubectl_calls(commands)
+
+            def parse_json(output: str | None) -> dict | None:
+                if not output:
+                    return None
                 try:
-                    ns_data = json.loads(ns_output)
-                    namespaces = ns_data.get("items", [])
-                    statistics["infrastructure"]["namespaces"] = len(namespaces)
-                    statistics["infrastructure"]["namespace_list"] = [
-                        ns.get("metadata", {}).get("name") for ns in namespaces
-                    ]
+                    return json.loads(output)
                 except json.JSONDecodeError:
-                    pass
+                    return None
 
-            # Nodes
-            nodes_output = self.safe_kubectl_call("kubectl get nodes -o json")
-            if nodes_output:
-                try:
-                    nodes_data = json.loads(nodes_output)
-                    nodes = nodes_data.get("items", [])
-                    statistics["infrastructure"]["nodes"] = len(nodes)
+            ns_data = parse_json(outputs.get("namespaces"))
+            if ns_data:
+                namespaces = ns_data.get("items", [])
+                statistics["infrastructure"]["namespaces"] = len(namespaces)
+                statistics["infrastructure"]["namespace_list"] = [
+                    ns.get("metadata", {}).get("name") for ns in namespaces
+                ]
 
-                    # Node conditions summary
-                    ready_nodes = 0
-                    not_ready_nodes = 0
-                    node_versions = set()
-                    node_types = {"ec2": 0, "fargate": 0}
+            nodes_data = parse_json(outputs.get("nodes"))
+            if nodes_data:
+                nodes = nodes_data.get("items", [])
+                statistics["infrastructure"]["nodes"] = len(nodes)
 
-                    for node in nodes:
-                        conditions = node.get("status", {}).get("conditions", [])
-                        for cond in conditions:
-                            if cond.get("type") == "Ready":
-                                if cond.get("status") == "True":
-                                    ready_nodes += 1
-                                else:
-                                    not_ready_nodes += 1
+                ready_nodes = 0
+                not_ready_nodes = 0
+                node_versions = set()
+                node_types = {"ec2": 0, "fargate": 0}
 
-                        node_info = node.get("metadata", {}).get("labels", {})
-                        node_version = node_info.get("node.kubernetes.io/instance-type", "unknown")
-                        node_versions.add(node_version)
-
-                        # Detect Fargate nodes
-                        if "eks.amazonaws.com/compute-type" in node_info:
-                            if node_info["eks.amazonaws.com/compute-type"] == "fargate":
-                                node_types["fargate"] += 1
+                for node in nodes:
+                    conditions = node.get("status", {}).get("conditions", [])
+                    for cond in conditions:
+                        if cond.get("type") == "Ready":
+                            if cond.get("status") == "True":
+                                ready_nodes += 1
                             else:
-                                node_types["ec2"] += 1
+                                not_ready_nodes += 1
+
+                    node_info = node.get("metadata", {}).get("labels", {})
+                    node_version = node_info.get("node.kubernetes.io/instance-type", "unknown")
+                    node_versions.add(node_version)
+
+                    if "eks.amazonaws.com/compute-type" in node_info:
+                        if node_info["eks.amazonaws.com/compute-type"] == "fargate":
+                            node_types["fargate"] += 1
                         else:
                             node_types["ec2"] += 1
+                    else:
+                        node_types["ec2"] += 1
 
-                    statistics["infrastructure"]["nodes_ready"] = ready_nodes
-                    statistics["infrastructure"]["nodes_not_ready"] = not_ready_nodes
-                    statistics["infrastructure"]["node_instance_types"] = list(node_versions)
-                    statistics["infrastructure"]["node_compute_types"] = node_types
+                statistics["infrastructure"]["nodes_ready"] = ready_nodes
+                statistics["infrastructure"]["nodes_not_ready"] = not_ready_nodes
+                statistics["infrastructure"]["node_instance_types"] = list(node_versions)
+                statistics["infrastructure"]["node_compute_types"] = node_types
 
-                    # Kubelet versions
-                    kube_versions = set()
-                    for node in nodes:
-                        kv = node.get("status", {}).get("nodeInfo", {}).get("kubeletVersion", "unknown")
-                        kube_versions.add(kv)
-                    statistics["infrastructure"]["kubelet_versions"] = list(kube_versions)
+                kube_versions = set()
+                for node in nodes:
+                    kv = node.get("status", {}).get("nodeInfo", {}).get("kubeletVersion", "unknown")
+                    kube_versions.add(kv)
+                statistics["infrastructure"]["kubelet_versions"] = list(kube_versions)
 
-                except json.JSONDecodeError:
-                    pass
+            dep_data = parse_json(outputs.get("deployments"))
+            if dep_data:
+                deployments = dep_data.get("items", [])
+                statistics["workloads"]["deployments"] = len(deployments)
 
-            # === Workload Statistics ===
-            # Deployments
-            if self.namespace:
-                cmd = f"kubectl get deployments -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get deployments --all-namespaces -o json"
-            dep_output = self.safe_kubectl_call(cmd)
-            if dep_output:
-                try:
-                    dep_data = json.loads(dep_output)
-                    deployments = dep_data.get("items", [])
-                    statistics["workloads"]["deployments"] = len(deployments)
+                healthy_deps = 0
+                unhealthy_deps = 0
+                for dep in deployments:
+                    conditions = dep.get("status", {}).get("conditions", [])
+                    progressing = False
+                    available = False
+                    for cond in conditions:
+                        if cond.get("type") == "Progressing" and cond.get("status") == "True":
+                            progressing = True
+                        if cond.get("type") == "Available" and cond.get("status") == "True":
+                            available = True
+                    if progressing and available:
+                        healthy_deps += 1
+                    else:
+                        unhealthy_deps += 1
 
-                    # Count by status
-                    healthy_deps = 0
-                    unhealthy_deps = 0
-                    for dep in deployments:
-                        conditions = dep.get("status", {}).get("conditions", [])
-                        progressing = False
-                        available = False
-                        for cond in conditions:
-                            if cond.get("type") == "Progressing" and cond.get("status") == "True":
-                                progressing = True
-                            if cond.get("type") == "Available" and cond.get("status") == "True":
-                                available = True
-                        if progressing and available:
-                            healthy_deps += 1
-                        else:
-                            unhealthy_deps += 1
+                statistics["workloads"]["deployments_healthy"] = healthy_deps
+                statistics["workloads"]["deployments_unhealthy"] = unhealthy_deps
 
-                    statistics["workloads"]["deployments_healthy"] = healthy_deps
-                    statistics["workloads"]["deployments_unhealthy"] = unhealthy_deps
-                except json.JSONDecodeError:
-                    pass
+            sts_data = parse_json(outputs.get("statefulsets"))
+            if sts_data:
+                statefulsets = sts_data.get("items", [])
+                statistics["workloads"]["statefulsets"] = len(statefulsets)
 
-            # StatefulSets
-            if self.namespace:
-                cmd = f"kubectl get statefulsets -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get statefulsets --all-namespaces -o json"
-            sts_output = self.safe_kubectl_call(cmd)
-            if sts_output:
-                try:
-                    sts_data = json.loads(sts_output)
-                    statefulsets = sts_data.get("items", [])
-                    statistics["workloads"]["statefulsets"] = len(statefulsets)
+                ready_sts = 0
+                for sts in statefulsets:
+                    replicas = sts.get("status", {}).get("replicas", 0)
+                    ready = sts.get("status", {}).get("readyReplicas", 0)
+                    if replicas == ready:
+                        ready_sts += 1
+                statistics["workloads"]["statefulsets_ready"] = ready_sts
 
-                    ready_sts = 0
-                    for sts in statefulsets:
-                        replicas = sts.get("status", {}).get("replicas", 0)
-                        ready = sts.get("status", {}).get("readyReplicas", 0)
-                        if replicas == ready:
-                            ready_sts += 1
-                    statistics["workloads"]["statefulsets_ready"] = ready_sts
-                except json.JSONDecodeError:
-                    pass
+            ds_data = parse_json(outputs.get("daemonsets"))
+            if ds_data:
+                daemonsets = ds_data.get("items", [])
+                statistics["workloads"]["daemonsets"] = len(daemonsets)
 
-            # DaemonSets
-            if self.namespace:
-                cmd = f"kubectl get daemonsets -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get daemonsets --all-namespaces -o json"
-            ds_output = self.safe_kubectl_call(cmd)
-            if ds_output:
-                try:
-                    ds_data = json.loads(ds_output)
-                    daemonsets = ds_data.get("items", [])
-                    statistics["workloads"]["daemonsets"] = len(daemonsets)
-                except json.JSONDecodeError:
-                    pass
+            jobs_data = parse_json(outputs.get("jobs"))
+            if jobs_data:
+                jobs = jobs_data.get("items", [])
+                statistics["workloads"]["jobs"] = len(jobs)
 
-            # Jobs
-            if self.namespace:
-                cmd = f"kubectl get jobs -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get jobs --all-namespaces -o json"
-            jobs_output = self.safe_kubectl_call(cmd)
-            if jobs_output:
-                try:
-                    jobs_data = json.loads(jobs_output)
-                    jobs = jobs_data.get("items", [])
-                    statistics["workloads"]["jobs"] = len(jobs)
+                completed_jobs = sum(1 for j in jobs if j.get("status", {}).get("succeeded"))
+                failed_jobs = sum(1 for j in jobs if j.get("status", {}).get("failed"))
+                running_jobs = len(jobs) - completed_jobs - failed_jobs
 
-                    completed_jobs = sum(1 for j in jobs if j.get("status", {}).get("succeeded"))
-                    failed_jobs = sum(1 for j in jobs if j.get("status", {}).get("failed"))
-                    running_jobs = len(jobs) - completed_jobs - failed_jobs
+                statistics["workloads"]["jobs_completed"] = completed_jobs
+                statistics["workloads"]["jobs_failed"] = failed_jobs
+                statistics["workloads"]["jobs_running"] = running_jobs
 
-                    statistics["workloads"]["jobs_completed"] = completed_jobs
-                    statistics["workloads"]["jobs_failed"] = failed_jobs
-                    statistics["workloads"]["jobs_running"] = running_jobs
-                except json.JSONDecodeError:
-                    pass
+            cj_data = parse_json(outputs.get("cronjobs"))
+            if cj_data:
+                cronjobs = cj_data.get("items", [])
+                statistics["workloads"]["cronjobs"] = len(cronjobs)
 
-            # CronJobs
-            if self.namespace:
-                cmd = f"kubectl get cronjobs -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get cronjobs --all-namespaces -o json"
-            cj_output = self.safe_kubectl_call(cmd)
-            if cj_output:
-                try:
-                    cj_data = json.loads(cj_output)
-                    cronjobs = cj_data.get("items", [])
-                    statistics["workloads"]["cronjobs"] = len(cronjobs)
-                except json.JSONDecodeError:
-                    pass
+            rs_data = parse_json(outputs.get("replicasets"))
+            if rs_data:
+                replicasets = rs_data.get("items", [])
+                statistics["workloads"]["replicasets"] = len(replicasets)
 
-            # ReplicaSets
-            if self.namespace:
-                cmd = f"kubectl get replicasets -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get replicasets --all-namespaces -o json"
-            rs_output = self.safe_kubectl_call(cmd)
-            if rs_output:
-                try:
-                    rs_data = json.loads(rs_output)
-                    replicasets = rs_data.get("items", [])
-                    statistics["workloads"]["replicasets"] = len(replicasets)
-                except json.JSONDecodeError:
-                    pass
+            pods_data = parse_json(outputs.get("pods"))
+            if pods_data:
+                pods = pods_data.get("items", [])
+                statistics["workloads"]["pods"] = len(pods)
 
-            # Pods
-            if self.namespace:
-                cmd = f"kubectl get pods -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get pods --all-namespaces -o json"
-            pods_output = self.safe_kubectl_call(cmd)
-            if pods_output:
-                try:
-                    pods_data = json.loads(pods_output)
-                    pods = pods_data.get("items", [])
-                    statistics["workloads"]["pods"] = len(pods)
+                phases = {"Running": 0, "Pending": 0, "Succeeded": 0, "Failed": 0, "Unknown": 0}
+                restart_count = 0
 
-                    # Count by phase
-                    phases = {"Running": 0, "Pending": 0, "Succeeded": 0, "Failed": 0, "Unknown": 0}
-                    restart_count = 0
+                for pod in pods:
+                    phase = pod.get("status", {}).get("phase", "Unknown")
+                    if phase in phases:
+                        phases[phase] += 1
 
-                    for pod in pods:
-                        phase = pod.get("status", {}).get("phase", "Unknown")
-                        if phase in phases:
-                            phases[phase] += 1
+                    for cs in pod.get("status", {}).get("containerStatuses", []):
+                        restart_count += cs.get("restartCount", 0)
 
-                        # Sum restart counts
-                        for cs in pod.get("status", {}).get("containerStatuses", []):
-                            restart_count += cs.get("restartCount", 0)
+                statistics["workloads"]["pods_running"] = phases["Running"]
+                statistics["workloads"]["pods_pending"] = phases["Pending"]
+                statistics["workloads"]["pods_succeeded"] = phases["Succeeded"]
+                statistics["workloads"]["pods_failed"] = phases["Failed"]
+                statistics["workloads"]["pods_unknown"] = phases["Unknown"]
+                statistics["workloads"]["total_container_restarts"] = restart_count
 
-                    statistics["workloads"]["pods_running"] = phases["Running"]
-                    statistics["workloads"]["pods_pending"] = phases["Pending"]
-                    statistics["workloads"]["pods_succeeded"] = phases["Succeeded"]
-                    statistics["workloads"]["pods_failed"] = phases["Failed"]
-                    statistics["workloads"]["pods_unknown"] = phases["Unknown"]
-                    statistics["workloads"]["total_container_restarts"] = restart_count
-                except json.JSONDecodeError:
-                    pass
+            svc_data = parse_json(outputs.get("services"))
+            if svc_data:
+                services = svc_data.get("items", [])
+                statistics["networking"]["services"] = len(services)
 
-            # === Networking Statistics ===
-            # Services
-            if self.namespace:
-                cmd = f"kubectl get services -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get services --all-namespaces -o json"
-            svc_output = self.safe_kubectl_call(cmd)
-            if svc_output:
-                try:
-                    svc_data = json.loads(svc_output)
-                    services = svc_data.get("items", [])
-                    statistics["networking"]["services"] = len(services)
+                svc_types = {"ClusterIP": 0, "NodePort": 0, "LoadBalancer": 0, "ExternalName": 0}
+                for svc in services:
+                    svc_type = svc.get("spec", {}).get("type", "ClusterIP")
+                    if svc_type in svc_types:
+                        svc_types[svc_type] += 1
 
-                    # Count by type
-                    svc_types = {"ClusterIP": 0, "NodePort": 0, "LoadBalancer": 0, "ExternalName": 0}
-                    for svc in services:
-                        svc_type = svc.get("spec", {}).get("type", "ClusterIP")
-                        if svc_type in svc_types:
-                            svc_types[svc_type] += 1
+                statistics["networking"]["services_clusterip"] = svc_types["ClusterIP"]
+                statistics["networking"]["services_nodeport"] = svc_types["NodePort"]
+                statistics["networking"]["services_loadbalancer"] = svc_types["LoadBalancer"]
 
-                    statistics["networking"]["services_clusterip"] = svc_types["ClusterIP"]
-                    statistics["networking"]["services_nodeport"] = svc_types["NodePort"]
-                    statistics["networking"]["services_loadbalancer"] = svc_types["LoadBalancer"]
-                except json.JSONDecodeError:
-                    pass
+            ing_data = parse_json(outputs.get("ingresses"))
+            if ing_data:
+                ingresses = ing_data.get("items", [])
+                statistics["networking"]["ingresses"] = len(ingresses)
 
-            # Ingresses
-            if self.namespace:
-                cmd = f"kubectl get ingresses -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get ingresses --all-namespaces -o json"
-            ing_output = self.safe_kubectl_call(cmd)
-            if ing_output:
-                try:
-                    ing_data = json.loads(ing_output)
-                    ingresses = ing_data.get("items", [])
-                    statistics["networking"]["ingresses"] = len(ingresses)
-                except json.JSONDecodeError:
-                    pass
+            np_data = parse_json(outputs.get("networkpolicies"))
+            if np_data:
+                netpols = np_data.get("items", [])
+                statistics["networking"]["networkpolicies"] = len(netpols)
 
-            # NetworkPolicies
-            if self.namespace:
-                cmd = f"kubectl get networkpolicies -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get networkpolicies --all-namespaces -o json"
-            np_output = self.safe_kubectl_call(cmd)
-            if np_output:
-                try:
-                    np_data = json.loads(np_output)
-                    netpols = np_data.get("items", [])
-                    statistics["networking"]["networkpolicies"] = len(netpols)
-                except json.JSONDecodeError:
-                    pass
+            ep_data = parse_json(outputs.get("endpoints"))
+            if ep_data:
+                endpoints = ep_data.get("items", [])
+                statistics["networking"]["endpoints"] = len(endpoints)
 
-            # Endpoints
-            if self.namespace:
-                cmd = f"kubectl get endpoints -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get endpoints --all-namespaces -o json"
-            ep_output = self.safe_kubectl_call(cmd)
-            if ep_output:
-                try:
-                    ep_data = json.loads(ep_output)
-                    endpoints = ep_data.get("items", [])
-                    statistics["networking"]["endpoints"] = len(endpoints)
-
-                    # Count endpoints with no addresses
-                    empty_endpoints = 0
-                    for ep in endpoints:
-                        subsets = ep.get("subsets", [])
-                        has_addresses = False
-                        for subset in subsets:
-                            if subset.get("addresses"):
-                                has_addresses = True
-                                break
-                        if not has_addresses:
-                            empty_endpoints += 1
-
-                    statistics["networking"]["endpoints_empty"] = empty_endpoints
-                except json.JSONDecodeError:
-                    pass
-
-            # === Storage Statistics ===
-            # PVCs
-            if self.namespace:
-                cmd = f"kubectl get pvc -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get pvc --all-namespaces -o json"
-            pvc_output = self.safe_kubectl_call(cmd)
-            if pvc_output:
-                try:
-                    pvc_data = json.loads(pvc_output)
-                    pvcs = pvc_data.get("items", [])
-                    statistics["storage"]["pvcs"] = len(pvcs)
-
-                    # Count by phase
-                    phases = {"Bound": 0, "Pending": 0, "Lost": 0}
-                    for pvc in pvcs:
-                        phase = pvc.get("status", {}).get("phase", "Unknown")
-                        if phase in phases:
-                            phases[phase] += 1
-
-                    statistics["storage"]["pvcs_bound"] = phases["Bound"]
-                    statistics["storage"]["pvcs_pending"] = phases["Pending"]
-                    statistics["storage"]["pvcs_lost"] = phases["Lost"]
-                except json.JSONDecodeError:
-                    pass
-
-            # PVs
-            pv_output = self.safe_kubectl_call("kubectl get pv -o json")
-            if pv_output:
-                try:
-                    pv_data = json.loads(pv_output)
-                    pvs = pv_data.get("items", [])
-                    statistics["storage"]["pvs"] = len(pvs)
-                except json.JSONDecodeError:
-                    pass
-
-            # StorageClasses
-            sc_output = self.safe_kubectl_call("kubectl get storageclasses -o json")
-            if sc_output:
-                try:
-                    sc_data = json.loads(sc_output)
-                    storageclasses = sc_data.get("items", [])
-                    statistics["storage"]["storageclasses"] = len(storageclasses)
-
-                    # Default storage class
-                    default_sc = None
-                    for sc in storageclasses:
-                        annotations = sc.get("metadata", {}).get("annotations", {})
-                        if annotations.get("storageclass.kubernetes.io/is-default-class") == "true":
-                            default_sc = sc.get("metadata", {}).get("name")
+                empty_endpoints = 0
+                for ep in endpoints:
+                    subsets = ep.get("subsets", [])
+                    has_addresses = False
+                    for subset in subsets:
+                        if subset.get("addresses"):
+                            has_addresses = True
                             break
-                    statistics["storage"]["default_storageclass"] = default_sc
-                except json.JSONDecodeError:
-                    pass
+                    if not has_addresses:
+                        empty_endpoints += 1
 
-            # === Configuration Statistics ===
-            # ConfigMaps
-            if self.namespace:
-                cmd = f"kubectl get configmaps -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get configmaps --all-namespaces -o json"
-            cm_output = self.safe_kubectl_call(cmd)
-            if cm_output:
-                try:
-                    cm_data = json.loads(cm_output)
-                    configmaps = cm_data.get("items", [])
-                    statistics["configuration"]["configmaps"] = len(configmaps)
-                except json.JSONDecodeError:
-                    pass
+                statistics["networking"]["endpoints_empty"] = empty_endpoints
 
-            # Secrets
-            if self.namespace:
-                cmd = f"kubectl get secrets -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get secrets --all-namespaces -o json"
-            sec_output = self.safe_kubectl_call(cmd)
-            if sec_output:
-                try:
-                    sec_data = json.loads(sec_output)
-                    secrets = sec_data.get("items", [])
-                    statistics["configuration"]["secrets"] = len(secrets)
+            pvc_data = parse_json(outputs.get("pvc"))
+            if pvc_data:
+                pvcs = pvc_data.get("items", [])
+                statistics["storage"]["pvcs"] = len(pvcs)
 
-                    # Count by type
-                    secret_types = {}
-                    for secret in secrets:
-                        stype = secret.get("type", "Unknown")
-                        secret_types[stype] = secret_types.get(stype, 0) + 1
-                    statistics["configuration"]["secrets_by_type"] = secret_types
-                except json.JSONDecodeError:
-                    pass
+                phases = {"Bound": 0, "Pending": 0, "Lost": 0}
+                for pvc in pvcs:
+                    phase = pvc.get("status", {}).get("phase", "Unknown")
+                    if phase in phases:
+                        phases[phase] += 1
 
-            # === RBAC Statistics ===
-            # ServiceAccounts
-            if self.namespace:
-                cmd = f"kubectl get serviceaccounts -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get serviceaccounts --all-namespaces -o json"
-            sa_output = self.safe_kubectl_call(cmd)
-            if sa_output:
-                try:
-                    sa_data = json.loads(sa_output)
-                    serviceaccounts = sa_data.get("items", [])
-                    statistics["rbac"]["serviceaccounts"] = len(serviceaccounts)
-                except json.JSONDecodeError:
-                    pass
+                statistics["storage"]["pvcs_bound"] = phases["Bound"]
+                statistics["storage"]["pvcs_pending"] = phases["Pending"]
+                statistics["storage"]["pvcs_lost"] = phases["Lost"]
 
-            # Roles
-            if self.namespace:
-                cmd = f"kubectl get roles -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get roles --all-namespaces -o json"
-            roles_output = self.safe_kubectl_call(cmd)
-            if roles_output:
-                try:
-                    roles_data = json.loads(roles_output)
-                    roles = roles_data.get("items", [])
-                    statistics["rbac"]["roles"] = len(roles)
-                except json.JSONDecodeError:
-                    pass
+            pv_data = parse_json(outputs.get("pv"))
+            if pv_data:
+                pvs = pv_data.get("items", [])
+                statistics["storage"]["pvs"] = len(pvs)
 
-            # RoleBindings
-            if self.namespace:
-                cmd = f"kubectl get rolebindings -n {self.namespace} -o json"
-            else:
-                cmd = "kubectl get rolebindings --all-namespaces -o json"
-            rb_output = self.safe_kubectl_call(cmd)
-            if rb_output:
-                try:
-                    rb_data = json.loads(rb_output)
-                    rolebindings = rb_data.get("items", [])
-                    statistics["rbac"]["rolebindings"] = len(rolebindings)
-                except json.JSONDecodeError:
-                    pass
+            sc_data = parse_json(outputs.get("storageclasses"))
+            if sc_data:
+                storageclasses = sc_data.get("items", [])
+                statistics["storage"]["storageclasses"] = len(storageclasses)
 
-            # ClusterRoles
-            cr_output = self.safe_kubectl_call("kubectl get clusterroles -o json")
-            if cr_output:
-                try:
-                    cr_data = json.loads(cr_output)
-                    clusterroles = cr_data.get("items", [])
-                    statistics["rbac"]["clusterroles"] = len(clusterroles)
-                except json.JSONDecodeError:
-                    pass
+                default_sc = None
+                for sc in storageclasses:
+                    annotations = sc.get("metadata", {}).get("annotations", {})
+                    if annotations.get("storageclass.kubernetes.io/is-default-class") == "true":
+                        default_sc = sc.get("metadata", {}).get("name")
+                        break
+                statistics["storage"]["default_storageclass"] = default_sc
 
-            # ClusterRoleBindings
-            crb_output = self.safe_kubectl_call("kubectl get clusterrolebindings -o json")
-            if crb_output:
-                try:
-                    crb_data = json.loads(crb_output)
-                    clusterrolebindings = crb_data.get("items", [])
-                    statistics["rbac"]["clusterrolebindings"] = len(clusterrolebindings)
-                except json.JSONDecodeError:
-                    pass
+            cm_data = parse_json(outputs.get("configmaps"))
+            if cm_data:
+                configmaps = cm_data.get("items", [])
+                statistics["configuration"]["configmaps"] = len(configmaps)
 
-            # Store in shared data for use by other methods
+            sec_data = parse_json(outputs.get("secrets"))
+            if sec_data:
+                secrets = sec_data.get("items", [])
+                statistics["configuration"]["secrets"] = len(secrets)
+
+                secret_types = {}
+                for secret in secrets:
+                    stype = secret.get("type", "Unknown")
+                    secret_types[stype] = secret_types.get(stype, 0) + 1
+                statistics["configuration"]["secrets_by_type"] = secret_types
+
+            sa_data = parse_json(outputs.get("serviceaccounts"))
+            if sa_data:
+                serviceaccounts = sa_data.get("items", [])
+                statistics["rbac"]["serviceaccounts"] = len(serviceaccounts)
+
+            roles_data = parse_json(outputs.get("roles"))
+            if roles_data:
+                roles = roles_data.get("items", [])
+                statistics["rbac"]["roles"] = len(roles)
+
+            rb_data = parse_json(outputs.get("rolebindings"))
+            if rb_data:
+                rolebindings = rb_data.get("items", [])
+                statistics["rbac"]["rolebindings"] = len(rolebindings)
+
+            cr_data = parse_json(outputs.get("clusterroles"))
+            if cr_data:
+                clusterroles = cr_data.get("items", [])
+                statistics["rbac"]["clusterroles"] = len(clusterroles)
+
+            crb_data = parse_json(outputs.get("clusterrolebindings"))
+            if crb_data:
+                clusterrolebindings = crb_data.get("items", [])
+                statistics["rbac"]["clusterrolebindings"] = len(clusterrolebindings)
+
             with self._shared_data_lock:
                 self._shared_data["cluster_statistics"] = statistics
 
@@ -10073,7 +9965,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         log_group = f"/aws/eks/{self.cluster_name}/cluster"
 
         try:
-            # Use cached log group data if available
             response = self._get_cached_log_group(log_group)
 
             if not response or not response.get("logGroups"):
@@ -10091,11 +9982,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             if not success:
                 return
 
-            error_patterns = ["error", "fail", "denied", "forbidden", "unauthorized"]
+            streams = streams_response.get("logStreams", [])
+            if not streams:
+                return
 
-            for stream in streams_response.get("logStreams", []):
-                stream_name = stream["logStreamName"]
-
+            def fetch_stream_logs(stream_name: str) -> list[dict]:
                 success, logs_response = self.safe_api_call(
                     self.logs_client.get_log_events,
                     logGroupName=log_group,
@@ -10105,11 +9996,27 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     limit=50,
                     startFromHead=False,
                 )
-
                 if not success:
-                    continue
+                    return []
+                return logs_response.get("events", [])
 
-                for event in logs_response.get("events", []):
+            stream_names = [s["logStreamName"] for s in streams]
+            all_events: list[tuple[str, list[dict]]] = []
+
+            with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as executor:
+                future_to_stream = {executor.submit(fetch_stream_logs, name): name for name in stream_names}
+                for future in as_completed(future_to_stream):
+                    stream_name = future_to_stream[future]
+                    try:
+                        events = future.result(timeout=DEFAULT_TIMEOUT)
+                        all_events.append((stream_name, events))
+                    except Exception:
+                        pass
+
+            error_patterns = ["error", "fail", "denied", "forbidden", "unauthorized"]
+
+            for stream_name, events in all_events:
+                for event in events:
                     message = event["message"]
                     message_lower = message.lower()
 
@@ -10265,9 +10172,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             correlation_findings = []
 
+            # PERFORMANCE OPTIMIZATION: Start all queries in parallel, then poll for results
+            # This reduces total time from ~120s (sequential) to ~30s (parallel with 4 queries)
+            query_start_time = time.time()
+            query_ids = {}  # query_id -> query_def mapping
+
+            # Step 1: Start all queries in parallel
             for query_def in queries:
                 try:
-                    # Start the query
                     start_query_params = {
                         "logGroupNames": log_groups,
                         "startTime": int(self.start_date.timestamp()),
@@ -10277,20 +10189,37 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     success, start_response = self.safe_api_call(self.logs_client.start_query, **start_query_params)
 
-                    if not success:
+                    if success:
+                        query_id = start_response.get("queryId")
+                        if query_id:
+                            query_ids[query_id] = query_def
+                        else:
+                            self.progress.warning(f"Failed to start query: {query_def['name']} (no queryId)")
+                    else:
                         self.progress.warning(f"Failed to start query: {query_def['name']}")
+
+                except Exception as e:
+                    self.progress.warning(f"Failed to start Insights query {query_def['name']}: {e}")
+                    continue
+
+            if not query_ids:
+                self.progress.info("No Insights queries started successfully")
+                return
+
+            self.progress.info(f"Started {len(query_ids)} Insights queries in parallel")
+
+            # Step 2: Poll for all query results concurrently
+            max_wait = 30  # seconds total for all queries
+            poll_interval = 1  # seconds between polls
+            waited = 0
+            completed_queries = set()
+
+            while waited < max_wait and len(completed_queries) < len(query_ids):
+                for query_id, query_def in list(query_ids.items()):
+                    if query_id in completed_queries:
                         continue
 
-                    query_id = start_response.get("queryId")
-                    if not query_id:
-                        continue
-
-                    # Poll for query results (with timeout)
-                    max_wait = 30  # seconds
-                    waited = 0
-                    query_results = None
-
-                    while waited < max_wait:
+                    try:
                         success, results_response = self.safe_api_call(
                             self.logs_client.get_query_results, queryId=query_id
                         )
@@ -10299,37 +10228,44 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             status = results_response.get("status")
                             if status == "Complete":
                                 query_results = results_response.get("results", [])
-                                break
+                                completed_queries.add(query_id)
+
+                                # Process query results
+                                for result in query_results[:5]:  # Top 5 results
+                                    timestamp_field = next((f for f in result if f["field"] == "@timestamp"), None)
+                                    message_field = next((f for f in result if f["field"] == "@message"), None)
+
+                                    if timestamp_field and message_field:
+                                        correlation_findings.append(
+                                            {
+                                                "query_name": query_def["name"],
+                                                "description": query_def["description"],
+                                                "timestamp": timestamp_field["value"],
+                                                "message": message_field["value"][:200],
+                                                "severity": query_def["severity"],
+                                            }
+                                        )
+
                             elif status in ["Failed", "Cancelled"]:
                                 self.progress.warning(f"Query {query_def['name']} {status.lower()}")
-                                break
+                                completed_queries.add(query_id)
 
-                        time.sleep(2)
-                        waited += 2
+                    except Exception as e:
+                        self.progress.warning(f"Failed to poll query {query_def['name']}: {e}")
+                        completed_queries.add(query_id)
 
-                    if not query_results:
-                        continue
+                if len(completed_queries) < len(query_ids):
+                    time.sleep(poll_interval)
+                    waited += poll_interval
 
-                    # Process query results
-                    if query_results:
-                        for result in query_results[:5]:  # Top 5 results
-                            timestamp_field = next((f for f in result if f["field"] == "@timestamp"), None)
-                            message_field = next((f for f in result if f["field"] == "@message"), None)
+            # Log timing for performance tracking
+            total_duration = time.time() - query_start_time
+            self._perf_tracker.record("analyze_logs_insights_correlation", total_duration)
 
-                            if timestamp_field and message_field:
-                                correlation_findings.append(
-                                    {
-                                        "query_name": query_def["name"],
-                                        "description": query_def["description"],
-                                        "timestamp": timestamp_field["value"],
-                                        "message": message_field["value"][:200],
-                                        "severity": query_def["severity"],
-                                    }
-                                )
-
-                except Exception as e:
-                    self.progress.warning(f"Failed to run Insights query {query_def['name']}: {e}")
-                    continue
+            if completed_queries:
+                self.progress.info(
+                    f"Completed {len(completed_queries)}/{len(query_ids)} Insights queries in {total_duration:.1f}s"
+                )
 
             # Add correlation findings
             for finding in correlation_findings[:20]:  # Limit to top 20
@@ -11893,6 +11829,29 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 pass
         return None
 
+    def _is_finding_in_time_window(self, finding: dict) -> bool:
+        """Check if a finding's timestamp falls within the analysis time window.
+
+        Args:
+            finding: Finding dict with 'details' containing timestamp
+
+        Returns:
+            True if finding is within time window or has no timestamp, False otherwise
+        """
+        details = finding.get("details", {})
+        timestamp = self._extract_timestamp(details)
+
+        if not timestamp:
+            # No timestamp - assume it's in window (current state or untimestamped)
+            return True
+
+        # Ensure timestamp has timezone
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+        # Check if within window
+        return self.start_date <= timestamp <= self.end_date
+
     def _get_node_from_pod(self, pod_details):
         """Extract node name from pod details if available"""
         return pod_details.get("node") or pod_details.get("nodeName")
@@ -13311,18 +13270,33 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         timeline_events.sort(key=lambda x: x["timestamp"])
 
         # Correlation Rule 1: Node Pressure → Pod Evictions
-        if self.findings["memory_pressure"] or self.findings["disk_pressure"]:
-            pressure_type = "memory" if self.findings["memory_pressure"] else "disk"
+        # Only check HISTORICAL findings within time window
+        pressure_findings = [
+            f
+            for f in (self.findings["memory_pressure"] + self.findings["disk_pressure"])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
+
+        if pressure_findings:
+            pressure_type = (
+                "memory" if any(f in self.findings["memory_pressure"] for f in pressure_findings) else "disk"
+            )
             affected_nodes = set()
 
-            for finding in self.findings.get(f"{pressure_type}_pressure", []):
+            for finding in pressure_findings:
                 node = finding.get("details", {}).get("node")
                 if node:
                     affected_nodes.add(node)
 
-            # Find evicted pods on those nodes
+            # Find evicted pods on those nodes (only HISTORICAL findings within time window)
             evicted_on_nodes = []
             for finding in self.findings.get("pod_errors", []):
+                if finding.get("details", {}).get("finding_type") != FindingType.HISTORICAL_EVENT:
+                    continue
+                if not self._is_finding_in_time_window(finding):
+                    continue
+
                 details = finding.get("details", {})
                 if "evict" in details.get("reason", "").lower():
                     node = self._get_node_from_pod(details)
@@ -13332,7 +13306,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             if evicted_on_nodes:
                 # Find earliest pressure event as root cause
                 pressure_times = []
-                for f in self.findings.get(f"{pressure_type}_pressure", []):
+                for f in pressure_findings:
                     ts = self._extract_timestamp(f.get("details", {}))
                     if ts:
                         pressure_times.append(ts)
@@ -13653,8 +13627,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         ]
 
         # Check for upgrade-related events in findings
+        # CRITICAL: Only check HISTORICAL findings that are within the time window
         for category, findings_list in self.findings.items():
             for finding in findings_list:
+                # Skip current-state findings for upgrade detection
+                if finding.get("details", {}).get("finding_type") != FindingType.HISTORICAL_EVENT:
+                    continue
+
+                # Skip findings outside the time window
+                if not self._is_finding_in_time_window(finding):
+                    continue
+
                 summary = finding.get("summary", "").lower()
                 details_str = str(finding.get("details", {})).lower()
 
@@ -13679,17 +13662,23 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     )
 
         # Check for patterns indicating upgrade: multiple node events in short time
+        # Only check HISTORICAL findings within time window
         node_ready_events = [
             f
             for f in self.findings.get("node_issues", [])
-            if any(kw in f.get("summary", "").lower() for kw in ["ready", "reboot", "notready", "pressure"])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+            and any(kw in f.get("summary", "").lower() for kw in ["ready", "reboot", "notready", "pressure"])
         ]
 
         # Check for DaemonSet restarts (common during upgrades)
+        # Only check HISTORICAL findings within time window
         ds_restarts = [
             f
             for f in self.findings.get("pod_errors", [])
-            if any(
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+            and any(
                 ds in f.get("summary", "").lower()
                 for ds in ["aws-node", "coredns", "kube-proxy", "vpc-cni", "ebs-csi", "efs-csi"]
             )
@@ -13697,10 +13686,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # ENHANCED: Check for upgrade-like patterns even without explicit keywords
         # Pattern 1: Mass pod evictions across multiple nodes (upgrade causes node cycling)
+        # Only check HISTORICAL findings within time window
         evicted_pods = [
             f
             for f in self.findings.get("pod_errors", [])
-            if any(
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+            and any(
                 kw in f.get("summary", "").lower() for kw in ["evict", "terminat", "deleted", "removed", "disruption"]
             )
         ]
@@ -13711,27 +13703,73 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 evicted_nodes.add(node)
 
         # Pattern 2: Multiple pods restarting on same node (upgrade rollout)
+        # Only check HISTORICAL findings within time window
         restarted_pods = [
             f
             for f in self.findings.get("pod_errors", [])
-            if any(kw in f.get("summary", "").lower() for kw in ["restart", "crashloop", "backoff", "killed", "failed"])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+            and any(
+                kw in f.get("summary", "").lower() for kw in ["restart", "crashloop", "backoff", "killed", "failed"]
+            )
         ]
 
         # Pattern 3: High finding density - lots of issues in short time window
-        total_findings_count = sum(len(v) for v in self.findings.values())
+        # IMPORTANT: Only count HISTORICAL findings for upgrade pattern scoring
+        # Current-state findings represent ongoing conditions, not upgrade-related events
+        total_historical_count = sum(
+            1
+            for cat, flist in self.findings.items()
+            for f in flist
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        )
+        total_current_count = sum(
+            1
+            for cat, flist in self.findings.items()
+            for f in flist
+            if f.get("details", {}).get("finding_type") != FindingType.HISTORICAL_EVENT
+        )
 
         # Pattern 4: Issues spread across multiple categories (upgrade affects everything)
-        affected_categories = [cat for cat, flist in self.findings.items() if flist]
+        # Only count categories with HISTORICAL findings within time window for upgrade pattern
+        affected_categories = [
+            cat
+            for cat, flist in self.findings.items()
+            if any(
+                f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+                and self._is_finding_in_time_window(f)
+                for f in flist
+            )
+        ]
         category_spread = len(affected_categories)
 
         # Pattern 5: OOM kills during upgrade (pods restarting with lower memory)
-        oom_kills = self.findings.get("oom_killed", [])
+        # Only check HISTORICAL findings within time window
+        oom_kills = [
+            f
+            for f in self.findings.get("oom_killed", [])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
 
         # Pattern 6: Scheduling failures during upgrade (nodes temporarily unavailable)
-        sched_failures = self.findings.get("scheduling_failures", [])
+        # Only check HISTORICAL findings within time window
+        sched_failures = [
+            f
+            for f in self.findings.get("scheduling_failures", [])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
 
         # Pattern 7: Multiple nodes affected by pressure
-        pressure_events = self.findings.get("memory_pressure", []) + self.findings.get("disk_pressure", [])
+        # Only check HISTORICAL findings within time window
+        pressure_events = [
+            f
+            for f in (self.findings.get("memory_pressure", []) + self.findings.get("disk_pressure", []))
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
         pressure_nodes = set()
         for pe in pressure_events:
             node = pe.get("details", {}).get("node")
@@ -13739,13 +13777,31 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 pressure_nodes.add(node)
 
         # Pattern 8: Image pull failures (pods restarting quickly)
-        image_pull_failures = self.findings.get("image_pull_failures", [])
+        # Only check HISTORICAL findings within time window
+        image_pull_failures = [
+            f
+            for f in self.findings.get("image_pull_failures", [])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
 
         # Pattern 9: Network issues (CNI restarting)
-        network_issues = self.findings.get("network_issues", [])
+        # Only check HISTORICAL findings within time window
+        network_issues = [
+            f
+            for f in self.findings.get("network_issues", [])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
 
         # Pattern 10: Node issues (NotReady, conditions changing)
-        node_issues_count = len(self.findings.get("node_issues", []))
+        # Only count HISTORICAL findings within time window
+        node_issues_count = sum(
+            1
+            for f in self.findings.get("node_issues", [])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        )
 
         # Calculate upgrade pattern score
         upgrade_pattern_score = 0
@@ -13793,13 +13849,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             upgrade_pattern_score += 1
             upgrade_pattern_evidence.append(f"{len(sched_failures)} scheduling failures")
 
-        # High finding count in short time window
-        if total_findings_count >= 20:
+        # High finding count in short time window (HISTORICAL only - not current state)
+        if total_historical_count >= 20:
             upgrade_pattern_score += 2
-            upgrade_pattern_evidence.append(f"{total_findings_count} total findings in analysis window")
-        elif total_findings_count >= 10:
+            upgrade_pattern_evidence.append(f"{total_historical_count} historical events in analysis window")
+        elif total_historical_count >= 10:
             upgrade_pattern_score += 1
-            upgrade_pattern_evidence.append(f"{total_findings_count} findings detected")
+            upgrade_pattern_evidence.append(f"{total_historical_count} historical events detected")
 
         # Multiple pod restarts
         if len(restarted_pods) >= 5:
@@ -13854,55 +13910,87 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             should_correlate_upgrade = True
 
         if should_correlate_upgrade:
-            # Count findings by severity
-            total_findings = sum(len(v) for v in self.findings.values())
-            critical_findings = sum(
-                1
-                for cat, findings in self.findings.items()
-                for f in findings
-                if f.get("details", {}).get("severity") == "critical"
-            )
-            warning_findings = sum(
-                1
-                for cat, findings in self.findings.items()
-                for f in findings
-                if f.get("details", {}).get("severity") == "warning"
-            )
-            info_findings = total_findings - critical_findings - warning_findings
+            # Count findings by severity AND type (historical vs current state)
+            # Historical findings = events that occurred during the upgrade window
+            # Current-state findings = ongoing conditions (may or may not be related to upgrade)
+            historical_findings = []
+            current_state_findings = []
+            for cat, findings in self.findings.items():
+                for f in findings:
+                    if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT:
+                        historical_findings.append(f)
+                    else:
+                        current_state_findings.append(f)
 
-            # Get affected categories
+            total_historical = len(historical_findings)
+            total_current = len(current_state_findings)
+            total_findings = total_historical + total_current
+
+            historical_critical = sum(
+                1 for f in historical_findings if f.get("details", {}).get("severity") == "critical"
+            )
+            historical_warning = sum(
+                1 for f in historical_findings if f.get("details", {}).get("severity") == "warning"
+            )
+
+            current_critical = sum(
+                1 for f in current_state_findings if f.get("details", {}).get("severity") == "critical"
+            )
+            current_warning = sum(
+                1 for f in current_state_findings if f.get("details", {}).get("severity") == "warning"
+            )
+
+            # Get affected categories (historical only for upgrade correlation)
+            # Also filter by time window
             affected_categories = []
             for cat, findings in self.findings.items():
-                if findings:
+                if any(
+                    f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+                    and self._is_finding_in_time_window(f)
+                    for f in findings
+                ):
                     affected_categories.append(cat)
-            # Get representative examples (top 3 critical, then top 2 warning)
+
+            # Get representative examples from HISTORICAL findings (upgrade-related)
             examples = []
-            for cat, findings_list in self.findings.items():
-                if not findings_list:
-                    continue
-                for f in findings_list:
-                    sev = f.get("details", {}).get("severity", "")
-                    if sev == "critical" and len(examples) < 3:
-                        examples.append({"category": cat, "summary": f.get("summary", "")[:100]})
-            for cat, findings_list in self.findings.items():
-                if not findings_list:
-                    continue
-                for f in findings_list:
-                    sev = f.get("details", {}).get("severity", "")
-                    if sev == "warning" and len(examples) < 5:
-                        examples.append({"category": cat, "summary": f.get("summary", "")[:100]})
+            for f in historical_findings:
+                sev = f.get("details", {}).get("severity", "")
+                if sev == "critical" and len(examples) < 3:
+                    # Find category for this finding
+                    for cat, findings in self.findings.items():
+                        if f in findings:
+                            examples.append({"category": cat, "summary": f.get("summary", "")[:100]})
+                            break
+            for f in historical_findings:
+                sev = f.get("details", {}).get("severity", "")
+                if sev == "warning" and len(examples) < 5:
+                    for cat, findings in self.findings.items():
+                        if f in findings:
+                            examples.append({"category": cat, "summary": f.get("summary", "")[:100]})
+                            break
+
             # Prefer AWS API data if available
             if aws_upgrade_info:
                 upgrade_type = aws_upgrade_info.get("upgrade_type", "Cluster upgrade")
-                first_upgrade = aws_upgrade_info.get("updates", [{}])[0].get("created_at", "Unknown")
                 aws_updates = aws_upgrade_info.get("updates", [])
+                first_upgrade = aws_updates[0].get("created_at", "Unknown") if aws_updates else "Unknown"
                 correlation_severity = "info"
-                impact_msg = (
-                    f"Confirmed via AWS API: {upgrade_type} at {first_upgrade}. "
-                    f"This explains {total_findings} findings ({critical_findings} critical, {warning_findings} warning, {info_findings} info). "
-                    f"Affected categories: {', '.join(affected_categories[:3])}. "
-                    f"Examples: {examples[0]['summary'] if examples else 'None'}"
-                )
+                # Distinguish historical (upgrade-caused) from current-state (ongoing) findings
+                if total_current > 0:
+                    impact_msg = (
+                        f"Confirmed via AWS API: {upgrade_type} at {first_upgrade}. "
+                        f"This explains {total_historical} historical findings ({historical_critical} critical, {historical_warning} warning). "
+                        f"Additionally, {total_current} current-state issues detected ({current_critical} critical, {current_warning} warning). "
+                        f"Affected categories: {', '.join(affected_categories[:3])}. "
+                        f"Examples: {examples[0]['summary'] if examples else 'None'}"
+                    )
+                else:
+                    impact_msg = (
+                        f"Confirmed via AWS API: {upgrade_type} at {first_upgrade}. "
+                        f"This explains {total_historical} historical findings ({historical_critical} critical, {historical_warning} warning). "
+                        f"Affected categories: {', '.join(affected_categories[:3])}. "
+                        f"Examples: {examples[0]['summary'] if examples else 'None'}"
+                    )
             else:
                 # Fallback to event-based detection
                 upgrade_times = []
@@ -13922,13 +14010,23 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     upgrade_type = "EKS addon upgrade"
                 aws_updates = []
                 correlation_severity = "info"
-                impact_msg = (
-                    f"Findings are likely due to cluster upgrade activity. "
-                    f"{total_indicators} upgrade-related events detected. "
-                    f"This explains {total_findings} findings ({critical_findings} critical, {warning_findings} warning). "
-                    f"Affected categories: {', '.join(affected_categories[:3])}. "
-                    f"Examples: {examples[0]['summary'] if examples else 'None'}"
-                )
+                if total_current > 0:
+                    impact_msg = (
+                        f"Findings are likely due to cluster upgrade activity. "
+                        f"{total_indicators} upgrade-related events detected. "
+                        f"This explains {total_historical} historical findings ({historical_critical} critical, {historical_warning} warning). "
+                        f"Additionally, {total_current} current-state issues detected ({current_critical} critical, {current_warning} warning). "
+                        f"Affected categories: {', '.join(affected_categories[:3])}. "
+                        f"Examples: {examples[0]['summary'] if examples else 'None'}"
+                    )
+                else:
+                    impact_msg = (
+                        f"Findings are likely due to cluster upgrade activity. "
+                        f"{total_indicators} upgrade-related events detected. "
+                        f"This explains {total_historical} historical findings ({historical_critical} critical, {historical_warning} warning). "
+                        f"Affected categories: {', '.join(affected_categories[:3])}. "
+                        f"Examples: {examples[0]['summary'] if examples else 'None'}"
+                    )
             correlations.append(
                 {
                     "correlation_type": "cluster_upgrade",
@@ -13942,10 +14040,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "daemonset_restarts": len(ds_restarts),
                         "aws_updates": aws_updates[:5] if aws_updates else [],
                         "categories_affected": affected_categories[:3],
+                        "historical_findings": total_historical,
+                        "historical_critical": historical_critical,
+                        "historical_warning": historical_warning,
+                        "current_state_findings": total_current,
+                        "current_state_critical": current_critical,
+                        "current_state_warning": current_warning,
                         "total_findings": total_findings,
-                        "critical_findings": critical_findings,
-                        "warning_findings": warning_findings,
-                        "info_findings": info_findings,
                         "example_findings": examples[:5],
                     },
                     "impact": impact_msg,
@@ -14652,6 +14753,20 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         ("storage_cascade", "scheduling_pattern", "Storage issues prevented pod scheduling"),
     ]
 
+    def _split_findings_by_type(self, category: str) -> tuple[list, list]:
+        """Split findings into (historical_events, current_state) lists.
+
+        Args:
+            category: Finding category name (e.g., "memory_pressure", "pod_errors")
+
+        Returns:
+            Tuple of (historical_findings, current_state_findings)
+        """
+        findings = self.findings.get(category, [])
+        historical = [f for f in findings if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT]
+        current = [f for f in findings if f.get("details", {}).get("finding_type") != FindingType.HISTORICAL_EVENT]
+        return historical, current
+
     def _score_temporal_causality(self, cause_events: list, effect_events: list, max_lag_minutes: int = 30) -> dict:
         """Score how likely cause preceded effect within a time window.
 
@@ -14661,14 +14776,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             max_lag_minutes: Maximum time window for causality
 
         Returns:
-            Dict with confidence score, average lag, and causal pairs
+            Dict with confidence score, average lag, causal pairs, and evidence_available flag
         """
         causal_pairs = []
+        effects_with_timestamps = 0
+        causes_with_timestamps = 0
 
         for effect in effect_events:
             effect_ts = self._extract_timestamp(effect.get("details", {}))
             if not effect_ts:
                 continue
+
+            effects_with_timestamps += 1
 
             # Find closest preceding cause
             best_cause = None
@@ -14678,6 +14797,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cause_ts = self._extract_timestamp(cause.get("details", {}))
                 if not cause_ts:
                     continue
+
+                causes_with_timestamps += 1
 
                 lag = (effect_ts - cause_ts).total_seconds() / 60
 
@@ -14699,12 +14820,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         confidence = len(causal_pairs) / len(effect_events) if effect_events else 0
         avg_lag = sum(p["lag_minutes"] for p in causal_pairs) / len(causal_pairs) if causal_pairs else 0
 
+        # Track whether we had temporal evidence to work with
+        # This distinguishes "no temporal relationship" from "couldn't check (no timestamps)"
+        evidence_available = effects_with_timestamps > 0 and causes_with_timestamps > 0
+
         return {
             "confidence": round(confidence, 2),
             "avg_lag_minutes": round(avg_lag, 1),
             "causal_pairs_count": len(causal_pairs),
             "total_effects": len(effect_events),
             "causal_pairs": causal_pairs[:5],  # Top 5 examples
+            "evidence_available": evidence_available,
+            "effects_with_timestamps": effects_with_timestamps,
+            "causes_with_timestamps": causes_with_timestamps,
         }
 
     def _calculate_5d_confidence(
@@ -14739,7 +14867,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # 1. Temporal: Score based on causal precedence
         temporal_result = self._score_temporal_causality(cause_events, effect_events)
-        scores["temporal"] = temporal_result["confidence"]
+        temporal_evidence_available = temporal_result.get("evidence_available", False)
+
+        # If no temporal evidence (e.g., all current-state findings), use neutral value
+        # This prevents penalizing correlations that simply lack timestamp data
+        if temporal_evidence_available:
+            scores["temporal"] = temporal_result["confidence"]
+        else:
+            scores["temporal"] = 0.5  # Neutral - couldn't determine
 
         # 2. Spatial: Score based on resource overlap
         spatial_result = self._score_spatial_correlation(cause_events, effect_events)
@@ -14757,13 +14892,24 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         scores["reproducibility"] = min(1.0, unique_pairs / 5.0) if unique_pairs > 0 else 0.0
 
         # Weighted composite (temporal and mechanism weighted higher)
-        weights = {
-            "temporal": 0.30,
-            "spatial": 0.20,
-            "mechanism": 0.25,
-            "exclusivity": 0.15,
-            "reproducibility": 0.10,
-        }
+        # Redistribute temporal weight when evidence unavailable
+        if temporal_evidence_available:
+            weights = {
+                "temporal": 0.30,
+                "spatial": 0.20,
+                "mechanism": 0.25,
+                "exclusivity": 0.15,
+                "reproducibility": 0.10,
+            }
+        else:
+            # Redistribute temporal weight to mechanism and spatial
+            weights = {
+                "temporal": 0.0,  # Exclude - no evidence
+                "spatial": 0.30,  # +0.10 from temporal
+                "mechanism": 0.35,  # +0.10 from temporal
+                "exclusivity": 0.20,  # +0.05 from temporal
+                "reproducibility": 0.15,  # +0.05 from temporal
+            }
         composite = sum(scores[k] * weights[k] for k in scores)
 
         # Assign confidence tier
@@ -14778,6 +14924,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "scores": scores,
             "composite": round(composite, 3),
             "confidence_tier": tier,
+            "temporal_evidence_available": temporal_evidence_available,
             "temporal_evidence": temporal_result,
             "spatial_evidence": spatial_result,
         }

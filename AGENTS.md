@@ -7,7 +7,7 @@ Guidelines for AI coding agents working in the EKS Health Check Dashboard codeba
 Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
 
 **Version:** 3.8.0  
-**Lines of Code:** ~20,000  
+**Lines of Code:** ~20,400  
 **Analysis Methods:** 73  
 **Remediation Patterns:** 30+  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)  
@@ -699,6 +699,124 @@ except Exception as e:
 output = self.safe_kubectl_call(cmd)
 # Internally adds: --context {self.kube_context}
 ```
+
+### Exception Handling Patterns (v3.9.0)
+
+**Rule: Catch specific exceptions before generic Exception**
+
+```python
+# GOOD - Specific exception handling
+try:
+    cluster_info = self.eks_client.describe_cluster(name=cluster)
+except ClientError as e:
+    error_code = e.response.get("Error", {}).get("Code", "")
+    self._add_error("cluster_details", f"AWS error {error_code}: {e}")
+except (KeyError, AttributeError) as e:
+    self._add_error("cluster_details", f"Unexpected response structure: {e}")
+except Exception as e:
+    self._add_error("cluster_details", f"Unexpected error: {e}")
+```
+
+```python
+# BAD - Silent failure
+try:
+    cluster_info = self.eks_client.describe_cluster(name=cluster)
+except Exception:
+    pass  # Silent failure loses debugging information
+```
+
+### AWS API Best Practices (v3.9.0)
+
+**Rule: Always use explicit region in boto3 Session**
+
+```python
+# GOOD - Explicit region
+session = boto3.Session(profile_name=profile, region_name=region)
+client = session.client("eks")
+
+# BAD - Missing region (uses env var or default)
+session = boto3.Session(profile_name=profile)
+client = session.client("eks")
+```
+
+**Rule: Catch ClientError specifically with error code inspection**
+
+```python
+# GOOD - Inspect error codes
+try:
+    result = self.eks_client.describe_cluster(name=cluster_name)
+except ClientError as e:
+    error_code = e.response.get("Error", {}).get("Code", "")
+    if error_code == "ResourceNotFoundException":
+        raise ClusterNotFoundError(f"Cluster {cluster_name} not found")
+    elif error_code in ["Throttling", "RequestLimitExceeded"]:
+        # Retry with backoff
+        time.sleep(delay)
+        continue
+    raise
+```
+
+### safe_api_call Retry Pattern (v3.9.0)
+
+The `safe_api_call()` method implements exponential backoff with jitter for AWS API resilience:
+
+```python
+def safe_api_call(self, func: Callable, *args, use_cache: bool = True, **kwargs) -> tuple[bool, Any]:
+    max_retries = 3
+    base_delay = 0.5
+    max_delay = 30.0
+    
+    for attempt in range(max_retries):
+        try:
+            result = func(*args, **kwargs)
+            return (True, result)
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            
+            # Retryable error codes
+            retryable_codes = [
+                "Throttling", "ThrottlingException", "RequestLimitExceeded",
+                "TooManyRequestsException", "ServiceUnavailable", "InternalError"
+            ]
+            
+            if error_code in retryable_codes and attempt < max_retries - 1:
+                delay = min(base_delay * (2**attempt), max_delay)
+                jitter = random.uniform(0, delay * 0.1)
+                time.sleep(delay + jitter)
+                continue
+            
+            # Non-retryable
+            return (False, f"AWS error {error_code}: {e}")
+```
+
+### Caching with TTL (v3.9.0)
+
+kubectl command caching includes timestamp validation:
+
+```python
+def _set_kubectl_cache(self, cmd: str, output: str) -> None:
+    """Store kubectl output with timestamp."""
+    with self._shared_data_lock:
+        self._shared_data["kubectl_cache"][cmd] = (output, time.time())
+
+def _get_kubectl_cache(self, cmd: str, max_age_seconds: int = 600) -> str | None:
+    """Get cached output with TTL validation."""
+    with self._shared_data_lock:
+        if cmd not in self._shared_data["kubectl_cache"]:
+            return None
+        cached_entry = self._shared_data["kubectl_cache"][cmd]
+        
+        # Handle tuple format (output, timestamp)
+        if isinstance(cached_entry, tuple) and len(cached_entry) == 2:
+            output, timestamp = cached_entry
+            if time.time() - timestamp > max_age_seconds:
+                del self._shared_data["kubectl_cache"][cmd]
+                return None
+            return output
+    return None
+```
+
+
 
 ---
 

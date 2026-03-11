@@ -7039,7 +7039,7 @@ class HTMLOutputFormatter(OutputFormatter):
                                     <ul>
 """
                         for ex in examples[:3]:
-                            html += f"                                        <li>{ex}</li>\n"
+                            html += f"                                        <li>{self._escape_html(str(ex))}</li>\n"
                         html += """                                    </ul>
                                 </div>
 """
@@ -7047,9 +7047,10 @@ class HTMLOutputFormatter(OutputFormatter):
                     # Show affected resources
                     affected = evidence.get("affected_resources", [])
                     if affected:
+                        affected_str = ", ".join(self._escape_html(str(r)) for r in affected[:5])
                         html += f"""
                                 <div class="evidence-resources">
-                                    <strong>Affected resources:</strong> {", ".join(affected[:5])}
+                                    <strong>Affected resources:</strong> {affected_str}
                                     {f"and {len(affected) - 5} more..." if len(affected) > 5 else ""}
                                 </div>
 """
@@ -7058,10 +7059,12 @@ class HTMLOutputFormatter(OutputFormatter):
                     first_seen = evidence.get("first_seen")
                     last_seen = evidence.get("last_seen")
                     if first_seen:
+                        escaped_first = self._escape_html(first_seen)
+                        escaped_last = self._escape_html(last_seen) if last_seen else ""
                         html += f"""
                                 <div class="evidence-timing">
-                                    <strong>First seen:</strong> {first_seen}
-                                    {f"<br><strong>Last seen:</strong> {last_seen}" if last_seen and last_seen != first_seen else ""}
+                                    <strong>First seen:</strong> {escaped_first}
+                                    {f"<br><strong>Last seen:</strong> {escaped_last}" if last_seen and last_seen != first_seen else ""}
                                 </div>
 """
 
@@ -7069,9 +7072,10 @@ class HTMLOutputFormatter(OutputFormatter):
                     if is_correlation:
                         impact = evidence.get("impact")
                         if impact:
+                            escaped_impact = self._escape_html(str(impact))
                             html += f"""
                                 <div class="evidence-impact">
-                                    <strong>Impact:</strong> {impact}
+                                    <strong>Impact:</strong> {escaped_impact}
                                 </div>
 """
 

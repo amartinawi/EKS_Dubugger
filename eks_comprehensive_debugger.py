@@ -21,15 +21,14 @@ import html
 import threading
 import uuid
 import logging
-import random
 
 from botocore.exceptions import ClientError, BotoCoreError, ProfileNotFound, PartialCredentialsError, NoRegionError
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as date_parser
-from typing import Optional, Any, Callable
+from typing import Optional, Any
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
 import hashlib
 import os
 import json as json_module

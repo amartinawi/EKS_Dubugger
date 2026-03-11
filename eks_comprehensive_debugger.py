@@ -3,156 +3,9 @@
 EKS Health Check Dashboard v3.6.0
 
 A production-grade diagnostic tool for Amazon EKS cluster troubleshooting that provides
-systematic analysis of cluster health, workload issues, networking, storage, and control plane.
+systematic analysis of cluster health,"""
 
-================================================================================
-FEATURES
-================================================================================
-
-📊 Comprehensive Issue Detection (56 Analysis Methods)
-   • Pod & Workload: CrashLoopBackOff, ImagePullBackOff, OOMKilled, evictions, probes
-   • Node Health: NotReady, DiskPressure, MemoryPressure, PIDPressure, PLEG, runtime
-   • Networking: VPC CNI, CoreDNS, service endpoints, connectivity, NetworkPolicy
-   • Storage: PVC issues, EBS/EFS CSI, volume attachment failures
-   • Control Plane: API latency, rate limiting, etcd health, webhooks
-   • IAM/RBAC: Permission errors, IRSA/Pod Identity, CloudTrail correlation
-   • Autoscaling: Cluster Autoscaler, Karpenter, HPA/VPA, Fargate
-
-📈 Interactive HTML Reports
-   • Modern dashboard with sidebar navigation
-   • Real-time search and filtering
-   • Severity classification with color coding
-   • Data source badges (kubectl, CloudWatch, EKS API)
-   • Evidence-based recommendations with diagnostic steps
-
-🔗 Smart Correlation Engine
-   • Root cause identification across data sources
-   • Timeline of events by hour
-   • Cascading failure analysis
-   • First issue detection
-
-================================================================================
-OUTPUT FORMATS
-================================================================================
-
-   • html      - Interactive dashboard (recommended)
-   • json      - Structured output for automation
-   • markdown  - Documentation-friendly format
-   • yaml      - Human-readable structured output
-   • console   - Text output with colors
-
-================================================================================
-USAGE
-================================================================================
-
-Basic usage (generates HTML + LLM-JSON reports):
-    python eks_comprehensive_debugger.py --profile prod --region eu-west-1
-
-With specific cluster and time range:
-    python eks_comprehensive_debugger.py \\
-        --profile prod \\
-        --region eu-west-1 \\
-        --cluster-name my-cluster \\
-        --days 2
-
-With custom kubectl context (SSM tunnel/VPN):
-    python eks_comprehensive_debugger.py \\
-        --profile prod \\
-        --region eu-west-1 \\
-        --cluster-name my-cluster \\
-        --kube-context my-cluster-ssm-tunnel \\
-        --days 1
-
-Historical analysis with specific timezone:
-    python eks_comprehensive_debugger.py \\
-        --profile prod \\
-        --region eu-west-1 \\
-        --cluster-name my-cluster \\
-        --start-date "2026-02-15T08:00:00" \\
-        --end-date "2026-02-16T18:00:00" \\
-        --timezone "Asia/Dubai"
-
-================================================================================
-CLI ARGUMENTS
-================================================================================
-
-Required:
-    --profile       AWS profile from ~/.aws/credentials
-    --region        AWS region (e.g., eu-west-1, us-east-1)
-
-Optional:
-    --cluster-name  EKS cluster name (prompts if not provided)
-    --kube-context  Kubernetes context (skips kubeconfig update)
-    --hours         Look back N hours from now
-    --days          Look back N days from now (default: 1)
-    --start-date    Start date (ISO 8601 or YYYY-MM-DD, supports time)
-    --end-date      End date (ISO 8601 or YYYY-MM-DD, supports time)
-    --timezone      Timezone for date parsing (default: UTC, e.g., "Asia/Dubai")
-    --namespace     Focus on specific namespace
-    --verbose       Enable verbose output
-    --quiet         Suppress progress messages
-
-Output:
-    Always generates two files:
-    - {cluster}-eks-report-{timestamp}.html      - Interactive HTML dashboard
-    - {cluster}-eks-findings-{timestamp}.json    - LLM-ready JSON for AI analysis
-
-================================================================================
-EXIT CODES
-================================================================================
-
-    0   - Success, no issues found
-    1   - Success, issues found in cluster
-    2   - Error during analysis
-    130 - Interrupted by user (Ctrl+C)
-
-================================================================================
-IAM PERMISSIONS REQUIRED
-================================================================================
-
-EKS:
-    eks:ListClusters, eks:DescribeCluster
-    eks:ListAddons, eks:DescribeAddon
-    eks:ListNodegroups, eks:DescribeNodegroup
-
-CloudWatch:
-    cloudwatch:GetMetricStatistics, cloudwatch:ListMetrics
-    logs:DescribeLogGroups, logs:DescribeLogStreams, logs:GetLogEvents
-
-EC2:
-    ec2:DescribeInstances, ec2:DescribeInstanceStatus
-    ec2:DescribeSubnets, ec2:DescribeSecurityGroups
-
-Other:
-    service-quotas:ListServiceQuotas
-    cloudtrail:LookupEvents (optional, for IAM correlation)
-    sts:GetCallerIdentity
-
-================================================================================
-CATALOG COVERAGE
-================================================================================
-
-This tool implements 100% coverage of three comprehensive EKS troubleshooting catalogs:
-
-    • EKS Issue Patterns Catalog: 49 issues (100%)
-    • High-Value Kubernetes Issues: 21 issues (100%)
-    • Common Kubernetes Issues: 9 issues (100%)
-    • Total: 79 issues (100%)
-
-================================================================================
-REFERENCES
-================================================================================
-
-    • EKS Troubleshooting: https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html
-    • EKS Disk Pressure: https://repost.aws/knowledge-center/eks-resolve-disk-pressure
-    • CloudWatch Container Insights: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html
-    • EKS Best Practices: https://docs.aws.amazon.com/prescriptive-guidance/latest/amazon-eks-observability-best-practices/
-    • EKS Control Plane Logs: https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html
-    • IRSA: https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html
-    • EKS Pod Identity: https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html
-
-================================================================================
-"""
+from __future__ import annotations
 
 # === SECTION 1: IMPORTS & CONSTANTS ===
 
@@ -168,6 +21,9 @@ import html
 import threading
 import uuid
 import logging
+import random
+
+from botocore.exceptions import ClientError, BotoCoreError, ProfileNotFound, PartialCredentialsError, NoRegionError
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as date_parser
@@ -178,20 +34,7 @@ import hashlib
 import os
 import json as json_module
 import pytz
-
-import logging
-
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from dateutil import parser as date_parser
-from typing import Optional, Any, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
-import hashlib
-import os
-import json as json_module
-
-import pytz
+import random
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
@@ -315,9 +158,25 @@ class TimezoneManager:
 class ConfigLoader:
     """Load configuration from YAML/JSON files with environment variable support."""
 
+    ENV_VAR_MAPPING: dict[str, str] = {
+        "EKS_DEBUGGER_PROFILE": "profile",
+        "EKS_DEBUGGER_REGION": "region",
+        "EKS_DEBUGGER_CLUSTER": "cluster_name",
+        "EKS_DEBUGGER_NAMESPACE": "namespace",
+        "EKS_DEBUGGER_DAYS": "days",
+        "EKS_DEBUGGER_OUTPUT_FORMAT": "output_format",
+        "EKS_DEBUGGER_OUTPUT_FILE": "output_file",
+        "EKS_DEBUGGER_VERBOSE": "verbose",
+        "EKS_DEBUGGER_QUIET": "quiet",
+        "EKS_DEBUGGER_KUBE_CONTEXT": "kube_context",
+        "EKS_DEBUGGER_TIMEZONE": "timezone",
+        "EKS_DEBUGGER_PARALLEL": "parallel",
+        "EKS_DEBUGGER_MAX_FINDINGS": "max_findings",
+    }
+
     @staticmethod
-    def load(config_path: Optional[str] = None) -> dict:
-        config = {}
+    def load(config_path: str | None = None, env_mapping: dict[str, str] | None = None) -> dict:
+        config: dict = {}
         if config_path and os.path.exists(config_path):
             with open(config_path, "r") as f:
                 content = f.read()
@@ -330,28 +189,14 @@ class ConfigLoader:
                         pass
                 elif config_path.endswith(".json"):
                     config = json_module.loads(content)
-        config.update(ConfigLoader._load_from_env())
+        config.update(ConfigLoader._load_from_env(env_mapping))
         return config
 
     @staticmethod
-    def _load_from_env() -> dict:
-        env_mapping = {
-            "EKS_DEBUGGER_PROFILE": "profile",
-            "EKS_DEBUGGER_REGION": "region",
-            "EKS_DEBUGGER_CLUSTER": "cluster_name",
-            "EKS_DEBUGGER_NAMESPACE": "namespace",
-            "EKS_DEBUGGER_DAYS": "days",
-            "EKS_DEBUGGER_OUTPUT_FORMAT": "output_format",
-            "EKS_DEBUGGER_OUTPUT_FILE": "output_file",
-            "EKS_DEBUGGER_VERBOSE": "verbose",
-            "EKS_DEBUGGER_QUIET": "quiet",
-            "EKS_DEBUGGER_KUBE_CONTEXT": "kube_context",
-            "EKS_DEBUGGER_TIMEZONE": "timezone",
-            "EKS_DEBUGGER_PARALLEL": "parallel",
-            "EKS_DEBUGGER_MAX_FINDINGS": "max_findings",
-        }
-        config = {}
-        for env_var, config_key in env_mapping.items():
+    def _load_from_env(env_mapping: dict[str, str] | None = None) -> dict:
+        mapping = env_mapping or ConfigLoader.ENV_VAR_MAPPING
+        config: dict = {}
+        for env_var, config_key in mapping.items():
             value = os.environ.get(env_var)
             if value:
                 if config_key in ("verbose", "quiet", "parallel"):
@@ -497,14 +342,42 @@ def validate_input(name: str, value: str) -> str:
     return value
 
 
-# Pre-compiled regex patterns for severity classification (performance optimization)
+def timed_input(prompt: str, timeout: int = 60, default: str | None = None) -> str | None:
+    """Get user input with timeout for non-interactive environments.
+
+    Args:
+        prompt: The prompt to display to the user
+        timeout: Maximum seconds to wait for input (default: 60)
+        default: Default value to return if timeout or non-interactive mode
+
+    Returns:
+        User input string, default value, or None if unavailable
+    """
+    import select
+
+    # Check if running in non-interactive mode
+    if not sys.stdin.isatty():
+        return default
+
+    print(prompt, end="", flush=True)
+
+    # Wait for input with timeout
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+
+    if ready:
+        return sys.stdin.readline().strip()
+    else:
+        return default
+
+
+# Pre-compiled regex patterns for severity classification
 _CRITICAL_PATTERN = re.compile(r"\b(?:oom|killed|crash(?:ed)?|critical|(?<!shut)down|unhealthy)\b")
 _WARNING_PATTERN = re.compile(r"\b(?:warning|warn|degraded|pressure|evicted|pending|timeout|error|failed?)\b")
 _INFO_PATTERN = re.compile(r"\b(?:info|notice|fallback)\b|network not ready")
 _COMPOUND_CRITICAL = ("oomkilled", "crashloopbackoff", "imagepullbackoff")
 
 
-def classify_severity(summary_text: str, details: Optional[dict] = None) -> str:
+def classify_severity(summary_text: str, details: dict | None = None) -> str:
     """Classify finding severity based on content.
 
     Module-level function used by ExecutiveSummaryGenerator, HTMLOutputFormatter,
@@ -1341,12 +1214,6 @@ class DateValidationError(EKSDebuggerError):
 
 class InputValidationError(EKSDebuggerError):
     """Invalid or unsafe input parameter"""
-
-    pass
-
-
-class InsufficientPermissionsError(EKSDebuggerError):
-    """Raised when AWS permissions are insufficient for analysis"""
 
     pass
 
@@ -7609,15 +7476,16 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     def __init__(
         self,
-        profile,
-        region,
-        cluster_name=None,
-        start_date=None,
-        end_date=None,
-        namespace=None,
-        progress=None,
-        kube_context=None,
-    ):
+        profile: str,
+        region: str,
+        cluster_name: str | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        namespace: str | None = None,
+        progress: "ProgressTracker | None" = None,
+        kube_context: str | None = None,
+        pagination_limit: int = 1000,
+    ) -> None:
         """
         Initialize debugger
 
@@ -7634,6 +7502,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             max_findings: Maximum findings per category (default: MAX_FINDINGS_PER_CATEGORY)
             enable_cache: Enable API response caching (default: True)
             enable_incremental: Enable incremental analysis with delta reporting (default: True)
+            pagination_limit: Maximum items to fetch per paginated API call (default: 1000)
         """
         validate_input("profile", profile)
         validate_input("region", region)
@@ -7656,6 +7525,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.max_findings = MAX_FINDINGS_PER_CATEGORY
         self.enable_cache = True
         self.enable_incremental = True
+        self.pagination_limit = pagination_limit
 
         # API response cache
         self._api_cache = APICache(ttl_seconds=API_CACHE_TTL_SECONDS)
@@ -7669,6 +7539,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.sts_client = self.session.client("sts")
             self.ec2_client = self.session.client("ec2")
             self.cloudtrail_client = self.session.client("cloudtrail")
+            self.service_quotas_client = self.session.client("service-quotas")
         except Exception as e:
             raise AWSAuthenticationError(f"Failed to initialize AWS session: {e}")
 
@@ -7783,7 +7654,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         status_icon = "✓" if status == "ACTIVE" else "⚠️"
                         print(f"  {idx}. {cluster}")
                         print(f"     {status_icon} Status: {status} | Version: {version} | Created: {created}")
-                    except Exception:
+                    except ClientError as e:
+                        self._add_error(
+                            "cluster_details",
+                            f"Failed to get details for {cluster}: {e.response.get('Error', {}).get('Code', 'Unknown')}",
+                        )
+                        print(f"  {idx}. {cluster} (details unavailable)")
+                    except (KeyError, AttributeError) as e:
+                        self._add_error("cluster_details", f"Unexpected response structure for {cluster}: {e}")
+                        print(f"  {idx}. {cluster} (details unavailable)")
+                    except Exception as e:
+                        self._add_error("cluster_details", f"Unexpected error for {cluster}: {e}")
                         print(f"  {idx}. {cluster} (details unavailable)")
 
                 print()
@@ -7893,11 +7774,16 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     self._shared_data["kubectl_cache"]["kubectl get nodes -o json"] = nodes_output
                     try:
                         self._shared_data["node_info"] = json.loads(nodes_output)
-                    except json.JSONDecodeError:
-                        pass
-        except Exception:
-            pass
+                    except json.JSONDecodeError as e:
+                        self._add_error("prefetch_nodes", f"Failed to parse node JSON: {e}")
+        except subprocess.TimeoutExpired:
+            self._add_error("prefetch_nodes", "kubectl get nodes timed out")
+        except subprocess.CalledProcessError as e:
+            self._add_error("prefetch_nodes", f"kubectl get nodes failed with exit code {e.returncode}")
+        except Exception as e:
+            self._add_error("prefetch_nodes", f"Unexpected error: {e}")
 
+        pods_cmd = "kubectl get pods --all-namespaces -o json"  # Default
         try:
             if self.namespace:
                 pods_cmd = f"kubectl get pods -n {self.namespace} -o json"
@@ -7909,10 +7795,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     self._shared_data["kubectl_cache"][pods_cmd] = pods_output
                     try:
                         self._shared_data["pod_info"] = json.loads(pods_output)
-                    except json.JSONDecodeError:
-                        pass
-        except Exception:
-            pass
+                    except json.JSONDecodeError as e:
+                        self._add_error("prefetch_pods", f"Failed to parse pod JSON: {e}")
+        except subprocess.TimeoutExpired:
+            self._add_error("prefetch_pods", f"{pods_cmd} timed out")
+        except subprocess.CalledProcessError as e:
+            self._add_error("prefetch_pods", f"{pods_cmd} failed with exit code {e.returncode}")
+        except Exception as e:
+            self._add_error("prefetch_pods", f"Unexpected error: {e}")
 
         elapsed = time.time() - start_time
         cache_stats = f"{len(self._shared_data['log_groups'])} log groups"
@@ -7947,24 +7837,34 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             return response
         return None
 
-    def _get_cached_kubectl(self, cmd: str) -> Optional[str]:
+    def _get_cached_kubectl(self, cmd: str, max_age_seconds: int = 300) -> str | None:
         """Get cached kubectl output or execute if not cached.
 
         Args:
             cmd: kubectl command string
+            max_age_seconds: Maximum age of cached entry in seconds (default: 300)
 
         Returns:
             Command output or None
         """
+        now = time.time()
         with self._shared_data_lock:
             if cmd in self._shared_data["kubectl_cache"]:
-                return self._shared_data["kubectl_cache"][cmd]
+                cached_entry = self._shared_data["kubectl_cache"][cmd]
+                if isinstance(cached_entry, dict):
+                    timestamp = cached_entry.get("timestamp", 0)
+                    if now - timestamp < max_age_seconds:
+                        return cached_entry.get("output")
+                else:
+                    return cached_entry
 
-        # Not cached, execute now
         output = self.safe_kubectl_call(cmd)
         if output:
             with self._shared_data_lock:
-                self._shared_data["kubectl_cache"][cmd] = output
+                self._shared_data["kubectl_cache"][cmd] = {
+                    "output": output,
+                    "timestamp": now,
+                }
         return output
 
     def collect_cluster_statistics(self):
@@ -8645,23 +8545,51 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 if use_cache and self.enable_cache and cache_key:
                     self._api_cache.set(cache_key, outcome)
                 return outcome
-            except Exception as e:
+
+            except ClientError as e:
                 last_error = e
-                if attempt < max_retries - 1:
-                    # Exponential backoff with jitter: (2^attempt * base_delay) + random jitter
+                error_code = e.response.get("Error", {}).get("Code", "")
+
+                # Retry on throttling or transient errors
+                retryable_codes = [
+                    "Throttling",
+                    "ThrottlingException",
+                    "RequestLimitExceeded",
+                    "TooManyRequestsException",
+                    "ServiceUnavailable",
+                    "InternalError",
+                    "InternalFailure",
+                    "ServiceTimeout",
+                ]
+
+                if error_code in retryable_codes and attempt < max_retries - 1:
                     delay = min(base_delay * (2**attempt), max_delay)
-                    jitter = random.uniform(0, delay * 0.1)  # 10% jitter
+                    jitter = random.uniform(0, delay * 0.1)
                     total_delay = delay + jitter
 
-                    # Check for throttling - use longer delay
-                    error_str = str(e).lower()
-                    if "throttl" in error_str or "rate" in error_str or "limit" in error_str:
-                        total_delay *= 2  # Double delay for throttling
+                    # Double delay for throttling
+                    if "throttl" in error_code.lower() or "limit" in error_code.lower():
+                        total_delay *= 2
 
-                    self.progress.info(f"Retry {attempt + 1}/{max_retries} after error: {e}")
+                    self.progress.info(f"Retry {attempt + 1}/{max_retries} after {error_code}: {e}")
                     time.sleep(total_delay)
+                    continue
 
-        return False, str(last_error) if last_error else "Max retries exceeded"
+                # Non-retryable ClientError
+                return (False, f"AWS error {error_code}: {e}")
+
+            except (BotoCoreError, ProfileNotFound, PartialCredentialsError, NoRegionError) as e:
+                # BotoCore/configuration errors are not retryable
+                return (False, f"AWS configuration error: {e}")
+
+            except Exception as e:
+                # Catch-all for unexpected errors - log but don't retry
+                self._add_error(
+                    "api_call", f"Unexpected error in {func.__name__ if hasattr(func, '__name__') else 'API call'}: {e}"
+                )
+                return (False, f"Unexpected error: {e}")
+
+        return (False, f"Max retries exceeded: {last_error}")
 
     def _get_all_log_streams(self, log_group_name: str, max_streams: int = MAX_LOG_STREAMS) -> list:
         """
@@ -8773,8 +8701,21 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             node_count = len(nodes.get("items", []))
 
             return node_count == 0
-        except Exception:
-            return False  # Default to False if detection fails
+        except json.JSONDecodeError as e:
+            self._add_error("fargate_detection", f"Failed to parse node JSON: {e}")
+            return False
+        except subprocess.TimeoutExpired:
+            self._add_error("fargate_detection", "kubectl get nodes timed out")
+            return False
+        except subprocess.CalledProcessError as e:
+            self._add_error("fargate_detection", f"kubectl get nodes failed: {e}")
+            return False
+        except ClientError as e:
+            self._add_error("fargate_detection", f"AWS API error: {e}")
+            return False
+        except Exception as e:
+            self._add_error("fargate_detection", f"Unexpected error: {e}")
+            return False
 
     def _should_skip_node_check(self) -> bool:
         """Check if node-specific checks should be skipped (Fargate-only cluster)"""
@@ -9688,8 +9629,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             self.progress.info("Control plane log analysis completed")
 
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            if error_code in ["ResourceNotFoundException", "AccessDenied"]:
+                self.progress.info(f"Control plane logs not accessible: {error_code}")
+            else:
+                self._add_error("analyze_control_plane_logs", f"AWS API error: {e}")
+                self.progress.warning(f"Control plane log analysis failed: AWS error")
+        except json.JSONDecodeError as e:
+            self._add_error("analyze_control_plane_logs", f"Invalid JSON in log response: {e}")
+            self.progress.warning("Control plane log analysis failed: Invalid JSON")
         except Exception as e:
-            self._add_error("analyze_control_plane_logs", str(e))
+            self._add_error("analyze_control_plane_logs", f"Unexpected error: {e}")
             self.progress.warning(f"Control plane log analysis failed: {e}")
 
     def analyze_pod_scheduling_failures(self):
@@ -9761,8 +9712,20 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             self.progress.info(f"Found {len(events.get('items', []))} scheduling failures in date range")
 
+        except json.JSONDecodeError as e:
+            self._add_error("analyze_pod_scheduling_failures", f"Invalid JSON from kubectl: {e}")
+            self.progress.warning("Scheduling failure analysis failed: Invalid JSON")
+        except KeyError as e:
+            self._add_error("analyze_pod_scheduling_failures", f"Missing expected field: {e}")
+            self.progress.warning("Scheduling failure analysis failed: Missing field")
+        except subprocess.TimeoutExpired:
+            self._add_error("analyze_pod_scheduling_failures", "kubectl command timed out")
+            self.progress.warning("Scheduling failure analysis failed: kubectl timeout")
+        except subprocess.CalledProcessError as e:
+            self._add_error("analyze_pod_scheduling_failures", f"kubectl command failed: {e}")
+            self.progress.warning("Scheduling failure analysis failed: kubectl error")
         except Exception as e:
-            self._add_error("analyze_pod_scheduling_failures", str(e))
+            self._add_error("analyze_pod_scheduling_failures", f"Unexpected error: {e}")
             self.progress.warning(f"Scheduling failure analysis failed: {e}")
 
     def analyze_network_issues(self):
@@ -9845,8 +9808,20 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             self.progress.info("Network issue analysis completed")
 
+        except json.JSONDecodeError as e:
+            self._add_error("analyze_network_issues", f"Invalid JSON from kubectl: {e}")
+            self.progress.warning("Network issue analysis failed: Invalid JSON")
+        except KeyError as e:
+            self._add_error("analyze_network_issues", f"Missing expected field: {e}")
+            self.progress.warning("Network issue analysis failed: Missing field")
+        except subprocess.TimeoutExpired:
+            self._add_error("analyze_network_issues", "kubectl command timed out")
+            self.progress.warning("Network issue analysis failed: kubectl timeout")
+        except subprocess.CalledProcessError as e:
+            self._add_error("analyze_network_issues", f"kubectl command failed: {e}")
+            self.progress.warning("Network issue analysis failed: kubectl error")
         except Exception as e:
-            self._add_error("analyze_network_issues", str(e))
+            self._add_error("analyze_network_issues", f"Unexpected error: {e}")
             self.progress.warning(f"Network issue analysis failed: {e}")
 
     def analyze_rbac_issues(self):
@@ -9902,8 +9877,20 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             self.progress.info("RBAC analysis completed")
 
+        except json.JSONDecodeError as e:
+            self._add_error("analyze_rbac_issues", f"Invalid JSON from kubectl: {e}")
+            self.progress.warning("RBAC analysis failed: Invalid JSON")
+        except KeyError as e:
+            self._add_error("analyze_rbac_issues", f"Missing expected field: {e}")
+            self.progress.warning("RBAC analysis failed: Missing field")
+        except subprocess.TimeoutExpired:
+            self._add_error("analyze_rbac_issues", "kubectl command timed out")
+            self.progress.warning("RBAC analysis failed: kubectl timeout")
+        except subprocess.CalledProcessError as e:
+            self._add_error("analyze_rbac_issues", f"kubectl command failed: {e}")
+            self.progress.warning("RBAC analysis failed: kubectl error")
         except Exception as e:
-            self._add_error("analyze_rbac_issues", str(e))
+            self._add_error("analyze_rbac_issues", f"Unexpected error: {e}")
             self.progress.warning(f"RBAC analysis failed: {e}")
 
     def analyze_pvc_issues(self):
@@ -10245,8 +10232,20 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             self.progress.info("Image pull failure analysis completed")
 
+        except json.JSONDecodeError as e:
+            self._add_error("analyze_image_pull_failures", f"Invalid JSON from kubectl: {e}")
+            self.progress.warning("Image pull failure analysis failed: Invalid JSON")
+        except KeyError as e:
+            self._add_error("analyze_image_pull_failures", f"Missing expected field: {e}")
+            self.progress.warning("Image pull failure analysis failed: Missing field")
+        except subprocess.TimeoutExpired:
+            self._add_error("analyze_image_pull_failures", "kubectl command timed out")
+            self.progress.warning("Image pull failure analysis failed: kubectl timeout")
+        except subprocess.CalledProcessError as e:
+            self._add_error("analyze_image_pull_failures", f"kubectl command failed: {e}")
+            self.progress.warning("Image pull failure analysis failed: kubectl error")
         except Exception as e:
-            self._add_error("analyze_image_pull_failures", str(e))
+            self._add_error("analyze_image_pull_failures", f"Unexpected error: {e}")
             self.progress.warning(f"Image pull failure analysis failed: {e}")
 
     def check_eks_addons(self):
@@ -10757,8 +10756,20 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             self.progress.info("Deep pod health analysis completed")
 
+        except json.JSONDecodeError as e:
+            self._add_error("analyze_pod_health_deep", f"Invalid JSON from kubectl: {e}")
+            self.progress.warning(f"Deep pod health analysis failed: Invalid JSON")
+        except KeyError as e:
+            self._add_error("analyze_pod_health_deep", f"Missing expected field in pod data: {e}")
+            self.progress.warning(f"Deep pod health analysis failed: Missing field")
+        except subprocess.TimeoutExpired:
+            self._add_error("analyze_pod_health_deep", "kubectl command timed out")
+            self.progress.warning("Deep pod health analysis failed: kubectl timeout")
+        except subprocess.CalledProcessError as e:
+            self._add_error("analyze_pod_health_deep", f"kubectl command failed: {e}")
+            self.progress.warning(f"Deep pod health analysis failed: kubectl error")
         except Exception as e:
-            self._add_error("analyze_pod_health_deep", str(e))
+            self._add_error("analyze_pod_health_deep", f"Unexpected error: {e}")
             self.progress.warning(f"Deep pod health analysis failed: {e}")
 
     def analyze_vpc_cni_health(self):
@@ -10830,8 +10841,20 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             self.progress.info("VPC CNI health analysis completed")
 
+        except json.JSONDecodeError as e:
+            self._add_error("analyze_vpc_cni_health", f"Invalid JSON from kubectl: {e}")
+            self.progress.warning("VPC CNI health analysis failed: Invalid JSON")
+        except KeyError as e:
+            self._add_error("analyze_vpc_cni_health", f"Missing expected field: {e}")
+            self.progress.warning("VPC CNI health analysis failed: Missing field")
+        except subprocess.TimeoutExpired:
+            self._add_error("analyze_vpc_cni_health", "kubectl command timed out")
+            self.progress.warning("VPC CNI health analysis failed: kubectl timeout")
+        except subprocess.CalledProcessError as e:
+            self._add_error("analyze_vpc_cni_health", f"kubectl command failed: {e}")
+            self.progress.warning("VPC CNI health analysis failed: kubectl error")
         except Exception as e:
-            self._add_error("analyze_vpc_cni_health", str(e))
+            self._add_error("analyze_vpc_cni_health", f"Unexpected error: {e}")
             self.progress.warning(f"VPC CNI health analysis failed: {e}")
 
     def analyze_coredns_health(self):
@@ -10914,8 +10937,20 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             self.progress.info("CoreDNS health analysis completed")
 
+        except json.JSONDecodeError as e:
+            self._add_error("analyze_coredns_health", f"Invalid JSON from kubectl: {e}")
+            self.progress.warning("CoreDNS health analysis failed: Invalid JSON")
+        except KeyError as e:
+            self._add_error("analyze_coredns_health", f"Missing expected field: {e}")
+            self.progress.warning("CoreDNS health analysis failed: Missing field")
+        except subprocess.TimeoutExpired:
+            self._add_error("analyze_coredns_health", "kubectl command timed out")
+            self.progress.warning("CoreDNS health analysis failed: kubectl timeout")
+        except subprocess.CalledProcessError as e:
+            self._add_error("analyze_coredns_health", f"kubectl command failed: {e}")
+            self.progress.warning("CoreDNS health analysis failed: kubectl error")
         except Exception as e:
-            self._add_error("analyze_coredns_health", str(e))
+            self._add_error("analyze_coredns_health", f"Unexpected error: {e}")
             self.progress.warning(f"CoreDNS health analysis failed: {e}")
 
     def analyze_iam_pod_identity(self):
@@ -11090,8 +11125,22 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             self.progress.info("IAM and Pod Identity analysis completed")
 
+        except json.JSONDecodeError as e:
+            self._add_error("analyze_iam_pod_identity", f"Invalid JSON from API response: {e}")
+            self.progress.warning("IAM and Pod Identity analysis failed: Invalid JSON")
+        except KeyError as e:
+            self._add_error("analyze_iam_pod_identity", f"Missing expected field: {e}")
+            self.progress.warning("IAM and Pod Identity analysis failed: Missing field")
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            if error_code in ["AccessDenied", "UnauthorizedAccess"]:
+                self._add_error("analyze_iam_pod_identity", f"AWS permission denied: {error_code}")
+                self.progress.warning(f"IAM and Pod Identity analysis failed: AWS permission denied")
+            else:
+                self._add_error("analyze_iam_pod_identity", f"AWS API error: {e}")
+                self.progress.warning(f"IAM and Pod Identity analysis failed: AWS error")
         except Exception as e:
-            self._add_error("analyze_iam_pod_identity", str(e))
+            self._add_error("analyze_iam_pod_identity", f"Unexpected error: {e}")
             self.progress.warning(f"IAM and Pod Identity analysis failed: {e}")
 
     def check_eks_pod_identity_associations(self):
@@ -13826,7 +13875,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         return steps
 
-    def _generate_story_summary(self, narrative_events: list, primary_correlation: dict) -> str:
+    def _generate_story_summary(self, narrative_events: list, primary_correlation: dict | None) -> str:
         """Generate a summary paragraph of the incident."""
         if not narrative_events:
             return "No significant issues detected during the analysis period."
@@ -13948,7 +13997,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         best_cause = cause
                         best_lag = lag
 
-            if best_cause:
+            if best_cause and best_lag is not None:
                 causal_pairs.append(
                     {
                         "cause": best_cause.get("summary", "")[:100],
@@ -18532,7 +18581,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 }
                             )
 
-                    if missing_resource:
+                    if missing_resource and resource_type:
+                        rt_lower = resource_type.lower()
                         config_errors.append(
                             {
                                 "summary": f"Missing {resource_type}: {namespace}/{missing_resource} (referenced by pod {pod})",
@@ -18547,7 +18597,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "finding_type": FindingType.CURRENT_STATE,
                                     "diagnostic_steps": [
                                         f"kubectl describe pod {pod} -n {namespace}",
-                                        f"Create missing {resource_type}: kubectl create {resource_type.lower()} {missing_resource} -n {namespace} --from-literal=key=value",
+                                        f"Create missing {resource_type}: kubectl create {rt_lower} {missing_resource} -n {namespace} --from-literal=key=value",
                                         "Or fix the pod spec to reference an existing resource",
                                     ],
                                     "impact": f"Pod cannot start until {resource_type} is created",
@@ -19922,7 +19972,7 @@ Environment Variables:
     return parser
 
 
-def parse_flexible_date(date_str, tz_name="UTC"):
+def parse_flexible_date(date_str: str, tz_name: str = "UTC") -> datetime:
     """
     Parse flexible date formats
 
@@ -19932,9 +19982,12 @@ def parse_flexible_date(date_str, tz_name="UTC"):
     - Relative: "-2h", "-3d", "now"
 
     Returns timezone-aware datetime in UTC
+
+    Raises:
+        DateValidationError: If date_str is empty or invalid
     """
     if not date_str:
-        return None
+        raise DateValidationError("Date string cannot be empty")
 
     tz = pytz.timezone(tz_name)
 
@@ -19980,7 +20033,7 @@ def validate_aws_profile(profile: str, progress) -> None:
     import botocore.exceptions
 
     try:
-        session = boto3.Session(profile_name=profile)
+        session = boto3.Session(profile_name=profile, region_name="us-east-1")
         credentials = session.get_credentials()
 
         if credentials is None:
@@ -19989,7 +20042,6 @@ def validate_aws_profile(profile: str, progress) -> None:
                 f"Run 'aws configure --profile {profile}' or set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY environment variables."
             )
 
-        # Quick validation by getting caller identity
         sts = session.client("sts")
         sts.get_caller_identity()
 
@@ -20005,26 +20057,26 @@ def validate_aws_profile(profile: str, progress) -> None:
             f"Run 'aws configure --profile {profile}' to provide both access key and secret key."
         )
     except botocore.exceptions.NoRegionError:
-        # Region is specified separately, this is OK
         pass
+    except botocore.exceptions.BotoCoreError as e:
+        raise AWSAuthenticationError(f"AWS profile '{profile}' BotoCore error: {e}")
     except AWSAuthenticationError:
         raise
     except Exception as e:
-        # Check if it's a credential loading issue
         if "could not be found" in str(e).lower():
             raise AWSAuthenticationError(f"AWS profile '{profile}' could not be loaded: {e}")
-        # For other errors, let the normal flow handle it
         progress.warning(f"Could not pre-validate AWS profile: {e}")
 
 
-def validate_and_parse_dates(args):
+def validate_and_parse_dates(args) -> tuple[datetime, datetime]:
     """
     Validate and parse date arguments
 
     Returns: (start_date, end_date) as timezone-aware UTC datetimes
     """
     end_date = datetime.now(timezone.utc)
-    start_date = None
+    start_date: datetime
+    end_date = datetime.now(timezone.utc)
 
     # Parse end date if provided
     if args.end_date:

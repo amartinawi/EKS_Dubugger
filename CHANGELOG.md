@@ -6,146 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-## [3.7.9] - 2026-03-07
+## [3.7.5] - 2026-03-04
 
 ### Added
-- **Two new EKS analysis methods** - Registered and integrated into analysis pipeline
-  - `analyze_eks_cluster_insights()` - Detects Kubernetes version deprecation warnings
-  - Identifies addon version compatibility issues
-  - Provides upgrade recommendations
-  - Uses `eks:ListInsights` and `eks:DescribeInsight` APIs with pagination
-  - `analyze_eks_pod_identity_associations()` - Lists all Pod Identity associations with pagination
-  - Verifies namespace and service account existence
-  - Detects IRSA annotation conflicts
-  - Uses `eks:ListPodIdentityAssociations` API
+- **EKS Cluster Insights API** - New `check_eks_cluster_insights()` method
+  - Proactive upgrade readiness checks
+  - Identifies configuration issues before they impact clusters
+  - Categories: UPGRADE_READINESS, PERFORMANCE, SECURITY, RELIABILITY
+  - API: `eks:ListInsights`, `eks:DescribeInsight`
+  - Reference: https://docs.aws.amazon.com/eks/latest/userguide/cluster-insights.html
 
 ### Changed
-- **Code quality improvements** - Addressed all audit-reported issues
-  - Registered 2 orphaned EKS analysis methods in `analysis_methods` list
-  - Added missing `clusterName` parameter to `describe_insight` API call
-  - Fixed recommendations copy button onclick handler
-  - Replaced bare `except:` with `except Exception:` for better error handling
-  - Removed redundant `import time` statement inside function
-- **Project configuration updates**
-  - Updated `project.urls` in `pyproject.toml` with actual repository URLs
-  - Raised `cov-fail-under` threshold from 14% to 40% for better test coverage
-
-### Fixed
-- **API parameter bug** - `describe_insight` now correctly passes `clusterName` parameter
-- **JavaScript bug** - Recommendations copy button now correctly calls `copyToClipboard(this)`
-- **Error handling** - Bare except statements replaced with proper exception handling
-
-## [3.7.8] - 2026-03-07
-
-### Added
-- **Time-based TTL for kubectl cache** - Enhanced cache with 10-minute expiration
-  - Added `KUBECTL_CACHE_TTL_SECONDS = 600` constant
-  - Cache entries now store `(output, timestamp)` tuples
-  - `_get_kubectl_cache()` checks expiration and auto-removes stale entries
-  - Combines LRU eviction (size-based) with TTL (time-based) for optimal freshness
-  - Mirrors `APICache` TTL pattern for consistency
-- **JSON schema validation in CI/CD** - Automated schema validation in GitHub Actions
-  - Added `schema-validation` job to `.github/workflows/ci.yml`
-  - Validates `schemas/output_schema.json` against JSON Schema Draft-07
-  - Validates embedded `LLM_JSON_SCHEMA` in code
-  - Uses `jsonschema.Draft7Validator.check_schema()` for compliance
-  - Catches schema syntax errors before deployment
-- **Integration tests expansion** - Increased test coverage from 4 to 24 tests (500% increase)
-  - `TestPodAnalysisMethods` - Tests for pod evictions, OOM events, CrashLoopBackOff
-  - `TestNodeAnalysisMethods` - Tests for NotReady, MemoryPressure node conditions
-  - `TestControlPlaneAnalysis` - Tests for CloudWatch log analysis
-  - `TestKubectlCacheTTL` - Tests for cache timestamp storage, retrieval, expiration
-  - `TestSeverityClassification` - Tests for critical/warning/info severity detection
-  - All tests use mocked kubectl/AWS services for isolation
-
-### Changed
-- **Type hints coverage** - Increased from 39% to 81.8% (42.8% improvement)
-  - Added return type hints to 72 methods (all `analyze_*` and `check_*` methods)
-  - Total methods with type hints: 153 out of 187
-  - Enables better IDE autocomplete and type checking
-  - Improves code documentation and maintainability
-- **Kubectl cache structure** - Updated to support TTL
-  - Changed from `OrderedDict[str, str]` to `OrderedDict[str, tuple[str, float]]`
-  - Entries now include timestamp for expiration checking
-
-### Fixed
-- **Missing type hint colons** - Fixed 72 method definitions missing colons after `-> None`
-
-### Security
-- **Schema validation** - Prevents deployment of malformed JSON schemas
-  - Ensures output format compatibility with consumers
-  - Validates schema structure against JSON Schema standards
-
-## [3.7.6] - 2026-03-05
-
-### Added
-- **EKS Cluster Insights API** - New `analyze_eks_cluster_insights()` method
-  - Detects Kubernetes version deprecation warnings
-  - Identifies addon version compatibility issues
-  - Provides upgrade recommendations
-  - Uses `eks:ListInsights` and `eks:DescribeInsight` APIs with pagination
-- **EKS Pod Identity Associations** - New `analyze_eks_pod_identity_associations()` method
-  - Lists all Pod Identity associations with pagination
-  - Verifies namespace and service account existence
-  - Detects IRSA annotation conflicts
-  - Uses `eks:ListPodIdentityAssociations` API
-
-### Changed
-- **Service Quotas pagination** - Refactored `analyze_service_quotas()` to use `list_service_quotas` with pagination
-  - Reduced API calls by batching requests per service
-  - More efficient than individual `get_service_quota` calls
-  - Added support for adjustable quota flag
-- **boto3 Config with timeouts** - All AWS clients now use custom timeouts
-  - Connect timeout: 5 seconds
-  - Read timeout: 30 seconds
-  - Adaptive retry mode with max 3 attempts
-  - Prevents hanging on unresponsive APIs
-
-### Security
-- **SECURITY.md** - Added comprehensive security policy documentation
-  - Vulnerability reporting process
-  - Supported versions matrix
-  - Security features documentation
-  - Required AWS permissions
-  - Security best practices
-  - Disclosure policy
+- Reorganized analysis methods - grouped Addons & Insights together
 
 ## [3.7.5] - 2026-03-04
 
-### Fixed
-- **Container Insights false positive** - Added `_detect_alternative_monitoring()` to check for Prometheus, Grafana Agent, Datadog, New Relic
-  - Skips Container Insights metrics check if alternative monitoring is detected
-  - Avoids confusing warnings when teams use custom observability stacks
-- **StatefulSet false positive** - Fixed warning for intentionally scaled down StatefulSets
-  - Now correctly ignores StatefulSets with `spec.replicas: 0` and `status.readyReplicas: 0`
-  - Also fixed namespace bug where `sts["metadata"]["name"]` was incorrectly used instead of `sts["metadata"]["namespace"]`
-- **Duplicate imports** - Removed ~16 duplicate import statements (lines 157-194)
-- **kubectl cache LRU eviction** - Added `KUBECTL_CACHE_MAX_SIZE = 100` limit with OrderedDict-based LRU eviction
-  - Prevents unbounded memory growth during long-running analyses
-  - Added `_get_kubectl_cache()` and `_set_kubectl_cache()` helper methods
-- **Indiscriminate API retry** - Added `_is_retryable_error()` to distinguish retryable from non-retryable errors
-  - Retryable: Throttling, RequestLimitExceeded, ServiceUnavailable, InternalError, etc.
-  - Non-retryable: AccessDenied, NotFound, ValidationError, InvalidParameter, etc.
-  - Prevents wasted retries on permission/config errors that won't succeed
-- **Timestamp format in LLM JSON output** - Fixed timestamps to use ISO 8601 format via `TimezoneManager.to_iso_string()`
-  - Ensures consistent machine-readable timestamps for LLM consumption
-- **CloudWatch API rate limiting** - Added `RateLimiter` class with token bucket algorithm
-  - Limits CloudWatch API calls to 10/second sustained, 20 burst capacity
-  - Prevents burst throttling during metric-intensive analyses
-- **LLM JSON schema definition** - Added `LLM_JSON_SCHEMA` constant with JSON Schema specification
-  - Enables LLM validation of output structure
-  - Added `$schema` reference to LLM JSON output for schema validation
-
 ### Added
-- **HTML output XSS tests** - 10 new tests for XSS prevention in HTML output
-  - Tests for script tags, event handlers, data URLs, javascript: URLs
-  - Unicode preservation tests
-  - Empty results crash prevention tests
-- **Correlation logic unit tests** - 15 new tests for root cause analysis
-  - 5D confidence scoring tests (temporal, spatial, mechanism, exclusivity, reproducibility)
-  - Confidence tier classification tests (high/medium/low)
-  - Root cause ranking prioritization tests
-  - Spatial correlation namespace weighting tests
+- **EKS Cluster Insights API** - New `check_eks_cluster_insights()` method
+  - Proactive upgrade readiness checks
+  - Identifies configuration issues before they impact clusters
+  - Categories: UPGRADE_READINESS, PERFORMANCE, SECURITY, RELIABILITY
+  - API: `eks:ListInsights`, `eks:DescribeInsight`
+  - Reference: https://docs.aws.amazon.com/eks/latest/userguide/cluster-insights.html
+
+### Changed
+- Reorganized analysis methods - grouped Addons & Insights together
 
 ## [3.7.4] - 2026-03-04
 

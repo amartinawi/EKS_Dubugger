@@ -31,14 +31,24 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import boto3
+import structlog
 from botocore.exceptions import BotoCoreError, ClientError, NoRegionError, PartialCredentialsError, ProfileNotFound
 from dateutil import parser as date_parser
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
-# Configure module-level logger
-logger = logging.getLogger(__name__)
+# Configure structlog for structured logging
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.dev.ConsoleRenderer() if sys.stderr.isatty() else structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    logger_factory=structlog.PrintLoggerFactory(),
+)
 
-logger.setLevel(logging.INFO)
+log = structlog.get_logger()
 
 VERSION = "3.8.0"
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
@@ -1242,12 +1252,8 @@ class ProgressTracker:
 
     def _configure_logging(self):
         """Configure logging based on settings."""
-        if self.log_level:
-            logger.setLevel(self.log_level)
-        elif self.verbose:
-            logger.setLevel(logging.DEBUG)
-        else:
-            logger.setLevel(logging.INFO)
+        # structlog level is configured at module level; this is a no-op for compatibility
+        pass
 
     def set_total_steps(self, total):
         self.total_steps = total
@@ -1257,8 +1263,8 @@ class ProgressTracker:
         self.steps_completed += 1
         prefix = f"[{self.steps_completed}/{self.total_steps}]" if self.total_steps > 0 else ""
 
-        # Always log to logger
-        logger.info(f"{prefix} {message}")
+        # Always log to structlog
+        log.info("step", message=message, prefix=prefix)
 
         # Also print to console if not quiet
         if not self.quiet:
@@ -1266,8 +1272,8 @@ class ProgressTracker:
 
     def info(self, message):
         """Show info message."""
-        # Always log to logger
-        logger.info(message)
+        # Always log to structlog
+        log.info("info", message=message)
 
         # Also print to console if verbose and not quiet
         if self.verbose and not self.quiet:
@@ -1275,8 +1281,8 @@ class ProgressTracker:
 
     def warning(self, message):
         """Show warning message."""
-        # Always log to logger
-        logger.warning(message)
+        # Always log to structlog
+        log.warning("warning", message=message)
 
         # Also print to console if not quiet
         if not self.quiet:
@@ -1284,8 +1290,8 @@ class ProgressTracker:
 
     def error(self, message):
         """Show error message."""
-        # Always log to logger
-        logger.error(message)
+        # Always log to structlog
+        log.error("error", message=message)
 
         # Also print to stderr for visibility
         print(f"✗ {message}", file=sys.stderr)

@@ -1,6 +1,7 @@
 boto3>=1.26.0
 python-dateutil>=2.8.0
 tenacity>=8.0.0
+structlog>=24.1.0
 
 # Test dependencies
 pytest>=8.0.0

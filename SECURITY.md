@@ -10,7 +10,7 @@ We take the security of EKS Health Check Dashboard seriously. If you believe you
 
 Instead, please report them via:
 
-- **Email:** security@yourdomain.com (replace with actual security email)
+- **Email:** security@amartinawi.com
 - **GitHub Security Advisory:** Use the "Security" tab in the repository to create a private security advisory
 
 You should receive a response within 48 hours. If for some reason you do not, please follow up via email to ensure we received your original message.

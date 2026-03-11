@@ -198,7 +198,7 @@ logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.INFO)
 
-VERSION = "3.7.5"
+VERSION = "3.8.0"
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30

@@ -36,17 +36,39 @@ from botocore.exceptions import BotoCoreError, ClientError, NoRegionError, Parti
 from dateutil import parser as date_parser
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
-# Configure structlog for structured logging
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.dev.ConsoleRenderer() if sys.stderr.isatty() else structlog.processors.JSONRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    logger_factory=structlog.PrintLoggerFactory(),
-)
+# Configure structlog for structured logging (console output suppressed by default)
+# Can be enabled for file logging or external integrations via LOG_FILE or LOG_LEVEL env vars
+log_level_str = os.environ.get("LOG_LEVEL", "WARNING").upper()
+log_level = getattr(logging, log_level_str, logging.WARNING)
+log_file = os.environ.get("LOG_FILE")
+
+if log_file:
+    # File logging enabled
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.basicConfig(handlers=[file_handler], level=log_level, force=True)
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
+        logger_factory=structlog.PrintLoggerFactory(),
+    )
+else:
+    # Console output suppressed - only errors to stderr
+    logging.basicConfig(level=log_level, stream=sys.stderr, force=True)
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
+        logger_factory=structlog.BytesLoggerFactory(),
+    )
 
 log = structlog.get_logger()
 

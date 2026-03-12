@@ -13109,8 +13109,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         ]
 
         # Check for upgrade-related events in findings
+        # CRITICAL: Only check HISTORICAL findings that are within the time window
         for category, findings_list in self.findings.items():
             for finding in findings_list:
+                # Skip current-state findings for upgrade detection
+                if finding.get("details", {}).get("finding_type") != FindingType.HISTORICAL_EVENT:
+                    continue
+
+                # Skip findings outside the time window
+                if not self._is_finding_in_time_window(finding):
+                    continue
+
                 summary = finding.get("summary", "").lower()
                 details_str = str(finding.get("details", {})).lower()
 
@@ -13135,17 +13144,23 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     )
 
         # Check for patterns indicating upgrade: multiple node events in short time
+        # Only check HISTORICAL findings within time window
         node_ready_events = [
             f
             for f in self.findings.get("node_issues", [])
-            if any(kw in f.get("summary", "").lower() for kw in ["ready", "reboot", "notready", "pressure"])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+            and any(kw in f.get("summary", "").lower() for kw in ["ready", "reboot", "notready", "pressure"])
         ]
 
         # Check for DaemonSet restarts (common during upgrades)
+        # Only check HISTORICAL findings within time window
         ds_restarts = [
             f
             for f in self.findings.get("pod_errors", [])
-            if any(
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+            and any(
                 ds in f.get("summary", "").lower()
                 for ds in ["aws-node", "coredns", "kube-proxy", "vpc-cni", "ebs-csi", "efs-csi"]
             )
@@ -13153,10 +13168,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # ENHANCED: Check for upgrade-like patterns even without explicit keywords
         # Pattern 1: Mass pod evictions across multiple nodes (upgrade causes node cycling)
+        # Only check HISTORICAL findings within time window
         evicted_pods = [
             f
             for f in self.findings.get("pod_errors", [])
-            if any(
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+            and any(
                 kw in f.get("summary", "").lower() for kw in ["evict", "terminat", "deleted", "removed", "disruption"]
             )
         ]
@@ -13167,27 +13185,73 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 evicted_nodes.add(node)
 
         # Pattern 2: Multiple pods restarting on same node (upgrade rollout)
+        # Only check HISTORICAL findings within time window
         restarted_pods = [
             f
             for f in self.findings.get("pod_errors", [])
-            if any(kw in f.get("summary", "").lower() for kw in ["restart", "crashloop", "backoff", "killed", "failed"])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+            and any(
+                kw in f.get("summary", "").lower() for kw in ["restart", "crashloop", "backoff", "killed", "failed"]
+            )
         ]
 
         # Pattern 3: High finding density - lots of issues in short time window
-        total_findings_count = sum(len(v) for v in self.findings.values())
+        # IMPORTANT: Only count HISTORICAL findings for upgrade pattern scoring
+        # Current-state findings represent ongoing conditions, not upgrade-related events
+        total_historical_count = sum(
+            1
+            for cat, flist in self.findings.items()
+            for f in flist
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        )
+        total_current_count = sum(
+            1
+            for cat, flist in self.findings.items()
+            for f in flist
+            if f.get("details", {}).get("finding_type") != FindingType.HISTORICAL_EVENT
+        )
 
         # Pattern 4: Issues spread across multiple categories (upgrade affects everything)
-        affected_categories = [cat for cat, flist in self.findings.items() if flist]
+        # Only count categories with HISTORICAL findings within time window for upgrade pattern
+        affected_categories = [
+            cat
+            for cat, flist in self.findings.items()
+            if any(
+                f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+                and self._is_finding_in_time_window(f)
+                for f in flist
+            )
+        ]
         category_spread = len(affected_categories)
 
         # Pattern 5: OOM kills during upgrade (pods restarting with lower memory)
-        oom_kills = self.findings.get("oom_killed", [])
+        # Only check HISTORICAL findings within time window
+        oom_kills = [
+            f
+            for f in self.findings.get("oom_killed", [])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
 
         # Pattern 6: Scheduling failures during upgrade (nodes temporarily unavailable)
-        sched_failures = self.findings.get("scheduling_failures", [])
+        # Only check HISTORICAL findings within time window
+        sched_failures = [
+            f
+            for f in self.findings.get("scheduling_failures", [])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
 
         # Pattern 7: Multiple nodes affected by pressure
-        pressure_events = self.findings.get("memory_pressure", []) + self.findings.get("disk_pressure", [])
+        # Only check HISTORICAL findings within time window
+        pressure_events = [
+            f
+            for f in (self.findings.get("memory_pressure", []) + self.findings.get("disk_pressure", []))
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
         pressure_nodes = set()
         for pe in pressure_events:
             node = pe.get("details", {}).get("node")
@@ -13195,13 +13259,31 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 pressure_nodes.add(node)
 
         # Pattern 8: Image pull failures (pods restarting quickly)
-        image_pull_failures = self.findings.get("image_pull_failures", [])
+        # Only check HISTORICAL findings within time window
+        image_pull_failures = [
+            f
+            for f in self.findings.get("image_pull_failures", [])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
 
         # Pattern 9: Network issues (CNI restarting)
-        network_issues = self.findings.get("network_issues", [])
+        # Only check HISTORICAL findings within time window
+        network_issues = [
+            f
+            for f in self.findings.get("network_issues", [])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        ]
 
         # Pattern 10: Node issues (NotReady, conditions changing)
-        node_issues_count = len(self.findings.get("node_issues", []))
+        # Only check HISTORICAL findings within time window
+        node_issues_count = sum(
+            1
+            for f in self.findings.get("node_issues", [])
+            if f.get("details", {}).get("finding_type") == FindingType.HISTORICAL_EVENT
+            and self._is_finding_in_time_window(f)
+        )
 
         # Calculate upgrade pattern score
         upgrade_pattern_score = 0
@@ -13250,12 +13332,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             upgrade_pattern_evidence.append(f"{len(sched_failures)} scheduling failures")
 
         # High finding count in short time window
-        if total_findings_count >= 20:
+        # IMPORTANT: Only count HISTORICAL findings for upgrade pattern scoring
+        if total_historical_count >= 20:
             upgrade_pattern_score += 2
-            upgrade_pattern_evidence.append(f"{total_findings_count} total findings in analysis window")
-        elif total_findings_count >= 10:
+            upgrade_pattern_evidence.append(f"{total_historical_count} historical findings in analysis window")
+        elif total_historical_count >= 10:
             upgrade_pattern_score += 1
-            upgrade_pattern_evidence.append(f"{total_findings_count} findings detected")
+            upgrade_pattern_evidence.append(f"{total_historical_count} historical findings detected")
 
         # Multiple pod restarts
         if len(restarted_pods) >= 5:

@@ -15,7 +15,6 @@ import json
 import json as json_module
 import logging
 import os
-import random
 import re
 import shlex
 import subprocess
@@ -10974,6 +10973,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "namespace": involved.get("namespace", "unknown"),
                                     "object": involved.get("name", "unknown"),
                                     "message": event.get("message", "N/A")[:200],
+                                    "timestamp": event.get("lastTimestamp")
+                                    or event.get("eventTime")
+                                    or event.get("firstTimestamp", "Unknown"),
                                     "root_causes": EKS_ISSUE_PATTERNS["network_issues"]["IPExhaustion"]["root_causes"],
                                     "severity": "critical",
                                     "aws_doc": EKS_ISSUE_PATTERNS["network_issues"]["IPExhaustion"]["aws_doc"],
@@ -11068,6 +11070,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "object": involved.get("name", "unknown"),
                                     "reason": reason,
                                     "message": event.get("message", "N/A")[:200],
+                                    "timestamp": event.get("lastTimestamp")
+                                    or event.get("eventTime")
+                                    or event.get("firstTimestamp", "Unknown"),
                                     "root_causes": EKS_ISSUE_PATTERNS["network_issues"]["DNSResolutionFailure"][
                                         "root_causes"
                                     ],
@@ -11157,6 +11162,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "object": involved.get("name", "unknown"),
                                     "reason": event.get("reason", "N/A"),
                                     "message": event.get("message", "N/A")[:200],
+                                    "timestamp": event.get("lastTimestamp")
+                                    or event.get("eventTime")
+                                    or event.get("firstTimestamp", "Unknown"),
                                     "root_causes": EKS_ISSUE_PATTERNS["iam_issues"]["AccessDenied"]["root_causes"],
                                     "severity": "critical",
                                     "aws_doc": EKS_ISSUE_PATTERNS["iam_issues"]["AccessDenied"]["aws_doc"],
@@ -11204,6 +11212,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                             "error_code": error_code,
                                             "error_message": error_message[:300] if error_message else "N/A",
                                             "event_time": str(event.get("EventTime", "Unknown")),
+                                            "timestamp": str(event.get("EventTime", "Unknown")),
                                             "severity": "critical",
                                             "root_causes": [
                                                 "IAM role trust policy does not allow OIDC provider",
@@ -12668,6 +12677,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     "namespace": namespace,
                                     "exit_code": exit_code,
                                     "reason": reason,
+                                    "timestamp": terminated.get("finishedAt", "Unknown"),
                                     "severity": "info",
                                     "finding_type": FindingType.HISTORICAL_EVENT,
                                     "impact": "Debug container ran out of memory - indicates resource constraints",

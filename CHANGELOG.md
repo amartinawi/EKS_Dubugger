@@ -6,6 +6,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [3.8.1] - 2026-05-03
+
+### Fixed
+
+- **[CRITICAL] StatefulSet namespace key wrong** (`analyze_statefulset_issues`)  
+  `sts["metadata"]["name"]` was used as `namespace` instead of `sts["metadata"]["namespace"]`.
+  Every PVC lookup and finding was attributed to the StatefulSet name, causing empty PVC results
+  and mislabelled findings across all StatefulSets.
+
+- **[CRITICAL] Upgrade detection disabled by naive/aware datetime comparison** (`_check_eks_cluster_upgrade`)  
+  `dateutil.parser.parse` returns a naive `datetime` when the AWS API response string has no
+  timezone offset. Comparing that to the always-tz-aware `self.start_date` raised `TypeError`,
+  silently disabling all cluster upgrade detection. UTC is now assumed when no TZ is present.
+
+- **[CRITICAL] Init container failures double-counted in findings**  
+  `analyze_pod_health_deep` contained a duplicate init container scanning block that wrote to the
+  same `pod_errors` category as `analyze_init_container_failures`. Both ran unconditionally,
+  inflating severity counts and corrupting correlation scores. The redundant block has been removed
+  from `analyze_pod_health_deep`; `analyze_init_container_failures` is the canonical implementation.
+
+- **[CRITICAL] Control plane logs silently truncated at 50 events** (`analyze_control_plane_logs`)  
+  A direct `get_log_events(limit=50)` call was used instead of the existing
+  `_get_log_events_paginated` helper. Clusters with high log volume (etcd quota exhaustion,
+  scheduler panics) had the vast majority of their control-plane errors invisible to analysis.
+
+- **[HIGH] Six bare `except Exception: pass` blocks silenced analysis failures**  
+  Sub-blocks in `analyze_node_conditions` (PIDPressure), `analyze_pvc_issues` (three blocks), and
+  `analyze_etcd_health` (two blocks) swallowed all exceptions without logging. Each is now replaced
+  with `self._add_error(...)` so failures surface in the report.
+
+- **[HIGH] Container Insights metrics silently return zero datapoints for short time windows**  
+  `get_metric_statistics` used a fixed `Period=3600`, which requires the query window to be at
+  least one hour. Runs with `--hours 1` or shorter returned an empty `Datapoints` list with no
+  error, producing false-clean results. `Period` is now derived from the actual window duration
+  (`max(60, window_seconds)`).
+
+- **[HIGH] Duplicate CoreDNS pod-phase findings** (`analyze_network_issues`)  
+  A CoreDNS pod-phase check in `analyze_network_issues` emitted to `dns_issues` for the same
+  condition already covered by the dedicated `analyze_coredns_health`. The redundant check has been
+  removed; `analyze_coredns_health` remains the canonical implementation.
+
+- **[HIGH] Ingress backend service name unquoted in kubectl command** (`analyze_ingress_health`)  
+  `backend_svc` and `namespace` from the Ingress spec were interpolated into the kubectl command
+  string without `shlex.quote()`. A service name containing a space would cause `shlex.split` to
+  silently query a different resource. Both values are now quoted.
+
+- **[MEDIUM] KeyError on PVC spec access for dynamic-provisioner PVCs** (`analyze_pvc_issues`)  
+  `pvc["spec"]["resources"]["requests"]` used direct indexing; PVCs that omit `resources` or
+  `resources.requests` (valid in some provisioner flows) raised `KeyError`. Replaced with a
+  safe `.get()` chain.
+
+- **[MEDIUM] `_extract_timestamp` returns naive datetime causing sort `TypeError`**  
+  `dateutil.parser.parse` could return a naive `datetime` for strings without a timezone designator.
+  Sorting that value against tz-aware timestamps in `correlate_findings` raised `TypeError`.
+  UTC is now assumed when no TZ is present, consistent with `analyze_node_ami_age`.
+
+- **[MEDIUM] XSS in HTML report — component name/message unescaped** (`HTMLOutputFormatter`)  
+  `comp.get("name")` and `comp.get("message")` in the Healthy Components section of the executive
+  summary were interpolated raw into HTML. A Kubernetes resource with a crafted name containing
+  `<script>` would execute in any browser that opens the report. Both values now pass through
+  `_escape_html()`.
+
 ## [3.8.0] - 2026-03-11
 
 ### Added

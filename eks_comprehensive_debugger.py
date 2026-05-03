@@ -2933,8 +2933,8 @@ class HTMLOutputFormatter(OutputFormatter):
                                 <div class="healthy-item">
                                     <span class="healthy-icon">✓</span>
                                     <div class="healthy-info">
-                                        <div class="healthy-name">{comp.get("name", "")}</div>
-                                        <div class="healthy-message">{comp.get("message", "")}</div>
+                                        <div class="healthy-name">{self._escape_html(comp.get("name", ""))}</div>
+                                        <div class="healthy-message">{self._escape_html(comp.get("message", ""))}</div>
                                     </div>
                                 </div>
                 """
@@ -9294,8 +9294,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 },
                             },
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                self._add_error("analyze_node_conditions_pid", str(e))
 
             self.progress.info(f"Analyzed {len(nodes_data.get('items', []))} nodes")
 
@@ -9407,7 +9407,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     Dimensions=[{"Name": "ClusterName", "Value": self.cluster_name}],
                     StartTime=time_params["StartTime"],
                     EndTime=time_params["EndTime"],
-                    Period=3600,
+                    # Period must be ≤ the query window; a fixed 3600 returns zero
+                    # datapoints for windows shorter than 1 hour.
+                    Period=max(60, int((self.end_date - self.start_date).total_seconds())),
                     Statistics=["Average", "Maximum", "Minimum"],
                 )
 
@@ -9718,20 +9720,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             for stream in streams_response.get("logStreams", []):
                 stream_name = stream["logStreamName"]
 
-                success, logs_response = self.safe_api_call(
-                    self.logs_client.get_log_events,
-                    logGroupName=log_group,
-                    logStreamName=stream_name,
-                    startTime=int(self.start_date.timestamp() * 1000),
-                    endTime=int(self.end_date.timestamp() * 1000),
-                    limit=50,
-                    startFromHead=False,
+                events = self._get_log_events_paginated(
+                    log_group,
+                    stream_name,
+                    int(self.start_date.timestamp() * 1000),
+                    int(self.end_date.timestamp() * 1000),
                 )
 
-                if not success:
-                    continue
-
-                for event in logs_response.get("events", []):
+                for event in events:
                     message = event["message"]
                     message_lower = message.lower()
 
@@ -9925,29 +9921,6 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         },
                     )
 
-            # Check CoreDNS health
-            cmd = "kubectl get pods -n kube-system -l k8s-app=kube-dns -o json"
-            output = self.safe_kubectl_call(cmd)
-            if output:
-                pods = json.loads(output)
-                for pod in pods.get("items", []):
-                    pod_name = pod["metadata"]["name"]
-                    phase = pod["status"].get("phase", "Unknown")
-
-                    if phase != "Running":
-                        self._add_finding_dict(
-                            "dns_issues",
-                            {
-                                "summary": f"CoreDNS pod {pod_name} is not Running (status: {phase})",
-                                "details": {
-                                    "pod": pod_name,
-                                    "namespace": "kube-system",
-                                    "status": phase,
-                                    "finding_type": FindingType.CURRENT_STATE,
-                                },
-                            },
-                        )
-
             self.progress.info("Network issue analysis completed")
 
         except json.JSONDecodeError as e:
@@ -10065,7 +10038,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if phase != "Bound":
                         storage_class = pvc["spec"].get("storageClassName", "N/A")
-                        requested_storage = pvc["spec"]["resources"]["requests"].get("storage", "N/A")
+                        requested_storage = pvc.get("spec", {}).get("resources", {}).get("requests", {}).get("storage", "N/A")
 
                         diagnostic_steps = [
                             f"kubectl describe pvc {pvc_name} -n {namespace}",
@@ -10233,8 +10206,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             },
                         )
 
-            except Exception:
-                pass
+            except Exception as e:
+                self._add_error("analyze_pvc_issues_pv", str(e))
 
             try:
                 cmd = "kubectl get events --all-namespaces --field-selector reason=ProvisioningFailed -o json"
@@ -10265,8 +10238,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 },
                             },
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                self._add_error("analyze_pvc_issues_provisioning", str(e))
 
             try:
                 cmd = "kubectl get events --all-namespaces --field-selector reason=VolumeResizeFailed -o json"
@@ -10296,8 +10269,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 },
                             },
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                self._add_error("analyze_pvc_issues_resize", str(e))
 
             self.progress.info("PVC/PV analysis completed")
 
@@ -10743,125 +10716,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             },
                         )
 
-                # Check init container statuses (Catalog 3.5: Init Container Failure)
-                init_container_statuses = status.get("initContainerStatuses", [])
-                if init_container_statuses:
-                    for idx, init_status in enumerate(init_container_statuses):
-                        init_name = init_status.get("name", "Unknown")
-                        state = init_status.get("state", {})
-
-                        waiting = state.get("waiting", {})
-                        terminated = state.get("terminated", {})
-
-                        if waiting:
-                            reason = waiting.get("reason", "")
-                            message = waiting.get("message", "")
-
-                            if reason in [
-                                "ImagePullBackOff",
-                                "ErrImagePull",
-                                "CrashLoopBackOff",
-                                "RunContainerError",
-                                "CreateContainerConfigError",
-                            ]:
-                                failure_category = "unknown"
-                                diagnostic_steps = []
-
-                                if reason in ["ImagePullBackOff", "ErrImagePull"]:
-                                    failure_category = "image_pull"
-                                    diagnostic_steps = [
-                                        f"kubectl describe pod {pod_name} -n {namespace}",
-                                        "Verify image exists in registry",
-                                        "Check imagePullSecrets configuration",
-                                        "Verify node IAM role has ECR permissions",
-                                    ]
-                                elif reason == "CrashLoopBackOff":
-                                    failure_category = "init_crash"
-                                    diagnostic_steps = [
-                                        f"kubectl logs {pod_name} -n {namespace} -c {init_name} --previous",
-                                        "Check init container script for errors",
-                                        "Verify init container has required permissions",
-                                        "Check for missing dependencies",
-                                    ]
-                                elif reason == "CreateContainerConfigError":
-                                    failure_category = "config_error"
-                                    diagnostic_steps = [
-                                        f"kubectl describe pod {pod_name} -n {namespace}",
-                                        "Check for missing ConfigMaps or Secrets",
-                                        "Verify volume mounts exist",
-                                    ]
-
-                                self._add_finding_dict(
-                                    "pod_errors",
-                                    {
-                                        "summary": f"Pod {namespace}/{pod_name} init container {init_name} failed: {reason}",
-                                        "details": {
-                                            "pod": pod_name,
-                                            "namespace": namespace,
-                                            "init_container": init_name,
-                                            "init_index": idx,
-                                            "container_type": "init",
-                                            "reason": reason,
-                                            "failure_category": failure_category,
-                                            "message": message[:200] if message else "N/A",
-                                            "severity": "critical",
-                                            "diagnostic_steps": diagnostic_steps,
-                                            "impact": "Pod cannot start until init containers complete successfully",
-                                            "aws_doc": "https://kubernetes.io/docs/concepts/workloads/pods/init-containers/",
-                                        },
-                                    },
-                                )
-
-                        elif terminated:
-                            exit_code = terminated.get("exitCode", 0)
-                            reason = terminated.get("reason", "")
-
-                            if exit_code != 0:
-                                failure_category = "init_exit_error"
-                                diagnostic_steps = [
-                                    f"kubectl logs {pod_name} -n {namespace} -c {init_name}",
-                                    f"Exit code {exit_code} indicates failure",
-                                ]
-
-                                if exit_code == 137:
-                                    failure_category = "init_oom_killed"
-                                    diagnostic_steps.extend(
-                                        [
-                                            "Init container was OOMKilled",
-                                            "Increase init container memory limits",
-                                        ]
-                                    )
-                                elif exit_code == 1:
-                                    diagnostic_steps.extend(
-                                        [
-                                            "Check init container command/script for errors",
-                                            "Verify all dependencies are available",
-                                        ]
-                                    )
-                                elif exit_code == 126:
-                                    diagnostic_steps.append("Command permission denied or not executable")
-                                elif exit_code == 127:
-                                    diagnostic_steps.append("Command not found")
-
-                                self._add_finding_dict(
-                                    "pod_errors",
-                                    {
-                                        "summary": f"Pod {namespace}/{pod_name} init container {init_name} exited with code {exit_code}",
-                                        "details": {
-                                            "pod": pod_name,
-                                            "namespace": namespace,
-                                            "init_container": init_name,
-                                            "container_type": "init",
-                                            "exit_code": exit_code,
-                                            "reason": reason,
-                                            "failure_category": failure_category,
-                                            "message": terminated.get("message", "")[:200],
-                                            "severity": "critical",
-                                            "diagnostic_steps": diagnostic_steps,
-                                            "aws_doc": "https://kubernetes.io/docs/concepts/workloads/pods/init-containers/",
-                                        },
-                                    },
-                                )
+                # Init container failure detection is handled exclusively by
+                # analyze_init_container_failures (richer exit-code mapping, event-TTL coverage).
 
                 # Check for pods stuck in Init state (Init:0/N, Init:Error, etc.)
                 if phase == "Pending":
@@ -11391,7 +11247,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     return ts
                 if isinstance(ts, str):
                     if "T" in ts or "-" in ts:
-                        return date_parser.parse(ts)
+                        dt = date_parser.parse(ts)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt
             except Exception:
                 pass
         return None
@@ -11452,6 +11311,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             from dateutil import parser
 
                             created_at_dt = parser.parse(created_at)
+                            # dateutil returns naive datetime when the string has no TZ offset;
+                            # comparing naive to the tz-aware self.start_date raises TypeError.
+                            if created_at_dt.tzinfo is None:
+                                created_at_dt = created_at_dt.replace(tzinfo=timezone.utc)
                         except Exception:
                             continue
                     else:
@@ -11994,7 +11857,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         backend_svc = service.get("name")
 
                         if backend_svc:
-                            svc_check = self.safe_kubectl_call(f"kubectl get svc {backend_svc} -n {namespace} -o name")
+                            svc_check = self.safe_kubectl_call(f"kubectl get svc {shlex.quote(backend_svc)} -n {shlex.quote(namespace)} -o name")
                             if not svc_check:
                                 self._add_finding(
                                     "network_issues",
@@ -16953,8 +16816,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                     },
                                 },
                             )
-            except Exception:
-                pass
+            except Exception as e:
+                self._add_error("analyze_etcd_health_cw", str(e))
 
             try:
                 cmd = "kubectl get events --all-namespaces --field-selector reason=FailedCreate -o json"
@@ -16985,8 +16848,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                         },
                                     },
                                 )
-            except Exception:
-                pass
+            except Exception as e:
+                self._add_error("analyze_etcd_health_events", str(e))
 
             if etcd_quota_exceeded:
                 self._add_finding_dict(
@@ -18148,7 +18011,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             for sts in statefulsets.get("items", []):
                 sts_name = sts["metadata"]["name"]
-                namespace = sts["metadata"]["name"]
+                namespace = sts["metadata"]["namespace"]
                 spec = sts.get("spec", {})
                 status = sts.get("status", {})
 

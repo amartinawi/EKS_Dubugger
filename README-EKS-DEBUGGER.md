@@ -4,17 +4,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![AWS EKS](https://img.shields.io/badge/AWS-EKS-orange.svg)](https://aws.amazon.com/eks/)
 [![Catalog Coverage](https://img.shields.io/badge/catalog%20coverage-100%25-green.svg)](#catalog-coverage)
-[![Tests](https://img.shields.io/badge/tests-207%20passing-brightgreen.svg)](#unit-tests)
+[![Tests](https://img.shields.io/badge/tests-215%20passing-brightgreen.svg)](#unit-tests)
 
 A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 3.8.0 | **Analysis Methods:** 73 | **Catalog Coverage:** 100% | **Tests:** 215
+**Version:** 3.8.1 | **Analysis Methods:** 74 | **Catalog Coverage:** 100% | **Tests:** 215
 
 ---
 
 ## Features
 
-### Comprehensive Issue Detection (73 Analysis Methods)
+### Comprehensive Issue Detection (74 Analysis Methods)
 
 #### Pod & Workload Issues
 - **CrashLoopBackOff** - Container crash detection with exit code analysis
@@ -116,7 +116,7 @@ Each finding is classified as either:
 - **Cascading failure analysis**
 
 ### Performance Optimizations (v3.3.0)
-- **Parallel Analysis** - 72 methods run concurrently using ThreadPoolExecutor
+- **Parallel Analysis** - 74 methods run concurrently using ThreadPoolExecutor
 - **Shared Data Pre-fetching** - CloudWatch log groups and kubectl data fetched once
 - **API Response Caching** - TTL-based cache for AWS API calls (5-minute default)
 - **kubectl Output Caching** - LRU eviction with 100-entry limit (v3.7.5)
@@ -134,10 +134,27 @@ Each finding is classified as either:
 - **Schema Reference** - `$schema` field in JSON output for automated validation
 - **ISO 8601 Timestamps** - All timestamps in standardized format for LLM consumption
 
+### Reliability Improvements (v3.8.1)
+
+A full static audit of the codebase identified and resolved 13 bugs across crash, data-loss, and
+correctness categories. See [`EKS_AUDIT_REPORT.md`](EKS_AUDIT_REPORT.md) for the complete findings.
+
+Key fixes:
+- **StatefulSet namespace key** — PVC lookups and findings were attributed to the wrong namespace
+- **Upgrade detection re-enabled** — naive/aware datetime `TypeError` was silently disabling all cluster upgrade correlation
+- **Duplicate init container findings removed** — two methods wrote to the same category simultaneously, inflating severity counts
+- **Control plane log pagination** — analysis was silently truncated at 50 events per log stream
+- **Silent exception swallowing** — 6 bare `except: pass` blocks in etcd, PVC, and node analysis now surface errors
+- **Container Insights metrics period** — fixed zero-datapoint results for analysis windows under 1 hour
+- **CoreDNS deduplication** — removed overlapping check that caused every CoreDNS issue to appear twice
+- **kubectl argument quoting** — `shlex.quote()` applied to Ingress backend service names
+- **HTML report XSS** — component names and messages in the executive summary now pass through `html.escape()`
+
 ### Security Features (v3.4.0+)
 - **Input Validation** - All CLI parameters validated with strict regex patterns (max 256 chars)
 - **Shell Injection Prevention** - Blocks dangerous characters (`;`, `|`, `&&`, `$()`, backticks)
-- **XSS Prevention** - HTML output properly escaped (v3.6.0)
+- **XSS Prevention** - HTML output fully escaped including executive summary components (v3.8.1)
+- **kubectl Argument Quoting** - `shlex.quote()` applied to all resource names interpolated into kubectl commands (v3.8.1)
 - **Secure File Permissions** - Output files created with `0o600` (owner-only)
 - **Log Sanitization** - AWS Account ID masked, IAM ARN truncated
 - **Thread-Safe Operations** - Concurrent analysis with proper locking

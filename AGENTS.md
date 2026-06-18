@@ -7,13 +7,13 @@ Guidelines for AI coding agents working in the EKS Health Check Dashboard codeba
 Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
 
 **Version:** 5.0.0  
-**Lines of Code:** ~23,400 (debugger) + ~800 (MCP server)  
+**Lines of Code:** ~22,800 (debugger) + ~1,400 (MCP server)  
 **Analysis Methods:** 84  
 **Correlation Rules:** 18  
 **Remediation Patterns:** 45+  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)  
 **MCP Tools:** 18 (AI-agent discoverable via Model Context Protocol)  
-**Unit Tests:** 383 tests (381 passing, 2 slow performance tests)
+**Unit Tests:** 384 tests (382 passing, 2 slow performance tests)
 
 ## Quick Commands
 
@@ -47,13 +47,13 @@ mypy eks_comprehensive_debugger.py --ignore-missing-imports
 ## File Structure
 
 ```
-eks_comprehensive_debugger.py  # Main debugger (~22,600 lines, all-in-one)
+eks_comprehensive_debugger.py  # Main debugger (~22,800 lines, all-in-one)
 eks_mcp_server.py              # MCP server — 18 tools for AI agents (Phase 2)
 requirements.txt               # Python dependencies (includes test deps)
 .gitignore                     # Git ignore rules
 README.md                      # User documentation
 AGENTS.md                      # This file
-tests/                         # Unit tests (383 tests)
+tests/                         # Unit tests (384 tests)
 ├── __init__.py
 ├── conftest.py                # Shared fixtures
 ├── test_severity_classification.py  # Severity logic tests
@@ -720,7 +720,7 @@ def _calculate_5d_confidence(self, cause_events: list, effect_events: list, mech
 ### Error Handling
 
 **Analysis Methods Exception Philosophy:**
-Each of the 72 analysis methods wraps its logic in `try/except Exception` for **graceful degradation**. This is intentional: if one analysis method fails (e.g., API timeout, malformed data), other methods continue and the tool still produces useful output.
+Each of the 84 analysis methods wraps its logic in `try/except Exception` for **graceful degradation**. This is intentional: if one analysis method fails (e.g., API timeout, malformed data), other methods continue and the tool still produces useful output.
 
 Known exception sources within methods:
 - `json.loads()` → `json.JSONDecodeError` (malformed kubectl/AWS responses)

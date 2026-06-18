@@ -6,6 +6,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-06-18
+
+### Added — Phase 2: MCP Server for AI Agent Interoperability
+
+- **MCP server** (`eks_mcp_server.py`) — 18 discoverable tools via Model Context Protocol
+  - Tier 1 (Connection): `connect`, `cluster_health`
+  - Tier 2 (Analysis): `analyze_pods`, `analyze_nodes`, `analyze_networking`, `analyze_control_plane`, `analyze_storage`, `analyze_iam`, `run_full_analysis`
+  - Tier 3 (Results): `get_findings`, `get_correlations`, `get_summary`, `search_findings`, `get_timeline`
+  - Tier 4 (Remediation): `get_remediation`, `get_recommendations`
+  - Tier 5 (Advanced): `collect_node_diagnostics`, `format_for_llm`
+- **Session-based state** — each AI agent session owns its own debugger instance; 30-minute auto-expiry
+- **Transport** — stdio (Claude Desktop) + streamable-http (remote deployment)
+- **69 MCP tests** in `test_mcp_server.py`
+
+### Added — Phase 4: Baseline Noise Subtraction
+
+- **BaselineTracker class** — persistent per-cluster finding frequency tracking
+  - Fingerprint normalization (strips timestamps, IPs, instance IDs, pod hashes)
+  - Annotates findings with `is_baseline` + `baseline_count` after threshold runs (default 10)
+  - Cache: `~/.eks-debugger-cache/{cluster}-{region}-baseline.json` (0o600, no TTL)
+- **CLI flag** — `--baseline-threshold N` (default 10, 0 to disable)
+- **HTML report** — grey "🔄 Known" badge on baseline findings
+- **25 baseline tests** in `test_baseline_tracker.py`
+
+### Fixed
+
+- **structlog configuration** (lines 59-70) — added `JSONRenderer()` to processor chain and swapped `BytesLoggerFactory()` → `PrintLoggerFactory(file=sys.stderr)`. Without this, every `ProgressTracker.warning()` / `.error()` call crashed with `TypeError: BytesLogger.msg() got an unexpected keyword argument 'event'` under structlog 25.x.
+- **REMEDIATION_COMMANDS context** (line 1444) — added missing `"name"` key to context dict in `get_remediation_commands()`. Without this, HTML report generation crashed with `KeyError: 'name'` when a finding matched the rolebinding remediation pattern.
+- **Finding-ID consistency** — `get_findings`, `search_findings`, and `get_remediation` now share `_build_finding_index()` helper ensuring F-0001 refers to the same finding across all MCP tools regardless of category filters.
+- **Timeline sort** — `get_timeline` MCP tool now sorts buckets chronologically before reporting earliest/latest.
+- **MCP boundary validation** — `connect()` tool now calls `validate_input()` at the MCP boundary for all user inputs.
+
+### Changed
+
+- Version bumped to 5.0.0
+- `mcp>=1.0.0` added to requirements.txt and pyproject.toml
+- AGENTS.md: added MCP Server section with full tool catalog, session management, error handling docs
+- README.md: added MCP Server section with Claude Desktop config, CLI args, tool catalog
+- `.pre-commit-config.yaml`: updated boto3-stubs to include ssm and bedrock-runtime
+
+## [4.0.0] - 2026-06-17
+
+### Added — Phase 1: SSM Node OS Diagnostics
+
+- **SSMNodeDiagnosticsManager** — SSM Run Command execution, polling, node mapping
+- **NodeOSOutputParser** — 10 parsers for SSM diagnostic output (iptables, conntrack, dmesg, kubelet, containerd, IPAMD, routes, CNI config, sysctl, ENI metadata)
+- **NodeDiagnosticConfig** — SSM configuration constants (timeouts, batching, limits)
+- **10 new analysis methods** (`node_os_*` findings categories) — opt-in via `--enable-node-diagnostics`
+- **4 new correlation rules** — `conntrack_exhaustion_cascade`, `iptables_dns_block`, `kubelet_pleg_cascade`, `ipamd_exhaustion_cascade`
+- **15 new REMEDIATION_COMMANDS entries** for SSM-detected issues
+- **CLI flags** — `--enable-node-diagnostics`, `--ssm-timeout`, `--ssm-mode`, `--ssm-max-nodes`
+- **75 new tests** across `test_ssm_integration.py`, `test_node_os_parsers.py`, `test_node_selection.py`
+
+### Changed
+
+- Version bumped to 4.0.0
+- Constructor params: `enable_node_diagnostics`, `ssm_timeout`, `ssm_mode`, `ssm_max_nodes`
+- 10 new findings categories added to `self.findings` dict
+- `set_total_steps` count updated
+- HTML report: new category icons and styling for node_os_* categories
+
 ## [3.8.1] - 2026-05-03
 
 ### Fixed

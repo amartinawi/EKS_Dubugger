@@ -64,14 +64,15 @@ else:
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
-        logger_factory=structlog.BytesLoggerFactory(),
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
     )
 
 log = structlog.get_logger()
 
-VERSION = "3.8.0"
+VERSION = "5.0.0"
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -328,6 +329,97 @@ class Thresholds:
     RESTART_CRITICAL = 10
     PENDING_POD_WARNING = 5
     PENDING_POD_CRITICAL = 10
+
+
+class NodeDiagnosticConfig:
+    """Configuration constants for SSM-based node OS diagnostics (Phase 1).
+
+    All values are AWS-validated. See:
+    - SSM Run Command limits: https://docs.aws.amazon.com/general/latest/gr/ssm.html
+    - SSM pricing: https://aws.amazon.com/systems-manager/pricing/
+    """
+
+    # SSM Run Command settings
+    DEFAULT_SSM_TIMEOUT = 300  # 5 minutes (per-command execution timeout)
+    MAX_SSM_TIMEOUT = 3600  # 1 hour hard cap
+    POLL_INTERVAL = 5  # Seconds between get_command_invocation polls
+    MAX_POLL_ATTEMPTS = 120  # 10 minutes max polling (120 * 5s)
+
+    # Batching (AWS limit: 50 InstanceIds per send_command)
+    MAX_INSTANCES_PER_COMMAND = 50
+    MAX_PARALLEL_SSM_COMMANDS = 8  # Match MAX_PARALLEL_WORKERS
+
+    # Output truncation limits (SSM get_command_invocation)
+    STDOUT_TRUNCATION_LIMIT = 24000  # SSM truncates StandardOutputContent at 24KB
+    STDERR_TRUNCATION_LIMIT = 8000  # SSM truncates StandardErrorContent at 8KB
+
+    # Node selection defaults
+    DEFAULT_MAX_NODES_TO_DIAGNOSE = 50
+    BASELINE_HEALTHY_RATIO = 0.20  # 20% of slots reserved for healthy baseline nodes
+
+    # Priority node states — diagnose these nodes first
+    PRIORITY_NODE_STATES = [
+        "MemoryPressure",
+        "DiskPressure",
+        "PIDPressure",
+        "NetworkUnavailable",
+    ]
+
+    # InvocationDoesNotExist retry (SSM eventual consistency)
+    INVOCATION_NOT_FOUND_INITIAL_DELAY = 2  # Seconds before first retry
+    INVOCATION_NOT_FOUND_MAX_RETRIES = 3
+
+
+# Diagnostic command templates executed via SSM Run Command (AWS-RunShellScript).
+# All commands are read-only and safe for production nodes.
+# The {hours} placeholder is substituted at runtime from the scan window.
+NODE_DIAGNOSTIC_COMMANDS: dict[str, list[str]] = {
+    "iptables": [
+        "iptables-save 2>/dev/null",
+        "ipvsadm -L -n --rate 2>/dev/null || true",
+    ],
+    "conntrack": [
+        "conntrack -S 2>/dev/null || cat /proc/net/netfilter/nf_conntrack_count 2>/dev/null || true",
+        "cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || true",
+        "cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || true",
+    ],
+    "dmesg": [
+        "dmesg -T --nopager 2>/dev/null | tail -200 || true",
+    ],
+    "kubelet": [
+        "journalctl -u kubelet --no-pager --since '{hours} hours ago' 2>/dev/null | tail -500 || true",
+    ],
+    "containerd": [
+        "journalctl -u containerd --no-pager --since '{hours} hours ago' 2>/dev/null | tail -300 || true",
+    ],
+    "ipamd": [
+        "curl -s --connect-timeout 3 http://localhost:61679/v1/enis 2>/dev/null || true",
+        "curl -s --connect-timeout 3 http://localhost:61679/v1/pods 2>/dev/null || true",
+        "tail -200 /var/log/aws-routed-eni/ipamd.log 2>/dev/null || true",
+    ],
+    "routes": [
+        "ip route show table all 2>/dev/null || true",
+        "ip rule show 2>/dev/null || true",
+    ],
+    "cni_config": [
+        "cat /etc/cni/net.d/*.conflist 2>/dev/null || true",
+    ],
+    "sysctl": [
+        "sysctl net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_count "
+        "net.ipv4.conf.all.rp_filter net.ipv4.ip_local_port_range "
+        "net.ipv4.tcp_early_demux net.core.somaxconn "
+        "net.ipv4.neigh.default.gc_thresh3 fs.file-max kernel.pid_max "
+        "vm.overcommit_memory 2>/dev/null || true",
+    ],
+    "eni_metadata": [
+        "ip -o addr show 2>/dev/null || true",
+        "ip link show 2>/dev/null || true",
+        "for iface in $(ip -o link show | awk -F': ' '{print $2}' | grep -v lo); do "
+        "echo '=== '$iface' ==='; ethtool -S $iface 2>/dev/null | grep -E "
+        "'(conntrack_allowance|linklocal_allowance|bw_in_allowance|bw_out_allowance|pps_allowance|rx_drops|tx_drops)' || true; "
+        "done",
+    ],
+}
 
 
 INPUT_VALIDATION_PATTERNS = {
@@ -1142,6 +1234,196 @@ REMEDIATION_COMMANDS = {
         ],
         "aws_doc": "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
     },
+    # Node OS: Conntrack Exhaustion (Phase 1: SSM)
+    "conntrack.*(exhaust|full|saturation|drop)": {
+        "diagnostic": [
+            "sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max",
+            "conntrack -S 2>/dev/null | grep -E 'drop|early_drop'",
+            "dmesg | grep 'table full'",
+        ],
+        "fix": [
+            "# Increase conntrack max (requires node reboot for permanent):",
+            "sysctl -w net.netfilter.nf_conntrack_max=262144",
+            "# Or set in node user-data / kubelet config",
+            "# If conntrack_allowance_exceeded in ethtool, need bigger instance type",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-conntrack-exhaustion",
+    },
+    # Node OS: iptables DNS Block (Phase 1: SSM)
+    "iptables.*dns|iptables.*port 53|iptables.*drop.*53": {
+        "diagnostic": [
+            "iptables -L FORWARD -n -v | grep 'dpt:53'",
+            "kubectl get pods -o wide --field-selector spec.nodeName={node}",
+        ],
+        "fix": [
+            "# Remove the blocking rule:",
+            "iptables -D FORWARD -p udp --dport 53 -j DROP",
+            "# Check for fault injection or NetworkPolicy misconfiguration",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-dns-failures",
+    },
+    # Node OS: Missing KUBE-SERVICES chain (Phase 1: SSM)
+    "missing.*kube.services|kube-services.*not synced": {
+        "diagnostic": [
+            "kubectl get pods -n kube-system -l k8s-app=kube-proxy",
+            "kubectl logs -n kube-system -l k8s-app=kube-proxy --tail=50",
+        ],
+        "fix": [
+            "# Restart kube-proxy to force iptables resync:",
+            "kubectl delete pod -n kube-system -l k8s-app=kube-proxy",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-kube-proxy",
+    },
+    # Node OS: Kubelet PLEG not healthy (Phase 1: SSM)
+    "pleg.*not healthy|pleg was last seen": {
+        "diagnostic": [
+            "sudo journalctl -u kubelet --since '30 min ago' | grep -i pleg",
+            "sudo crictl ps -a | head -20",
+            "sudo systemctl status kubelet",
+        ],
+        "fix": [
+            "# Restart kubelet (may cause brief pod disruption):",
+            "sudo systemctl restart kubelet",
+            "# If persistent, cordon and drain node:",
+            "kubectl drain {node} --ignore-daemonsets --delete-emptydir-data",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-node-status-ready",
+    },
+    # Node OS: Kubelet certificate expired (Phase 1: SSM)
+    "kubelet.*certificate.*expired|x509.*certificate.*expired": {
+        "diagnostic": [
+            "sudo openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -text -noout | grep 'Not After'",
+            "kubectl get nodes {node} -o jsonpath='{{.status.conditions[?(@.type==\"Ready\")]}}'",
+        ],
+        "fix": [
+            "# Restart kubelet to trigger cert rotation:",
+            "sudo systemctl restart kubelet",
+            "# If cert rotation fails, delete old certs:",
+            "sudo rm /var/lib/kubelet/pki/kubelet-client-* && sudo systemctl restart kubelet",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/certificate-rotation.html",
+    },
+    # Node OS: Kernel OOM Kill (Phase 1: SSM)
+    "kernel.*oom kill|out of memory.*killed process": {
+        "diagnostic": [
+            "sudo dmesg -T | grep -i 'out of memory' | tail -20",
+            "kubectl top nodes",
+            "kubectl describe node {node}",
+        ],
+        "fix": [
+            "# System-level OOM — node is under memory pressure",
+            "# Add memory limits to pods or increase node size",
+            "# Consider adding memory-based HPA or Cluster Autoscaler",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-oomkilled-pods",
+    },
+    # Node OS: IPAMD IP allocation failure (Phase 1: SSM)
+    "ipamd.*allocat|no available ip|insufficientfree|ip pool.*low": {
+        "diagnostic": [
+            "aws ec2 describe-subnets --subnet-ids $(kubectl get node {node} -o jsonpath='{{.spec.providerID}}' | cut -d/ -f5) --query 'Subnets[0].AvailableIpAddressCount'",
+            "kubectl get pods -o wide --field-selector spec.nodeName={node} | wc -l",
+            "kubectl describe ds aws-node -n kube-system",
+        ],
+        "fix": [
+            "# Check subnet IP availability:",
+            "aws ec2 describe-subnets --filters Name=tag:kubernetes.io/cluster/{cluster},Values=owned --query 'Subnets[*].[SubnetId,AvailableIpAddressCount]'",
+            "# Consider enabling prefix delegation for VPC CNI:",
+            "kubectl set env ds aws-node -n kube-system ENABLE_PREFIX_DELEGATION=true",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/prefix-delegation.html",
+    },
+    # Node OS: Blackhole route (Phase 1: SSM)
+    "blackhole.*route|unreachable.*route": {
+        "diagnostic": [
+            "sudo ip route show table all | grep -E 'blackhole|unreachable'",
+            "kubectl get pods -o wide --field-selector spec.nodeName={node}",
+        ],
+        "fix": [
+            "# Blackhole routes indicate stale pod CIDRs or CNI issues",
+            "# Restart VPC CNI on the affected node:",
+            "kubectl delete pod -n kube-system -l k8s-app=aws-node --field-selector spec.nodeName={node}",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html",
+    },
+    # Node OS: Missing CNI configuration (Phase 1: SSM)
+    "missing.*cni.*config|no cni plugin": {
+        "diagnostic": [
+            "sudo ls -la /etc/cni/net.d/",
+            "kubectl get ds aws-node -n kube-system",
+            "kubectl logs -n kube-system -l k8s-app=aws-node --tail=50",
+        ],
+        "fix": [
+            "# Reinstall VPC CNI:",
+            "kubectl rollout restart ds aws-node -n kube-system",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html",
+    },
+    # Node OS: Low nf_conntrack_max (Phase 1: SSM)
+    "low.*nf_conntrack_max|low.*conntrack_max": {
+        "diagnostic": [
+            "sysctl net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_count",
+        ],
+        "fix": [
+            "# Increase conntrack max immediately:",
+            "sudo sysctl -w net.netfilter.nf_conntrack_max=262144",
+            "# For permanent change, add to /etc/sysctl.d/ or node user-data",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/directoryservice/latest/admin-guide/ad-troubleshooting.html",
+    },
+    # Node OS: rp_filter wrong (Phase 1: SSM)
+    "rp_filter|reverse path filter": {
+        "diagnostic": [
+            "sysctl net.ipv4.conf.all.rp_filter",
+        ],
+        "fix": [
+            "# Set rp_filter to loose mode (2) for EKS:",
+            "sudo sysctl -w net.ipv4.conf.all.rp_filter=2",
+            "# Add to /etc/sysctl.d/99-eks.conf for persistence",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
+    },
+    # Node OS: AWS conntrack allowance exceeded (Phase 1: SSM)
+    "conntrack_allowance_exceeded|aws.*conntrack.*allowance": {
+        "diagnostic": [
+            "sudo ethtool -S eth0 | grep conntrack_allowance_exceeded",
+            "aws ec2 describe-instance-types --instance-types $(kubectl get node {node} -o jsonpath='{{.status.nodeInfo.machineID}}') --query 'InstanceTypes[0].NetworkInfo'",
+        ],
+        "fix": [
+            "# AWS-level conntrack limit hit — this is an instance type limit",
+            "# Upgrade to a larger instance type with higher conntrack allowance",
+            "# Reference: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-network-interface-traffic.html",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-network-interface-traffic.html",
+    },
+    # Node OS: Network interface DOWN (Phase 1: SSM)
+    "network interface.*down|interface.*eni.*down": {
+        "diagnostic": [
+            "sudo ip link show",
+            "sudo ethtool {node}",
+            "aws ec2 describe-network-interfaces --filters Name=attachment.instance-id,Values={instance_id}",
+        ],
+        "fix": [
+            "# Network interface is DOWN — may need node replacement",
+            "# Cordon and drain the node, then terminate:",
+            "kubectl cordon {node}",
+            "kubectl drain {node} --ignore-daemonsets --delete-emptydir-data",
+        ],
+        "aws_doc": "https://repost.aws/knowledge-center/eks-node-status-ready",
+    },
+    # Node OS: Disk full on containerd (Phase 1: SSM)
+    "containerd.*disk full|no space left on device": {
+        "diagnostic": [
+            "df -h /var/lib/containerd",
+            "sudo crictl rmi --prune",
+            "sudo journalctl -u containerd --since '30 min ago' | tail -50",
+        ],
+        "fix": [
+            "# Clean up unused container images:",
+            "sudo crictl rmi --prune",
+            "# If persistent, the node disk is too small — increase EBS volume size",
+        ],
+        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/eks-optimized-ami.html",
+    },
 }
 
 
@@ -1160,6 +1442,7 @@ def get_remediation_commands(summary: str, details: dict) -> dict | None:
     # Extract context variables from details
     context = {
         "namespace": details.get("namespace", "default"),
+        "name": details.get("name", "<name>"),
         "pod": details.get("pod", "<pod>"),
         "node": details.get("node", "<node>"),
         "service": details.get("service", "<service>"),
@@ -1189,6 +1472,7 @@ def get_remediation_commands(summary: str, details: dict) -> dict | None:
         "update_id": details.get("update_id", "<update-id>"),
         "selector": details.get("selector", "<selector>"),
         "nodegroup": details.get("nodegroup", "<nodegroup>"),
+        "instance_id": details.get("instance_id", "<instance-id>"),
     }
 
     # Try to extract deployment from pod name (common pattern)
@@ -3539,6 +3823,67 @@ class HTMLOutputFormatter(OutputFormatter):
                 "title": "Service Quota Issues",
                 "source": "Service Quotas API",
                 "color": "#e17055",
+            },
+            # Node OS-level diagnostics (Phase 1: SSM-based)
+            "node_os_iptables": {
+                "icon": "🔥",
+                "title": "Node OS: iptables",
+                "source": "SSM → iptables-save",
+                "color": "#e74c3c",
+            },
+            "node_os_conntrack": {
+                "icon": "🔗",
+                "title": "Node OS: Conntrack",
+                "source": "SSM → conntrack -S",
+                "color": "#3498db",
+            },
+            "node_os_dmesg": {
+                "icon": "💻",
+                "title": "Node OS: Kernel (dmesg)",
+                "source": "SSM → dmesg",
+                "color": "#2c3e50",
+            },
+            "node_os_kubelet": {
+                "icon": "⚙️",
+                "title": "Node OS: Kubelet",
+                "source": "SSM → journalctl kubelet",
+                "color": "#9b59b6",
+            },
+            "node_os_containerd": {
+                "icon": "📦",
+                "title": "Node OS: containerd",
+                "source": "SSM → journalctl containerd",
+                "color": "#f39c12",
+            },
+            "node_os_ipamd": {
+                "icon": "🌐",
+                "title": "Node OS: IPAMD (VPC CNI)",
+                "source": "SSM → IPAMD introspection",
+                "color": "#1abc9c",
+            },
+            "node_os_routes": {
+                "icon": "🗺️",
+                "title": "Node OS: Route Tables",
+                "source": "SSM → ip route",
+                "color": "#34495e",
+            },
+            "node_os_cni_config": {
+                "icon": "🔌",
+                "title": "Node OS: CNI Config",
+                "source": "SSM → /etc/cni/net.d/",
+                "color": "#e67e22",
+            },
+            "node_os_sysctl": {
+                "icon": "🎛️",
+                "title": "Node OS: sysctl Params",
+                "source": "SSM → sysctl",
+                "color": "#95a5a6",
+            },
+            "node_os_eni": {
+                "icon": "📡",
+                "title": "Node OS: ENI Metadata",
+                "source": "SSM → ip addr + ethtool",
+                "color": "#16a085",
             },
         }
 
@@ -6908,6 +7253,17 @@ class HTMLOutputFormatter(OutputFormatter):
             "addon_issues": 13,
             "resource_quota_exceeded": 14,  # Informational/best-practice last
             "quota_issues": 15,
+            # Node OS-level diagnostics (Phase 1: SSM-based)
+            "node_os_iptables": 16,
+            "node_os_conntrack": 17,
+            "node_os_dmesg": 18,
+            "node_os_kubelet": 19,
+            "node_os_containerd": 20,
+            "node_os_ipamd": 21,
+            "node_os_routes": 22,
+            "node_os_cni_config": 23,
+            "node_os_sysctl": 24,
+            "node_os_eni": 25,
         }
 
         def category_sort_key(item):
@@ -7476,6 +7832,1346 @@ class HTMLOutputFormatter(OutputFormatter):
 # === SECTION 5: CORE DEBUGGER CLASS ===
 
 
+class SSMNodeDiagnosticsManager:
+    """Manages SSM-based node OS-level diagnostics for EKS worker nodes.
+
+    Handles:
+    - Node-to-instance-ID mapping via kubectl spec.providerID
+    - SSM managed instance filtering (Online ping status)
+    - Diagnostic command execution via SSM Run Command (AWS-RunShellScript)
+    - Result polling and collection with InvocationDoesNotExist retry
+    - Instance batching for clusters with >50 nodes
+
+    All SSM API calls (send_command, describe_instance_information) go through
+    ``debugger.safe_api_call()`` for tenacity-backed retry on throttling.
+    Polling (get_command_invocation) uses a custom loop with eventual-consistency retry.
+
+    Attributes:
+        debugger: Reference to the ComprehensiveEKSDebugger instance
+        ssm_client: boto3 SSM client (from debugger.session)
+    """
+
+    def __init__(self, debugger: "ComprehensiveEKSDebugger"):
+        """Initialize the SSM diagnostics manager.
+
+        Args:
+            debugger: The ComprehensiveEKSDebugger instance owning the SSM client
+        """
+        self.debugger = debugger
+        self.ssm_client = debugger.ssm_client
+
+    def get_node_instance_mapping(self) -> dict[str, str]:
+        """Map Kubernetes node names to EC2 instance IDs via spec.providerID.
+
+        Reads pre-fetched node data from ``debugger._shared_data["node_info"]``
+        (populated by ``_prefetch_shared_data()``). The providerID format is:
+            aws:///<availability-zone>/<instance-id>
+        e.g. aws:///us-east-1a/i-0abc123def456
+
+        Returns:
+            Dict mapping node name (e.g. "ip-10-0-1-50") to instance ID (e.g. "i-0abc123def456").
+            Empty dict if node data is unavailable or no valid mappings found.
+        """
+        mapping: dict[str, str] = {}
+
+        with self.debugger._shared_data_lock:
+            node_info = self.debugger._shared_data.get("node_info")
+
+        if not node_info:
+            self.debugger.progress.warning("Node data not pre-fetched; cannot map to instance IDs")
+            return mapping
+
+        for node in node_info.get("items", []):
+            try:
+                node_name = node["metadata"]["name"]
+                provider_id = node.get("spec", {}).get("providerID", "")
+                if not provider_id:
+                    continue
+                # Extract instance ID: aws:///us-east-1a/i-0abc123 → i-0abc123
+                instance_id = provider_id.rstrip("/").split("/")[-1]
+                if instance_id.startswith("i-") and len(instance_id) >= 3:
+                    mapping[node_name] = instance_id
+            except (KeyError, TypeError):
+                continue
+
+        self.debugger.progress.info(f"Mapped {len(mapping)} EKS nodes to EC2 instance IDs")
+        return mapping
+
+    def check_ssm_managed(self, instance_ids: list[str]) -> set[str]:
+        """Filter instance IDs to only those managed by SSM with Online ping status.
+
+        Uses ``ssm.describe_instance_information()`` with InstanceIds and PingStatus
+        filters. Chunks requests at 50 instances per call (SSM API limit).
+
+        Args:
+            instance_ids: List of EC2 instance IDs to check
+
+        Returns:
+            Set of instance IDs that are SSM-managed and Online. Empty set on error.
+        """
+        if not instance_ids:
+            return set()
+
+        managed: set[str] = set()
+
+        for chunk in self._chunk_instances(instance_ids, NodeDiagnosticConfig.MAX_INSTANCES_PER_COMMAND):
+            success, response = self.debugger.safe_api_call(
+                self.ssm_client.describe_instance_information,
+                Filters=[
+                    {"Key": "InstanceIds", "Values": chunk},
+                    {"Key": "PingStatus", "Values": ["Online"]},
+                ],
+                use_cache=False,
+            )
+            if not success:
+                self.debugger._add_error("check_ssm_managed", f"SSM describe_instance_information failed: {response}")
+                continue
+
+            for inst in response.get("InstanceInformationList", []):
+                managed.add(inst["InstanceId"])
+
+        unmanaged_count = len(set(instance_ids)) - len(managed)
+        if unmanaged_count > 0:
+            self.debugger.progress.warning(
+                f"{unmanaged_count} node(s) not SSM-managed or offline — skipping OS diagnostics for those"
+            )
+
+        self.debugger.progress.info(f"{len(managed)} of {len(instance_ids)} instances are SSM-managed and Online")
+        return managed
+
+    def run_diagnostic_commands(
+        self,
+        instance_ids: list[str],
+        commands_dict: dict[str, list[str]],
+        hours: int = 24,
+    ) -> dict[str, dict[str, dict]]:
+        """Execute diagnostic commands on nodes via SSM Run Command.
+
+        For each diagnostic type (iptables, conntrack, etc.), sends a single
+        ``send_command`` call (chunked at 50 instances) and polls each instance
+        for completion. Commands are executed via AWS-RunShellScript (FREE).
+
+        Args:
+            instance_ids: List of EC2 instance IDs to run commands on
+            commands_dict: Dict mapping diagnostic type to list of shell commands.
+                           Commands may contain ``{hours}`` placeholder for time window.
+            hours: Hours to substitute into ``{hours}`` placeholders (from scan window)
+
+        Returns:
+            Nested dict: ``{instance_id: {diagnostic_type: {status, stdout, stderr, ...}}}``
+        """
+        # Results structure: instance_id → diagnostic_type → result dict
+        results: dict[str, dict[str, dict]] = {iid: {} for iid in instance_ids}
+
+        for diag_type, commands in commands_dict.items():
+            # Substitute {hours} placeholder — only in commands that contain it.
+            # Using str.format() unconditionally would crash on shell brace constructs
+            # like awk '{print $2}' which Python parses as a format replacement field.
+            formatted_commands = [cmd.format(hours=hours) if "{hours}" in cmd else cmd for cmd in commands]
+
+            # Send command in batches of 50
+            for chunk in self._chunk_instances(instance_ids, NodeDiagnosticConfig.MAX_INSTANCES_PER_COMMAND):
+                command_id = self._send_command_batch(chunk, formatted_commands, diag_type)
+                if not command_id:
+                    # Error already logged; mark all instances in chunk as failed for this type
+                    for iid in chunk:
+                        results[iid][diag_type] = {
+                            "status": "error",
+                            "stdout": "",
+                            "stderr": "Failed to send SSM command",
+                            "response_code": -1,
+                        }
+                    continue
+
+                # Poll each instance for this command
+                for iid in chunk:
+                    result = self._poll_command(command_id, iid, self.debugger.ssm_timeout)
+                    results[iid][diag_type] = result
+
+            self.debugger.progress.info(f"Completed SSM diagnostic '{diag_type}' on {len(instance_ids)} node(s)")
+
+        return results
+
+    def select_nodes_for_diagnostics(self, max_nodes: int = 50) -> list[str]:
+        """Select which nodes to run SSM diagnostics on, prioritizing unhealthy nodes.
+
+        Priority order:
+        1. Nodes with active conditions (MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable)
+        2. Nodes with NotReady status
+        3. Healthy nodes (up to 20% of max_nodes, for comparison baseline)
+
+        Args:
+            max_nodes: Maximum number of node names to return
+
+        Returns:
+            List of node names selected for diagnostics
+        """
+        with self.debugger._shared_data_lock:
+            node_info = self.debugger._shared_data.get("node_info")
+
+        if not node_info:
+            return []
+
+        priority_nodes: list[str] = []
+        notready_nodes: list[str] = []
+        healthy_nodes: list[str] = []
+
+        for node in node_info.get("items", []):
+            try:
+                name = node["metadata"]["name"]
+                conditions = {c.get("type"): c.get("status") for c in node.get("status", {}).get("conditions", [])}
+
+                # Priority 1: Active pressure conditions
+                has_pressure = any(conditions.get(cond) == "True" for cond in NodeDiagnosticConfig.PRIORITY_NODE_STATES)
+                if has_pressure:
+                    priority_nodes.append(name)
+                elif conditions.get("Ready") != "True":
+                    # Priority 2: NotReady
+                    notready_nodes.append(name)
+                else:
+                    # Priority 3: Healthy
+                    healthy_nodes.append(name)
+            except (KeyError, TypeError):
+                continue
+
+        # Assemble selected list: priority first, then NotReady, then healthy baseline
+        selected = priority_nodes[:max_nodes]
+        remaining = max_nodes - len(selected)
+        if remaining > 0:
+            selected.extend(notready_nodes[:remaining])
+            remaining = max_nodes - len(selected)
+        if remaining > 0:
+            baseline_count = min(remaining, max(1, int(max_nodes * NodeDiagnosticConfig.BASELINE_HEALTHY_RATIO)))
+            selected.extend(healthy_nodes[:baseline_count])
+
+        return selected
+
+    def _send_command_batch(self, instance_ids: list[str], commands: list[str], diag_type: str) -> str | None:
+        """Send a single SSM Run Command to a batch of instances.
+
+        Uses AWS-RunShellScript document (FREE). Wraps send_command in
+        ``safe_api_call()`` for throttling retry.
+
+        Args:
+            instance_ids: List of up to 50 instance IDs
+            commands: List of shell command strings to execute
+            diag_type: Diagnostic type name (for error logging)
+
+        Returns:
+            Command ID string on success, None on failure
+        """
+        success, result = self.debugger.safe_api_call(
+            self.ssm_client.send_command,
+            InstanceIds=instance_ids,
+            DocumentName="AWS-RunShellScript",
+            Parameters={
+                "commands": commands,
+                "executionTimeout": [str(self.debugger.ssm_timeout)],
+            },
+            TimeoutSeconds=self.debugger.ssm_timeout + 60,
+            MaxConcurrency=str(min(len(instance_ids), 10)),
+            MaxErrors="0",
+            use_cache=False,
+        )
+
+        if not success:
+            self.debugger._add_error(
+                f"ssm_send_command_{diag_type}",
+                f"SSM send_command failed for {diag_type}: {result}",
+            )
+            return None
+
+        return result["Command"]["CommandId"]
+
+    def _poll_command(self, command_id: str, instance_id: str, timeout: int) -> dict:
+        """Poll a single SSM command invocation until it reaches a terminal state.
+
+        Handles ``InvocationDoesNotExist`` (SSM eventual consistency) by retrying
+        after a short delay. Non-terminal statuses continue polling until timeout.
+
+        Terminal statuses: Success, Failed, TimedOut, Cancelled, Error
+
+        Args:
+            command_id: SSM command ID from send_command
+            instance_id: Target instance ID
+            timeout: Maximum seconds to poll
+
+        Returns:
+            Dict with keys: status, stdout, stderr, stdout_url, response_code.
+            On timeout returns ``{"status": "timeout", ...}``.
+        """
+        elapsed = 0
+        poll_interval = NodeDiagnosticConfig.POLL_INTERVAL
+        not_found_retries = 0
+        max_not_found = NodeDiagnosticConfig.INVOCATION_NOT_FOUND_MAX_RETRIES
+        initial_delay = NodeDiagnosticConfig.INVOCATION_NOT_FOUND_INITIAL_DELAY
+
+        while elapsed < timeout:
+            try:
+                result = self.ssm_client.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=instance_id,
+                )
+                status = result.get("Status", "")
+
+                # Terminal statuses
+                if status in ("Success", "Failed", "TimedOut", "Cancelled", "Error"):
+                    return {
+                        "status": status,
+                        "stdout": result.get("StandardOutputContent", ""),
+                        "stderr": result.get("StandardErrorContent", ""),
+                        "stdout_url": result.get("StandardOutputUrl", ""),
+                        "response_code": result.get("ResponseCode", -1),
+                    }
+
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+
+                if error_code == "InvocationDoesNotExist":
+                    # Eventual consistency — SSM hasn't registered the invocation yet
+                    not_found_retries += 1
+                    if not_found_retries <= max_not_found:
+                        time.sleep(initial_delay)
+                        elapsed += initial_delay
+                        continue
+                    # Exhausted retries
+                    return {
+                        "status": "error",
+                        "stdout": "",
+                        "stderr": f"InvocationDoesNotExist after {max_not_found} retries",
+                        "response_code": -1,
+                    }
+                elif error_code == "InvalidInstanceId":
+                    return {
+                        "status": "error",
+                        "stdout": "",
+                        "stderr": "Instance not managed by SSM",
+                        "response_code": -1,
+                    }
+                else:
+                    # Unexpected ClientError — log and continue polling
+                    self.debugger._add_error(
+                        f"ssm_poll_{command_id}",
+                        f"SSM get_command_invocation error ({error_code}): {e}",
+                    )
+
+            except Exception as e:
+                # Non-AWS error — log and continue polling
+                self.debugger._add_error(f"ssm_poll_{command_id}", f"Unexpected polling error: {e}")
+
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        return {
+            "status": "timeout",
+            "stdout": "",
+            "stderr": f"Timed out after {timeout}s",
+            "response_code": -1,
+        }
+
+    @staticmethod
+    def _chunk_instances(instance_ids: list[str], chunk_size: int = 50) -> list[list[str]]:
+        """Split a list of instance IDs into chunks of at most chunk_size.
+
+        SSM send_command accepts a maximum of 50 InstanceIds per call.
+
+        Args:
+            instance_ids: List of EC2 instance IDs
+            chunk_size: Maximum chunk size (default: 50, SSM API limit)
+
+        Returns:
+            List of chunks, each a list of up to chunk_size instance IDs
+        """
+        if chunk_size <= 0:
+            chunk_size = NodeDiagnosticConfig.MAX_INSTANCES_PER_COMMAND
+        return [instance_ids[i : i + chunk_size] for i in range(0, len(instance_ids), chunk_size)]
+
+
+class NodeOSOutputParser:
+    """Parse SSM command outputs from EKS worker nodes into structured findings.
+
+    Each parser method analyses raw text output from a specific diagnostic command
+    (iptables-save, conntrack -S, dmesg, etc.) and calls the provided ``add_finding``
+    callback for each issue detected. The callback is typically
+    ``ComprehensiveEKSDebugger._add_finding_dict``.
+
+    Finding categories (all prefixed with ``node_os_``):
+        - iptables: firewall/DNAT/SNAT rule analysis
+        - conntrack: connection tracking table saturation and drops
+        - dmesg: kernel messages (OOM, hardware errors, filesystem)
+        - kubelet: kubelet journal entries (PLEG, certs, runtime)
+        - containerd: container runtime logs (image pulls, sandbox)
+        - ipamd: VPC CNI IP allocation and ENI management
+        - routes: kernel route table and policy rules
+        - cni_config: CNI configuration files (/etc/cni/net.d/)
+        - sysctl: kernel tunable parameters
+        - eni_metadata: network interface state and ethtool counters
+    """
+
+    # Dispatch table: diagnostic_type → parser method name
+    PARSERS = {
+        "iptables": "_parse_iptables",
+        "conntrack": "_parse_conntrack",
+        "dmesg": "_parse_dmesg",
+        "kubelet": "_parse_kubelet",
+        "containerd": "_parse_containerd",
+        "ipamd": "_parse_ipamd",
+        "routes": "_parse_routes",
+        "cni_config": "_parse_cni_config",
+        "sysctl": "_parse_sysctl",
+        "eni_metadata": "_parse_eni_metadata",
+    }
+
+    def parse(
+        self,
+        diagnostic_type: str,
+        output: str,
+        node_name: str,
+        instance_id: str,
+        add_finding: Callable,
+    ) -> None:
+        """Dispatch to the appropriate parser based on diagnostic type.
+
+        Args:
+            diagnostic_type: One of the keys in PARSERS (e.g. "iptables", "conntrack")
+            output: Raw command output from SSM
+            node_name: Kubernetes node name (e.g. "ip-10-0-1-50")
+            instance_id: EC2 instance ID (e.g. "i-0abc123")
+            add_finding: Callback matching _add_finding_dict(category, finding_dict)
+        """
+        parser_name = self.PARSERS.get(diagnostic_type)
+        if parser_name:
+            getattr(self, parser_name)(output, node_name, instance_id, add_finding)
+
+    # ── Parser 1: iptables ──────────────────────────────────────────────
+
+    def _parse_iptables(self, output: str, node_name: str, instance_id: str, add_finding: Callable) -> None:
+        """Parse iptables-save output for EKS-relevant firewall issues.
+
+        Detects:
+            - DROP/REJECT rules on port 53 (DNS blocking)
+            - Missing KUBE-SERVICES chain (kube-proxy not synced)
+            - Missing AWS-SNAT-CHAIN-0 (VPC CNI SNAT issue)
+            - Unexpected DROP rules in FORWARD chain
+        """
+        if not output or not output.strip():
+            return
+
+        # DNS DROP on port 53 — critical: blocks all pod DNS resolution
+        dns_drop_pattern = re.compile(
+            r"-A\s+(?:INPUT|FORWARD)\s+.*(?:--dport|dpt)\s*:?\s*53\s+.*-j\s+(?:DROP|REJECT)",
+            re.IGNORECASE,
+        )
+        for match in dns_drop_pattern.finditer(output):
+            add_finding(
+                "node_os_iptables",
+                {
+                    "summary": f"iptables DROP/REJECT rule blocking DNS (port 53) on node {node_name}",
+                    "details": {
+                        "severity": "critical",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "rule": match.group(0),
+                        "remediation": f"Remove the blocking rule: iptables -D <chain> ... (see rule above)",
+                    },
+                },
+            )
+
+        # Missing KUBE-SERVICES chain — kube-proxy hasn't synced iptables
+        if "Chain KUBE-SERVICES" not in output:
+            add_finding(
+                "node_os_iptables",
+                {
+                    "summary": f"Missing KUBE-SERVICES chain on node {node_name} — kube-proxy iptables not synced",
+                    "details": {
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "impact": "All ClusterIP service routing is broken on this node",
+                        "remediation": "Restart kube-proxy: kubectl delete pod -n kube-system -l k8s-app=kube-proxy",
+                    },
+                },
+            )
+
+        # Missing AWS-SNAT-CHAIN-0 — VPC CNI SNAT issue (when EXTERNALSNAT=false)
+        if "AWS-SNAT-CHAIN" not in output and "KUBE-POSTROUTING" not in output:
+            add_finding(
+                "node_os_iptables",
+                {
+                    "summary": f"Missing AWS-SNAT-CHAIN and KUBE-POSTROUTING on node {node_name}",
+                    "details": {
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "impact": "Pods may not be able to reach external endpoints (SNAT broken)",
+                        "remediation": "Check VPC CNI aws-node DaemonSet: kubectl describe ds aws-node -n kube-system",
+                    },
+                },
+            )
+
+        # Unexpected DROP in FORWARD chain (excluding kube-proxy managed rules)
+        forward_drops = re.findall(
+            r"-A\s+FORWARD\s+(?!.*KUBE-).*-j\s+DROP",
+            output,
+            re.IGNORECASE,
+        )
+        for rule in forward_drops[:5]:  # Limit to first 5 to avoid noise
+            add_finding(
+                "node_os_iptables",
+                {
+                    "summary": f"Unexpected DROP rule in FORWARD chain on node {node_name}",
+                    "details": {
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "rule": rule,
+                    },
+                },
+            )
+
+    # ── Parser 2: conntrack ─────────────────────────────────────────────
+
+    def _parse_conntrack(self, output: str, node_name: str, instance_id: str, add_finding: Callable) -> None:
+        """Parse conntrack statistics for table saturation and drops.
+
+        SSM sends three commands; their output is concatenated. We extract:
+            - nf_conntrack_count and nf_conntrack_max from /proc/sys
+            - drop/early_drop counts from ``conntrack -S`` output
+
+        The ``conntrack -S`` output format is:
+            entries searched found new invalid ignore delete delete_list \\
+                insert insert_failed drop early_drop
+            100    50000   40000 1000 5      49000  100    100  \\
+                1100  0             15   5
+        """
+        if not output or not output.strip():
+            return
+
+        lines = output.strip().split("\n")
+
+        # Phase 1: Parse conntrack -S output for drops
+        # The header line contains "drop" and "early_drop"; values are on the next line(s)
+        for i, line in enumerate(lines):
+            if "drop" in line.lower() and "early_drop" in line.lower():
+                # This is the header line — find the values on the next non-empty line
+                for j in range(i + 1, min(i + 3, len(lines))):
+                    val_line = lines[j].strip()
+                    if val_line and val_line.split() and val_line.split()[0].lstrip("-").isdigit():
+                        self._check_conntrack_drops_from_values(val_line, node_name, instance_id, add_finding)
+                        break
+
+        # Phase 2: Extract count/max from /proc/sys/ lines (pure integers)
+        count_val: int | None = None
+        max_val: int | None = None
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.isdigit():
+                continue
+            num = int(stripped)
+            if count_val is None:
+                count_val = num
+            elif max_val is None:
+                max_val = num
+
+        # Phase 3: Calculate saturation ratio
+        if count_val is not None and max_val is not None and max_val > 0:
+            ratio = count_val / max_val
+            if ratio > 0.90:
+                add_finding(
+                    "node_os_conntrack",
+                    {
+                        "summary": f"Conntrack table {ratio:.0%} full on node {node_name}",
+                        "details": {
+                            "severity": "critical",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "node": node_name,
+                            "instance_id": instance_id,
+                            "source": "SSM",
+                            "current_entries": count_val,
+                            "max_entries": max_val,
+                            "saturation": f"{ratio:.1%}",
+                            "impact": "New connections are being silently dropped",
+                            "remediation": "sysctl -w net.netfilter.nf_conntrack_max=262144",
+                        },
+                    },
+                )
+            elif ratio > 0.75:
+                add_finding(
+                    "node_os_conntrack",
+                    {
+                        "summary": f"Conntrack table {ratio:.0%} full on node {node_name}",
+                        "details": {
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "node": node_name,
+                            "instance_id": instance_id,
+                            "source": "SSM",
+                            "current_entries": count_val,
+                            "max_entries": max_val,
+                            "saturation": f"{ratio:.1%}",
+                        },
+                    },
+                )
+
+    @staticmethod
+    def _check_conntrack_drops_from_values(
+        values_line: str, node_name: str, instance_id: str, add_finding: Callable
+    ) -> None:
+        """Parse a conntrack -S values line for non-zero drop/early_drop counts.
+
+        The conntrack -S column order is:
+            entries(0) searched(1) found(2) new(3) invalid(4) ignore(5)
+            delete(6) delete_list(7) insert(8) insert_failed(9)
+            drop(10) early_drop(11)
+        """
+        tokens = values_line.split()
+        if len(tokens) < 12:
+            return
+
+        try:
+            values = [int(t) for t in tokens]
+        except ValueError:
+            return
+
+        # Column 10 = drop, Column 11 = early_drop
+        for col_idx, metric_name in [(10, "drop"), (11, "early_drop")]:
+            if col_idx < len(values) and values[col_idx] > 0:
+                add_finding(
+                    "node_os_conntrack",
+                    {
+                        "summary": f"Conntrack {metric_name} count {values[col_idx]} on node {node_name}",
+                        "details": {
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "node": node_name,
+                            "instance_id": instance_id,
+                            "source": "SSM",
+                            "metric": metric_name,
+                            "count": values[col_idx],
+                            "impact": "Connections are being silently dropped",
+                        },
+                    },
+                )
+
+    # ── Parser 3: dmesg ─────────────────────────────────────────────────
+
+    def _parse_dmesg(self, output: str, node_name: str, instance_id: str, add_finding: Callable) -> None:
+        """Parse dmesg output for kernel-level errors.
+
+        Detects OOM kills, hardware errors, conntrack full, disk I/O errors,
+        filesystem corruption, NVMe timeouts, CPU throttling, and ENA driver errors.
+        """
+        if not output or not output.strip():
+            return
+
+        # Pattern registry: (regex, severity, category_suffix, description)
+        dmesg_patterns = [
+            (
+                r"Out of memory: Killed process \d+ \((\w+)\)",
+                "critical",
+                "Kernel OOM kill — process {} killed by kernel",
+            ),
+            (
+                r"Memory cgroup out of memory: Killed process",
+                "critical",
+                "Container cgroup OOM kill — pod memory limit exceeded",
+            ),
+            (
+                r"nf_conntrack: table full, dropping packet",
+                "critical",
+                "Conntrack table full — kernel dropping packets",
+            ),
+            (
+                r"(?:Hardware Error|Machine Check Exception)",
+                "critical",
+                "Hardware error (MCE) — possible CPU/memory failure",
+            ),
+            (
+                r"(?:I/O error.*dev|Buffer I/O error)",
+                "critical",
+                "Disk I/O error — possible EBS volume failure",
+            ),
+            (
+                r"(?:EXT4-fs error|XFS.*error)",
+                "critical",
+                "Filesystem corruption detected",
+            ),
+            (
+                r"(?:nvme .*timeout|nvme I/O Error)",
+                "warning",
+                "NVMe timeout — possible EBS latency or failure",
+            ),
+            (
+                r"(?:Temperature above threshold|throttling)",
+                "warning",
+                "CPU thermal throttling — instance may be too small",
+            ),
+            (
+                r"BUG: soft lockup",
+                "warning",
+                "Kernel soft lockup — possible driver or hardware issue",
+            ),
+            (
+                r"ena .*(?:error|fail|reset)",
+                "warning",
+                "ENA network driver error — possible NIC reset",
+            ),
+        ]
+
+        for pattern_str, severity, desc_template in dmesg_patterns:
+            pattern = re.compile(pattern_str, re.IGNORECASE)
+            for line in output.split("\n"):
+                match = pattern.search(line)
+                if not match:
+                    continue
+                desc = desc_template.format(match.group(1)) if match.lastindex else desc_template
+                # Extract timestamp from the full dmesg line (not just the match)
+                timestamp = self._extract_dmesg_timestamp(line)
+                details: dict = {
+                    "severity": severity,
+                    "finding_type": FindingType.HISTORICAL_EVENT,
+                    "node": node_name,
+                    "instance_id": instance_id,
+                    "source": "SSM",
+                    "message": match.group(0)[:500],
+                }
+                if timestamp:
+                    details["timestamp"] = timestamp
+                add_finding(
+                    "node_os_dmesg",
+                    {
+                        "summary": f"{desc} on node {node_name}",
+                        "details": details,
+                    },
+                )
+
+    @staticmethod
+    def _extract_dmesg_timestamp(line: str) -> str | None:
+        """Extract ISO timestamp from dmesg -T output line.
+
+        dmesg -T format: "[Tue Jun 17 10:30:00 2026] message..."
+        Returns ISO 8601 string or None.
+        """
+        ts_match = re.match(r"\[(\w{3} \w{3} +\d+ \d{2}:\d{2}:\d{2} \d{4})\]", line)
+        if ts_match:
+            try:
+                from dateutil import parser as date_parser
+
+                dt = date_parser.parse(ts_match.group(1))
+                return dt.isoformat()
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _extract_journalctl_timestamp(line: str) -> str | None:
+        """Extract ISO timestamp from journalctl output line.
+
+        journalctl format: "Jun 17 10:30:00 hostname service[pid]: message..."
+        Returns ISO 8601 string (current year assumed) or None.
+        """
+        ts_match = re.match(r"(\w{3} +\d+ \d{2}:\d{2}:\d{2})\s", line)
+        if ts_match:
+            try:
+                from dateutil import parser as date_parser
+
+                dt = date_parser.parse(ts_match.group(1), default=date_parser.parse("2026-01-01"))
+                return dt.isoformat()
+            except Exception:
+                return None
+        return None
+
+    # ── Parser 4: kubelet ───────────────────────────────────────────────
+
+    def _parse_kubelet(self, output: str, node_name: str, instance_id: str, add_finding: Callable) -> None:
+        """Parse kubelet journal for critical errors.
+
+        Detects PLEG not healthy, certificate expiry, API server connectivity,
+        container runtime issues, sandbox failures, and eviction events.
+        """
+        if not output or not output.strip():
+            return
+
+        kubelet_patterns = [
+            (
+                r"(?:PLEG is not healthy|pleg was last seen active.*ago)",
+                "warning",
+                "Kubelet PLEG not healthy — pod lifecycle event generator stalled",
+            ),
+            (
+                r"x509: certificate has expired",
+                "warning",
+                "Kubelet certificate expired — node cannot communicate with API server",
+            ),
+            (
+                r"(?:Failed to watch.*context deadline exceeded|Failed to connect to.*API server)",
+                "critical",
+                "Kubelet cannot reach API server — node may be decommissioned",
+            ),
+            (
+                r"(?:runtime.*not ready|Remote runtime may be unhealthy)",
+                "critical",
+                "Container runtime not ready — kubelet cannot manage pods",
+            ),
+            (
+                r"(?:failed to create sandbox|failed to setup network for sandbox)",
+                "warning",
+                "Pod sandbox creation failure — CNI or runtime issue",
+            ),
+            (
+                r"(?:eviction_manager|evicting pod)",
+                "warning",
+                "Kubelet eviction in progress — node under resource pressure",
+            ),
+            (
+                r"(?:Failed to register node|node .* not found)",
+                "critical",
+                "Kubelet node registration failure — node cannot join cluster",
+            ),
+        ]
+
+        for pattern_str, severity, desc in kubelet_patterns:
+            pattern = re.compile(pattern_str, re.IGNORECASE)
+            for line in output.split("\n"):
+                match = pattern.search(line)
+                if not match:
+                    continue
+                timestamp = self._extract_journalctl_timestamp(line)
+                details: dict = {
+                    "severity": severity,
+                    "finding_type": FindingType.HISTORICAL_EVENT,
+                    "node": node_name,
+                    "instance_id": instance_id,
+                    "source": "SSM",
+                    "message": match.group(0)[:500],
+                }
+                if timestamp:
+                    details["timestamp"] = timestamp
+                add_finding(
+                    "node_os_kubelet",
+                    {
+                        "summary": f"{desc} on node {node_name}",
+                        "details": details,
+                    },
+                )
+
+    # ── Parser 5: containerd ────────────────────────────────────────────
+
+    def _parse_containerd(self, output: str, node_name: str, instance_id: str, add_finding: Callable) -> None:
+        """Parse containerd journal for runtime errors.
+
+        Detects image pull failures (auth, not found), disk full, rate limiting,
+        sandbox network setup failures, and runtime unavailability.
+        """
+        if not output or not output.strip():
+            return
+
+        containerd_patterns = [
+            (
+                r"(?:PullImage.*failed.*(?:401 Unauthorized|403 Forbidden))",
+                "warning",
+                "Image pull authentication failure — check IRSA/ECR permissions",
+            ),
+            (
+                r"(?:manifest unknown|repository.*not found)",
+                "warning",
+                "Image not found — check image name and tag",
+            ),
+            (
+                r"no space left on device",
+                "critical",
+                "Containerd disk full — node storage exhausted",
+            ),
+            (
+                r"(?:toomanyrequests|rate limit|429)",
+                "warning",
+                "Image registry rate limiting — pulls being throttled",
+            ),
+            (
+                r"failed to setup network for sandbox",
+                "warning",
+                "Containerd sandbox network setup failure — CNI issue",
+            ),
+            (
+                r"(?:runtime.*not ready|containerd.*unavailable)",
+                "critical",
+                "Containerd runtime not available — pods cannot start",
+            ),
+            (
+                r"(?:snapshotter.*error|snapshot.*failed)",
+                "warning",
+                "Containerd snapshotter failure — image layer storage issue",
+            ),
+        ]
+
+        for pattern_str, severity, desc in containerd_patterns:
+            pattern = re.compile(pattern_str, re.IGNORECASE)
+            for line in output.split("\n"):
+                match = pattern.search(line)
+                if not match:
+                    continue
+                timestamp = self._extract_journalctl_timestamp(line)
+                details: dict = {
+                    "severity": severity,
+                    "finding_type": FindingType.HISTORICAL_EVENT,
+                    "node": node_name,
+                    "instance_id": instance_id,
+                    "source": "SSM",
+                    "message": match.group(0)[:500],
+                }
+                if timestamp:
+                    details["timestamp"] = timestamp
+                add_finding(
+                    "node_os_containerd",
+                    {
+                        "summary": f"{desc} on node {node_name}",
+                        "details": details,
+                    },
+                )
+
+    # ── Parser 6: ipamd ─────────────────────────────────────────────────
+
+    def _parse_ipamd(self, output: str, node_name: str, instance_id: str, add_finding: Callable) -> None:
+        """Parse VPC CNI IPAMD state for IP allocation failures.
+
+        Checks both the IPAMD introspection API (localhost:61679) and the
+        ipamd.log file for allocation errors, ENI creation failures, and
+        subnet exhaustion.
+        """
+        if not output or not output.strip():
+            return
+
+        ipamd_patterns = [
+            (
+                r"(?:failed to assign an IP|no available IP)",
+                "critical",
+                "IPAMD cannot allocate pod IP — IP pool exhausted on this node",
+            ),
+            (
+                r"(?:Failed to CreateNetworkInterface|CreateNetworkInterface.*InvalidParameterValue)",
+                "critical",
+                "IPAMD ENI creation failure — cannot attach new network interface",
+            ),
+            (
+                r"(?:InsufficientFreeAddresses|InsufficientCidrBlocks)",
+                "critical",
+                "Subnet IP exhaustion — no available IPs in subnet",
+            ),
+            (
+                r"(?:UnauthorizedOperation|AccessDenied.*ec2:)",
+                "critical",
+                "IPAMD IAM permission error — node role missing EC2 permissions",
+            ),
+            (
+                r"(?:sufficient free Ipv4.*prefixes|prefix delegation.*fail)",
+                "warning",
+                "Prefix delegation failure — VPC CNI cannot allocate prefix",
+            ),
+            (
+                r"IP pool is too low",
+                "warning",
+                "IPAMD warm pool depleted — new pods may fail to start",
+            ),
+        ]
+
+        for pattern_str, severity, desc in ipamd_patterns:
+            for match in re.finditer(pattern_str, output, re.IGNORECASE):
+                add_finding(
+                    "node_os_ipamd",
+                    {
+                        "summary": f"{desc} on node {node_name}",
+                        "details": {
+                            "severity": severity,
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "node": node_name,
+                            "instance_id": instance_id,
+                            "source": "SSM",
+                            "message": match.group(0)[:500],
+                        },
+                    },
+                )
+
+    # ── Parser 7: routes ────────────────────────────────────────────────
+
+    def _parse_routes(self, output: str, node_name: str, instance_id: str, add_finding: Callable) -> None:
+        """Parse kernel route table and policy rules.
+
+        Detects blackhole/unreachable routes, missing default route,
+        and missing pod CIDR routes (eni interfaces).
+        """
+        if not output or not output.strip():
+            return
+
+        # Blackhole or unreachable routes — critical
+        for match in re.finditer(r"^(?:blackhole|unreachable)\s+(\S+)", output, re.MULTILINE | re.IGNORECASE):
+            add_finding(
+                "node_os_routes",
+                {
+                    "summary": f"Blackhole/unreachable route to {match.group(1)} on node {node_name}",
+                    "details": {
+                        "severity": "critical",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "destination": match.group(1),
+                        "impact": "Traffic to this destination is silently dropped",
+                    },
+                },
+            )
+
+        # Missing default route — critical
+        if "default" not in output.lower():
+            add_finding(
+                "node_os_routes",
+                {
+                    "summary": f"Missing default route on node {node_name}",
+                    "details": {
+                        "severity": "critical",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "impact": "Node cannot reach external networks",
+                    },
+                },
+            )
+
+        # Missing VPC DNS route (169.254.169.253 or 169.254.20.10)
+        if "169.254.169.253" not in output and "169.254.20.10" not in output:
+            # Only warn if there are pod routes (eni) suggesting this is a worker node
+            if re.search(r"dev\s+eni\d+", output):
+                add_finding(
+                    "node_os_routes",
+                    {
+                        "summary": f"Missing VPC DNS route on node {node_name}",
+                        "details": {
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "node": node_name,
+                            "instance_id": instance_id,
+                            "source": "SSM",
+                            "impact": "Pods may experience intermittent DNS resolution failures",
+                        },
+                    },
+                )
+
+    # ── Parser 8: cni_config ────────────────────────────────────────────
+
+    def _parse_cni_config(self, output: str, node_name: str, instance_id: str, add_finding: Callable) -> None:
+        """Parse CNI configuration files from /etc/cni/net.d/.
+
+        Detects missing CNI config, incorrect MTU values, and multiple
+        conflicting CNI configurations.
+        """
+        stripped = output.strip() if output else ""
+
+        # Missing CNI config entirely — critical
+        if not stripped:
+            add_finding(
+                "node_os_cni_config",
+                {
+                    "summary": f"Missing CNI configuration on node {node_name}",
+                    "details": {
+                        "severity": "critical",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "impact": "No CNI plugin configured — pods cannot get networking",
+                        "remediation": "Reinstall VPC CNI: kubectl rollout restart ds aws-node -n kube-system",
+                    },
+                },
+            )
+            return
+
+        # Check MTU value — EKS optimized AMI uses 9001 (jumbo) or 1500 (standard)
+        mtu_matches = re.findall(r'"mtu"\s*:\s*(\d+)', output)
+        for mtu_str in mtu_matches:
+            mtu_val = int(mtu_str)
+            if mtu_val != 9001 and mtu_val != 1500:
+                add_finding(
+                    "node_os_cni_config",
+                    {
+                        "summary": f"Non-standard CNI MTU {mtu_val} on node {node_name}",
+                        "details": {
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "node": node_name,
+                            "instance_id": instance_id,
+                            "source": "SSM",
+                            "mtu": mtu_val,
+                            "expected": "9001 (jumbo) or 1500 (standard)",
+                            "impact": "MTU mismatch can cause packet fragmentation and timeout",
+                        },
+                    },
+                )
+
+        # Multiple CNI config files — potential conflict
+        # Each conflist starts with "{\n  \"cniVersion\" or \"name\"
+        conflist_count = len(re.findall(r'"cniVersion"', output))
+        if conflist_count > 1:
+            add_finding(
+                "node_os_cni_config",
+                {
+                    "summary": f"Multiple CNI configs ({conflist_count}) on node {node_name}",
+                    "details": {
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "count": conflist_count,
+                        "impact": "Multiple CNI plugins may conflict — ensure 10-aws.conflist sorts first",
+                    },
+                },
+            )
+
+    # ── Parser 9: sysctl ────────────────────────────────────────────────
+
+    def _parse_sysctl(self, output: str, node_name: str, instance_id: str, add_finding: Callable) -> None:
+        """Parse sysctl output for non-optimal kernel parameters.
+
+        Checks conntrack limits, rp_filter mode, port range, file-max,
+        and pid_max against EKS best-practice thresholds.
+        """
+        if not output or not output.strip():
+            return
+
+        # Build a dict of key → value from sysctl output
+        params: dict[str, str] = {}
+        for line in output.strip().split("\n"):
+            parts = line.split("=", 1)
+            if len(parts) == 2:
+                params[parts[0].strip()] = parts[1].strip()
+
+        # nf_conntrack_max too low
+        conntrack_max = self._parse_int_val(params, "net.netfilter.nf_conntrack_max")
+        if conntrack_max is not None and conntrack_max < 131072:
+            add_finding(
+                "node_os_sysctl",
+                {
+                    "summary": f"Low nf_conntrack_max ({conntrack_max}) on node {node_name}",
+                    "details": {
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "parameter": "net.netfilter.nf_conntrack_max",
+                        "current": conntrack_max,
+                        "recommended": ">= 131072",
+                        "remediation": "sysctl -w net.netfilter.nf_conntrack_max=131072",
+                    },
+                },
+            )
+
+        # rp_filter should be 2 (loose mode) for EKS
+        rp_filter = self._parse_int_val(params, "net.ipv4.conf.all.rp_filter")
+        if rp_filter is not None and rp_filter != 2:
+            add_finding(
+                "node_os_sysctl",
+                {
+                    "summary": f"Non-optimal rp_filter ({rp_filter}) on node {node_name}",
+                    "details": {
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "parameter": "net.ipv4.conf.all.rp_filter",
+                        "current": rp_filter,
+                        "recommended": "2 (loose mode)",
+                        "impact": "Strict rp_filter (1) can drop legitimate pod traffic",
+                    },
+                },
+            )
+
+        # ip_local_port_range too narrow
+        port_range_str = params.get("net.ipv4.ip_local_port_range", "")
+        if port_range_str:
+            port_parts = port_range_str.split()
+            if len(port_parts) == 2:
+                try:
+                    port_start, port_end = int(port_parts[0]), int(port_parts[1])
+                    available = port_end - port_start
+                    if available < 20000:
+                        add_finding(
+                            "node_os_sysctl",
+                            {
+                                "summary": f"Narrow ip_local_port_range ({port_range_str}) on node {node_name}",
+                                "details": {
+                                    "severity": "warning",
+                                    "finding_type": FindingType.CURRENT_STATE,
+                                    "node": node_name,
+                                    "instance_id": instance_id,
+                                    "source": "SSM",
+                                    "parameter": "net.ipv4.ip_local_port_range",
+                                    "current": port_range_str,
+                                    "recommended": "10240 65535",
+                                    "impact": "Low ephemeral port availability can cause connection failures",
+                                },
+                            },
+                        )
+                except ValueError:
+                    pass
+
+        # file-max too low
+        file_max = self._parse_int_val(params, "fs.file-max")
+        if file_max is not None and file_max < 65536:
+            add_finding(
+                "node_os_sysctl",
+                {
+                    "summary": f"Low fs.file-max ({file_max}) on node {node_name}",
+                    "details": {
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "parameter": "fs.file-max",
+                        "current": file_max,
+                        "recommended": ">= 65536",
+                    },
+                },
+            )
+
+        # pid_max too low
+        pid_max = self._parse_int_val(params, "kernel.pid_max")
+        if pid_max is not None and pid_max < 4194304:
+            add_finding(
+                "node_os_sysctl",
+                {
+                    "summary": f"Low kernel.pid_max ({pid_max}) on node {node_name}",
+                    "details": {
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "node": node_name,
+                        "instance_id": instance_id,
+                        "source": "SSM",
+                        "parameter": "kernel.pid_max",
+                        "current": pid_max,
+                        "recommended": ">= 4194304",
+                    },
+                },
+            )
+
+    @staticmethod
+    def _parse_int_val(params: dict[str, str], key: str) -> int | None:
+        """Safely parse an integer value from the sysctl params dict."""
+        val = params.get(key)
+        if val is None:
+            return None
+        try:
+            return int(val.strip())
+        except (ValueError, AttributeError):
+            return None
+
+    # ── Parser 10: eni_metadata ─────────────────────────────────────────
+
+    def _parse_eni_metadata(self, output: str, node_name: str, instance_id: str, add_finding: Callable) -> None:
+        """Parse network interface metadata and ethtool counters.
+
+        Detects AWS-level conntrack/linklocal/bandwidth allowance exhaustion
+        (from ethtool -S) and interfaces that are DOWN.
+        """
+        if not output or not output.strip():
+            return
+
+        # conntrack_allowance_exceeded — AWS-level conntrack limit hit (instance type limit)
+        for match in re.finditer(r"conntrack_allowance_exceeded:\s*(\d+)", output):
+            count = int(match.group(1))
+            if count > 0:
+                add_finding(
+                    "node_os_eni",
+                    {
+                        "summary": f"AWS conntrack allowance exceeded ({count}) on node {node_name}",
+                        "details": {
+                            "severity": "critical",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "node": node_name,
+                            "instance_id": instance_id,
+                            "source": "SSM",
+                            "metric": "conntrack_allowance_exceeded",
+                            "count": count,
+                            "impact": "AWS is dropping connections at the hypervisor level — need larger instance type",
+                            "remediation": "Upgrade to a larger instance type with higher conntrack allowance",
+                        },
+                    },
+                )
+
+        # linklocal_allowance_exceeded — DNS PPS throttling
+        for match in re.finditer(r"linklocal_allowance_exceeded:\s*(\d+)", output):
+            count = int(match.group(1))
+            if count > 0:
+                add_finding(
+                    "node_os_eni",
+                    {
+                        "summary": f"Link-local (DNS) allowance exceeded ({count}) on node {node_name}",
+                        "details": {
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "node": node_name,
+                            "instance_id": instance_id,
+                            "source": "SSM",
+                            "metric": "linklocal_allowance_exceeded",
+                            "count": count,
+                            "impact": "DNS packets to 169.254.169.253 are being throttled at AWS level",
+                        },
+                    },
+                )
+
+        # Bandwidth allowance exceeded
+        for match in re.finditer(r"bw_(?:in|out)_allowance_exceeded:\s*(\d+)", output):
+            count = int(match.group(1))
+            if count > 0:
+                add_finding(
+                    "node_os_eni",
+                    {
+                        "summary": f"Bandwidth allowance exceeded ({count}) on node {node_name}",
+                        "details": {
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "node": node_name,
+                            "instance_id": instance_id,
+                            "source": "SSM",
+                            "metric": match.group(0).split(":")[0],
+                            "count": count,
+                            "impact": "Network bandwidth throttled at AWS level",
+                        },
+                    },
+                )
+
+        # Interface DOWN — data interface should be UP
+        for match in re.finditer(r"^\d+:\s+(\S+):.*state\s+DOWN", output, re.MULTILINE | re.IGNORECASE):
+            iface = match.group(1)
+            if iface != "lo":  # Skip loopback
+                add_finding(
+                    "node_os_eni",
+                    {
+                        "summary": f"Network interface {iface} is DOWN on node {node_name}",
+                        "details": {
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "node": node_name,
+                            "instance_id": instance_id,
+                            "source": "SSM",
+                            "interface": iface,
+                            "impact": "Pods using this interface have no network connectivity",
+                        },
+                    },
+                )
+
+
 class ComprehensiveEKSDebugger(DateFilterMixin):
     """
     Comprehensive EKS cluster debugger with date filtering and multiple output formats.
@@ -7518,6 +9214,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         progress: ProgressTracker | None = None,
         kube_context: str | None = None,
         pagination_limit: int = 1000,
+        enable_node_diagnostics: bool = False,
+        ssm_timeout: int = NodeDiagnosticConfig.DEFAULT_SSM_TIMEOUT,
+        ssm_mode: str = "run-command",
+        ssm_max_nodes: int = NodeDiagnosticConfig.DEFAULT_MAX_NODES_TO_DIAGNOSE,
     ) -> None:
         """
         Initialize debugger
@@ -7536,6 +9236,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             enable_cache: Enable API response caching (default: True)
             enable_incremental: Enable incremental analysis with delta reporting (default: True)
             pagination_limit: Maximum items to fetch per paginated API call (default: 1000)
+            enable_node_diagnostics: Enable SSM-based node OS-level diagnostics (default: False)
+            ssm_timeout: Timeout in seconds for SSM Run Command execution (default: 300)
+            ssm_mode: SSM execution mode - "run-command" (default), "automation", or "both"
+            ssm_max_nodes: Maximum number of nodes to run SSM diagnostics on (default: 50)
         """
         validate_input("profile", profile)
         validate_input("region", region)
@@ -7560,6 +9264,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.enable_incremental = True
         self.pagination_limit = pagination_limit
 
+        # Node OS diagnostics configuration (Phase 1)
+        self.enable_node_diagnostics = enable_node_diagnostics
+        self.ssm_timeout = min(ssm_timeout, NodeDiagnosticConfig.MAX_SSM_TIMEOUT)
+        self.ssm_mode = ssm_mode if ssm_mode in ("run-command", "automation", "both") else "run-command"
+        self.ssm_max_nodes = max(1, ssm_max_nodes)
+
         # API response cache
         self._api_cache = APICache(ttl_seconds=API_CACHE_TTL_SECONDS)
 
@@ -7573,6 +9283,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self.ec2_client = self.session.client("ec2")
             self.cloudtrail_client = self.session.client("cloudtrail")
             self.service_quotas_client = self.session.client("service-quotas")
+            self.ssm_client = self.session.client("ssm")
         except Exception as e:
             raise AWSAuthenticationError(f"Failed to initialize AWS session: {e}")
 
@@ -7595,6 +9306,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "dns_issues": [],
             "addon_issues": [],
             "quota_issues": [],
+            # Node OS-level diagnostics (Phase 1: SSM-based)
+            "node_os_iptables": [],
+            "node_os_conntrack": [],
+            "node_os_dmesg": [],
+            "node_os_kubelet": [],
+            "node_os_containerd": [],
+            "node_os_ipamd": [],
+            "node_os_routes": [],
+            "node_os_cni_config": [],
+            "node_os_sysctl": [],
+            "node_os_eni": [],
         }
 
         self.errors = []
@@ -7612,6 +9334,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "kubectl_cache": {},  # cmd -> output
             "node_info": None,  # kubectl get nodes output
             "pod_info": None,  # kubectl get pods output
+            "ssm_results": {},  # instance_id -> {diag_type -> {status, stdout, stderr}}
         }
         self._shared_data_lock = threading.Lock()
 
@@ -10038,7 +11761,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if phase != "Bound":
                         storage_class = pvc["spec"].get("storageClassName", "N/A")
-                        requested_storage = pvc.get("spec", {}).get("resources", {}).get("requests", {}).get("storage", "N/A")
+                        requested_storage = (
+                            pvc.get("spec", {}).get("resources", {}).get("requests", {}).get("storage", "N/A")
+                        )
 
                         diagnostic_steps = [
                             f"kubectl describe pvc {pvc_name} -n {namespace}",
@@ -11857,7 +13582,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         backend_svc = service.get("name")
 
                         if backend_svc:
-                            svc_check = self.safe_kubectl_call(f"kubectl get svc {shlex.quote(backend_svc)} -n {shlex.quote(namespace)} -o name")
+                            svc_check = self.safe_kubectl_call(
+                                f"kubectl get svc {shlex.quote(backend_svc)} -n {shlex.quote(namespace)} -o name"
+                            )
                             if not svc_check:
                                 self._add_finding(
                                     "network_issues",
@@ -13507,6 +15234,134 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 }
             )
 
+        # Correlation Rule 14: Conntrack Exhaustion Cascade (node_os_conntrack → network/DNS)
+        # Links SSM-detected conntrack saturation with cluster-level network/DNS failures on same node
+        conntrack_findings = self.findings.get("node_os_conntrack", [])
+        net_dns_findings = self.findings.get("network_issues", []) + self.findings.get("dns_issues", [])
+        if conntrack_findings and net_dns_findings:
+            # Extract affected nodes from conntrack findings
+            ct_nodes = {
+                f.get("details", {}).get("node", "") for f in conntrack_findings if f.get("details", {}).get("node")
+            }
+            # Find network/DNS failures on same nodes
+            affected_nodes_findings = [f for f in net_dns_findings if f.get("details", {}).get("node", "") in ct_nodes]
+            if affected_nodes_findings:
+                ct_times = [self._extract_timestamp(f.get("details", {})) for f in conntrack_findings]
+                first_ct = min(t for t in ct_times if t) if any(ct_times) else None
+                correlations.append(
+                    {
+                        "correlation_type": "conntrack_exhaustion_cascade",
+                        "severity": "critical",
+                        "root_cause": "Conntrack table exhaustion causing network/DNS failures",
+                        "root_cause_time": str(first_ct) if first_ct else "Unknown",
+                        "affected_components": {
+                            "conntrack_nodes": len(ct_nodes),
+                            "network_dns_failures": len(affected_nodes_findings),
+                            "nodes": sorted(ct_nodes)[:10],
+                        },
+                        "impact": f"Conntrack saturation on {len(ct_nodes)} node(s) causing {len(affected_nodes_findings)} network/DNS failures",
+                        "recommendation": "Increase nf_conntrack_max or upgrade to larger instance type with higher conntrack allowance",
+                        "aws_doc": "https://repost.aws/knowledge-center/eks-conntrack-exhaustion",
+                    }
+                )
+
+        # Correlation Rule 15: iptables DNS Block (node_os_iptables → dns_issues)
+        # Links SSM-detected iptables DROP on port 53 with DNS resolution failures
+        iptables_dns_findings = [
+            f
+            for f in self.findings.get("node_os_iptables", [])
+            if "dns" in f.get("summary", "").lower() or "port 53" in f.get("summary", "").lower()
+        ]
+        dns_failures = self.findings.get("dns_issues", [])
+        if iptables_dns_findings and dns_failures:
+            ipt_nodes = {
+                f.get("details", {}).get("node", "") for f in iptables_dns_findings if f.get("details", {}).get("node")
+            }
+            dns_on_same_nodes = [f for f in dns_failures if f.get("details", {}).get("node", "") in ipt_nodes]
+            if dns_on_same_nodes:
+                correlations.append(
+                    {
+                        "correlation_type": "iptables_dns_block",
+                        "severity": "critical",
+                        "root_cause": "iptables DROP rule blocking DNS (port 53) traffic",
+                        "root_cause_time": "Unknown",
+                        "affected_components": {
+                            "blocked_nodes": len(ipt_nodes),
+                            "dns_failures": len(dns_on_same_nodes),
+                            "nodes": sorted(ipt_nodes)[:10],
+                        },
+                        "impact": f"Firewall blocking DNS on {len(ipt_nodes)} node(s), causing {len(dns_on_same_nodes)} DNS failures",
+                        "recommendation": "Remove the iptables DROP rule on port 53 and check for NetworkPolicy or fault injection misconfiguration",
+                        "aws_doc": "https://repost.aws/knowledge-center/eks-dns-failures",
+                    }
+                )
+
+        # Correlation Rule 16: Kubelet PLEG Cascade (node_os_kubelet PLEG → node NotReady/restarts)
+        # Links SSM-detected PLEG errors with node NotReady status or pod restarts
+        pleg_findings = [f for f in self.findings.get("node_os_kubelet", []) if "pleg" in f.get("summary", "").lower()]
+        node_notready = [
+            f
+            for f in self.findings.get("node_issues", [])
+            if "notready" in f.get("summary", "").lower() or "not ready" in f.get("summary", "").lower()
+        ]
+        if pleg_findings and node_notready:
+            pleg_nodes = {
+                f.get("details", {}).get("node", "") for f in pleg_findings if f.get("details", {}).get("node")
+            }
+            notready_same_nodes = [f for f in node_notready if f.get("details", {}).get("node", "") in pleg_nodes]
+            if notready_same_nodes:
+                pleg_times = [self._extract_timestamp(f.get("details", {})) for f in pleg_findings]
+                first_pleg = min(t for t in pleg_times if t) if any(pleg_times) else None
+                correlations.append(
+                    {
+                        "correlation_type": "kubelet_pleg_cascade",
+                        "severity": "critical",
+                        "root_cause": "Kubelet PLEG failure causing node instability",
+                        "root_cause_time": str(first_pleg) if first_pleg else "Unknown",
+                        "affected_components": {
+                            "pleg_nodes": len(pleg_nodes),
+                            "notready_events": len(notready_same_nodes),
+                            "nodes": sorted(pleg_nodes)[:10],
+                        },
+                        "impact": f"PLEG not healthy on {len(pleg_nodes)} node(s), causing {len(notready_same_nodes)} NotReady events",
+                        "recommendation": "Check container runtime status, node resource usage. Consider draining and replacing affected nodes",
+                        "aws_doc": "https://repost.aws/knowledge-center/eks-node-status-ready",
+                    }
+                )
+
+        # Correlation Rule 17: IPAMD Exhaustion Cascade (node_os_ipamd → FailedScheduling/ContainerCreating)
+        # Links SSM-detected IPAMD failures with scheduling or container creation failures
+        ipamd_failures = self.findings.get("node_os_ipamd", [])
+        sched_or_create = [
+            f
+            for f in self.findings.get("scheduling_failures", []) + self.findings.get("pod_errors", [])
+            if any(
+                kw in f.get("summary", "").lower() for kw in ["failedscheduling", "containercreating", "insufficient"]
+            )
+        ]
+        if ipamd_failures and sched_or_create:
+            ipamd_nodes = {
+                f.get("details", {}).get("node", "") for f in ipamd_failures if f.get("details", {}).get("node")
+            }
+            sched_on_same_nodes = [f for f in sched_or_create if f.get("details", {}).get("node", "") in ipamd_nodes]
+            if sched_on_same_nodes:
+                correlations.append(
+                    {
+                        "correlation_type": "ipamd_exhaustion_cascade",
+                        "severity": "critical",
+                        "root_cause": "VPC CNI IPAMD cannot allocate IPs — subnet or ENI limits exhausted",
+                        "root_cause_time": "Unknown",
+                        "affected_components": {
+                            "ipamd_nodes": len(ipamd_nodes),
+                            "scheduling_failures": len(sched_on_same_nodes),
+                            "nodes": sorted(ipamd_nodes)[:10],
+                        },
+                        "impact": f"IP allocation failures on {len(ipamd_nodes)} node(s) causing {len(sched_on_same_nodes)} scheduling/creation failures",
+                        "recommendation": "Check subnet IP availability, consider enabling prefix delegation or adding secondary CIDR ranges",
+                        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/prefix-delegation.html",
+                    }
+                )
+
         # Store correlations and enhance them
         if correlations:
             self.correlations = correlations
@@ -14466,6 +16321,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "quota_exhaustion": True,  # Quota limits → scheduling failures
             "hpa_thrashing": True,  # HPA config → rapid scaling
             "cluster_upgrade": True,  # Upgrades → transient failures
+            # Phase 1: Node OS diagnostics correlations
+            "conntrack_exhaustion_cascade": True,  # Conntrack saturation → network/DNS failures
+            "iptables_dns_block": True,  # iptables DROP on port 53 → DNS failures
+            "kubelet_pleg_cascade": True,  # Kubelet PLEG failure → node NotReady
+            "ipamd_exhaustion_cascade": True,  # IPAMD IP exhaustion → scheduling failures
         }
 
         for corr in self.correlations:
@@ -14611,6 +16471,47 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cause_events = []
                 effect_events = []
                 alternative_causes = []
+
+            elif corr_type == "conntrack_exhaustion_cascade":
+                cause_events = self.findings.get("node_os_conntrack", [])
+                effect_events = [
+                    f
+                    for f in self.findings.get("network_issues", []) + self.findings.get("dns_issues", [])
+                    if f.get("details", {}).get("node")
+                ]
+                alternative_causes = ["security_group_misconfig", "vpc_dns_issue", "coredns_scaling"]
+
+            elif corr_type == "iptables_dns_block":
+                cause_events = [
+                    f
+                    for f in self.findings.get("node_os_iptables", [])
+                    if "dns" in f.get("summary", "").lower() or "port 53" in f.get("summary", "").lower()
+                ]
+                effect_events = self.findings.get("dns_issues", [])
+                alternative_causes = ["coredns_misconfig", "vpc_dns_endpoint", "network_policy"]
+
+            elif corr_type == "kubelet_pleg_cascade":
+                cause_events = [
+                    f for f in self.findings.get("node_os_kubelet", []) if "pleg" in f.get("summary", "").lower()
+                ]
+                effect_events = [
+                    f
+                    for f in self.findings.get("node_issues", [])
+                    if "notready" in f.get("summary", "").lower() or "not ready" in f.get("summary", "").lower()
+                ]
+                alternative_causes = ["container_runtime_crash", "node_resource_exhaustion", "network_partition"]
+
+            elif corr_type == "ipamd_exhaustion_cascade":
+                cause_events = self.findings.get("node_os_ipamd", [])
+                effect_events = [
+                    f
+                    for f in self.findings.get("scheduling_failures", []) + self.findings.get("pod_errors", [])
+                    if any(
+                        kw in f.get("summary", "").lower()
+                        for kw in ["failedscheduling", "containercreating", "insufficient"]
+                    )
+                ]
+                alternative_causes = ["resource_quota", "taint_toleration", "node_selector_mismatch"]
 
             else:
                 # Default: use correlation's affected components as proxy
@@ -19387,6 +21288,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         else:
             self._run_analysis_sequential(analysis_methods)
 
+        # Node OS-level diagnostics (Phase 1: SSM-based) — opt-in via --enable-node-diagnostics
+        if self.enable_node_diagnostics:
+            try:
+                self._run_node_os_diagnostics()
+            except Exception as e:
+                self.progress.warning(f"Node OS diagnostics failed: {e}")
+
         # Step 59: Run correlation analysis
         try:
             self.correlate_findings()
@@ -19487,6 +21395,123 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         if slowest:
             slowest_str = ", ".join(f"{m}: {t:.1f}s" for m, t in slowest)
             self.progress.info(f"Slowest methods: {slowest_str}")
+
+    def _run_node_os_diagnostics(self) -> None:
+        """Execute SSM-based node OS-level diagnostics.
+
+        This is the orchestrator for Phase 1 node diagnostics. It:
+        1. Maps EKS node names to EC2 instance IDs (via pre-fetched kubectl data)
+        2. Filters to SSM-managed, Online instances
+        3. Selects nodes by priority (conditions > NotReady > healthy baseline)
+        4. Sends diagnostic commands via SSM Run Command (AWS-RunShellScript)
+        5. Parses results into findings via NodeOSOutputParser
+
+        All errors are handled gracefully — if SSM is unavailable, nodes aren't
+        managed, or API calls fail, the method logs a warning and returns without
+        crashing. The rest of the analysis pipeline continues unaffected.
+
+        Requires ``self.enable_node_diagnostics = True`` (set via --enable-node-diagnostics).
+        """
+        self.progress.info("Starting node OS-level diagnostics via SSM...")
+
+        if self.ssm_mode in ("automation", "both"):
+            self.progress.warning(
+                f"SSM mode '{self.ssm_mode}' requested but Automation is not yet implemented — "
+                "using Run Command mode (FREE). Automation support will be added in a future release."
+            )
+
+        try:
+            ssm_manager = SSMNodeDiagnosticsManager(self)
+
+            # Step 1: Map nodes to instance IDs
+            self.progress.info("Mapping EKS nodes to EC2 instance IDs...")
+            node_map = ssm_manager.get_node_instance_mapping()
+            if not node_map:
+                self._add_error(
+                    "node_diagnostics", "Could not map any nodes to EC2 instance IDs (check kubectl access)"
+                )
+                return
+
+            # Step 2: Filter to SSM-managed instances
+            all_instance_ids = list(node_map.values())
+            managed_instances = ssm_manager.check_ssm_managed(all_instance_ids)
+            if not managed_instances:
+                self._add_error(
+                    "node_diagnostics",
+                    "No SSM-managed nodes found. Ensure AmazonSSMManagedInstanceCore policy is attached to node IAM role.",
+                )
+                return
+
+            # Step 3: Select nodes for diagnostics (priority: unhealthy first)
+            all_node_names = list(node_map.keys())
+            # Build a set of managed node names for filtering
+            managed_node_names = [n for n in all_node_names if node_map[n] in managed_instances]
+            # Use select_nodes_for_diagnostics which reads from _shared_data["node_info"]
+            selected_node_names = ssm_manager.select_nodes_for_diagnostics(self.ssm_max_nodes)
+            # Intersect with managed nodes
+            selected_node_names = [n for n in selected_node_names if n in set(managed_node_names)]
+            if not selected_node_names:
+                self.progress.warning("No managed nodes selected for diagnostics")
+                return
+
+            selected_instance_ids = [node_map[n] for n in selected_node_names]
+            self.progress.info(
+                f"Running SSM diagnostics on {len(selected_instance_ids)} of {len(managed_instances)} managed nodes..."
+            )
+
+            # Step 4: Calculate scan window in hours for journalctl commands
+            hours = max(1, int((self.end_date - self.start_date).total_seconds() / 3600))
+
+            # Step 5: Run diagnostic commands via SSM
+            results = ssm_manager.run_diagnostic_commands(
+                selected_instance_ids,
+                NODE_DIAGNOSTIC_COMMANDS,
+                hours=hours,
+            )
+
+            # Store raw results in shared data for potential reuse
+            with self._shared_data_lock:
+                self._shared_data["ssm_results"] = results
+
+            # Step 6: Parse results into findings
+            parser = NodeOSOutputParser()
+            instance_to_node = {v: k for k, v in node_map.items()}
+            total_findings = 0
+
+            for instance_id, diag_results in results.items():
+                node_name = instance_to_node.get(instance_id, instance_id)
+
+                for diag_type, output_result in diag_results.items():
+                    status = output_result.get("status", "")
+                    stdout = output_result.get("stdout", "")
+
+                    if status == "Success" and stdout:
+                        # Parse successful output into findings
+                        before_count = sum(len(v) for v in self.findings.values())
+                        parser.parse(
+                            diag_type,
+                            stdout,
+                            node_name,
+                            instance_id,
+                            self._add_finding_dict,
+                        )
+                        after_count = sum(len(v) for v in self.findings.values())
+                        total_findings += after_count - before_count
+                    elif status not in ("Success", ""):
+                        # Log SSM command failures as errors (not findings)
+                        self._add_error(
+                            f"ssm_diag_{diag_type}_{node_name}",
+                            f"SSM diagnostic '{diag_type}' {status} on {node_name} ({instance_id})"
+                            f": {output_result.get('stderr', 'N/A')[:300]}",
+                        )
+
+            self.progress.info(
+                f"Node OS diagnostics complete. {total_findings} findings from {len(selected_instance_ids)} nodes."
+            )
+
+        except Exception as e:
+            self._add_error("node_diagnostics", f"Node OS diagnostics failed: {e}")
+            self.progress.warning(f"Node OS diagnostics failed: {e}")
 
     def _generate_summary(self):
         """Generate summary of findings using same severity logic as HTML output"""
@@ -19890,6 +21915,196 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 }
             )
 
+        # Node OS: iptables recommendations (Phase 1: SSM)
+        if self.findings.get("node_os_iptables"):
+            evidence = extract_evidence(self.findings["node_os_iptables"])
+            recommendations.append(
+                {
+                    "title": "Resolve iptables Firewall Issues on Nodes",
+                    "category": "node_os_iptables",
+                    "priority": "critical",
+                    "action": "Remove iptables DROP rules blocking DNS (port 53), restart kube-proxy if KUBE-SERVICES chain is missing",
+                    "aws_doc": "https://repost.aws/knowledge-center/eks-dns-failures",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run via SSM: iptables-save | grep -E 'DROP.*dpt:53'",
+                        "Run: kubectl delete pod -n kube-system -l k8s-app=kube-proxy",
+                        "Check for NetworkPolicy or fault injection misconfiguration",
+                    ],
+                }
+            )
+
+        # Node OS: conntrack recommendations (Phase 1: SSM)
+        if self.findings.get("node_os_conntrack"):
+            evidence = extract_evidence(self.findings["node_os_conntrack"])
+            recommendations.append(
+                {
+                    "title": "Resolve Conntrack Table Saturation on Nodes",
+                    "category": "node_os_conntrack",
+                    "priority": "critical",
+                    "action": "Increase nf_conntrack_max or upgrade to larger instance type with higher conntrack allowance",
+                    "aws_doc": "https://repost.aws/knowledge-center/eks-conntrack-exhaustion",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run via SSM: sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max",
+                        "Run via SSM: conntrack -S | grep drop",
+                        "Check ethtool for conntrack_allowance_exceeded (AWS-level limit)",
+                    ],
+                }
+            )
+
+        # Node OS: dmesg recommendations (Phase 1: SSM)
+        if self.findings.get("node_os_dmesg"):
+            evidence = extract_evidence(self.findings["node_os_dmesg"])
+            recommendations.append(
+                {
+                    "title": "Investigate Kernel-Level Errors Detected via dmesg",
+                    "category": "node_os_dmesg",
+                    "priority": "critical",
+                    "action": "Address kernel OOM kills, hardware errors, or disk I/O issues. May require node replacement for hardware failures.",
+                    "aws_doc": "https://repost.aws/knowledge-center/eks-oomkilled-pods",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run via SSM: dmesg -T | grep -iE 'oom|hardware|nvme|error'",
+                        "Check: kubectl describe node <node-name>",
+                        "Review: EBS volume CloudWatch metrics for I/O errors",
+                    ],
+                }
+            )
+
+        # Node OS: kubelet recommendations (Phase 1: SSM)
+        if self.findings.get("node_os_kubelet"):
+            evidence = extract_evidence(self.findings["node_os_kubelet"])
+            recommendations.append(
+                {
+                    "title": "Resolve Kubelet Journal Errors on Nodes",
+                    "category": "node_os_kubelet",
+                    "priority": "high",
+                    "action": "Address PLEG failures, certificate expiry, or API server connectivity issues. Restart kubelet or drain node if persistent.",
+                    "aws_doc": "https://repost.aws/knowledge-center/eks-node-status-ready",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run via SSM: journalctl -u kubelet --since '30 min ago' | grep -iE 'pleg|cert|error'",
+                        "Run: kubectl get node <node-name> -o jsonpath='{.status.conditions}'",
+                        "Check: sudo systemctl status kubelet",
+                    ],
+                }
+            )
+
+        # Node OS: containerd recommendations (Phase 1: SSM)
+        if self.findings.get("node_os_containerd"):
+            evidence = extract_evidence(self.findings["node_os_containerd"])
+            recommendations.append(
+                {
+                    "title": "Resolve containerd Runtime Issues on Nodes",
+                    "category": "node_os_containerd",
+                    "priority": "high",
+                    "action": "Address image pull failures, disk space, or runtime unavailability. Clean unused images or increase disk size.",
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/eks-optimized-ami.html",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run via SSM: journalctl -u containerd --since '30 min ago' | tail -50",
+                        "Run via SSM: df -h /var/lib/containerd",
+                        "Check: sudo crictl ps -a | head -20",
+                    ],
+                }
+            )
+
+        # Node OS: ipamd recommendations (Phase 1: SSM)
+        if self.findings.get("node_os_ipamd"):
+            evidence = extract_evidence(self.findings["node_os_ipamd"])
+            recommendations.append(
+                {
+                    "title": "Resolve VPC CNI IP Allocation Failures",
+                    "category": "node_os_ipamd",
+                    "priority": "critical",
+                    "action": "Check subnet IP availability, enable prefix delegation, or add secondary CIDR ranges",
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/prefix-delegation.html",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run: aws ec2 describe-subnets --query 'Subnets[*].[SubnetId,AvailableIpAddressCount]'",
+                        "Check: kubectl describe ds aws-node -n kube-system",
+                        "Consider: kubectl set env ds aws-node -n kube-system ENABLE_PREFIX_DELEGATION=true",
+                    ],
+                }
+            )
+
+        # Node OS: routes recommendations (Phase 1: SSM)
+        if self.findings.get("node_os_routes"):
+            evidence = extract_evidence(self.findings["node_os_routes"])
+            recommendations.append(
+                {
+                    "title": "Resolve Kernel Route Table Issues on Nodes",
+                    "category": "node_os_routes",
+                    "priority": "high",
+                    "action": "Remove blackhole routes, ensure default route exists, restart VPC CNI for stale pod routes",
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run via SSM: ip route show table all | grep -E 'blackhole|unreachable'",
+                        "Run via SSM: ip rule show",
+                        "Check: kubectl get pods -o wide --field-selector spec.nodeName=<node>",
+                    ],
+                }
+            )
+
+        # Node OS: CNI config recommendations (Phase 1: SSM)
+        if self.findings.get("node_os_cni_config"):
+            evidence = extract_evidence(self.findings["node_os_cni_config"])
+            recommendations.append(
+                {
+                    "title": "Resolve CNI Configuration Issues on Nodes",
+                    "category": "node_os_cni_config",
+                    "priority": "critical",
+                    "action": "Reinstall VPC CNI, fix MTU settings, resolve conflicting CNI configurations",
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run via SSM: cat /etc/cni/net.d/*.conflist",
+                        "Check: kubectl get ds aws-node -n kube-system",
+                        "Consider: kubectl rollout restart ds aws-node -n kube-system",
+                    ],
+                }
+            )
+
+        # Node OS: sysctl recommendations (Phase 1: SSM)
+        if self.findings.get("node_os_sysctl"):
+            evidence = extract_evidence(self.findings["node_os_sysctl"])
+            recommendations.append(
+                {
+                    "title": "Optimize Kernel Parameters on Nodes",
+                    "category": "node_os_sysctl",
+                    "priority": "warning",
+                    "action": "Adjust nf_conntrack_max, rp_filter, ip_local_port_range, and other kernel parameters to EKS best practices",
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run via SSM: sysctl net.netfilter.nf_conntrack_max net.ipv4.conf.all.rp_filter",
+                        "Apply: sudo sysctl -w net.netfilter.nf_conntrack_max=262144",
+                        "Apply: sudo sysctl -w net.ipv4.conf.all.rp_filter=2",
+                    ],
+                }
+            )
+
+        # Node OS: ENI metadata recommendations (Phase 1: SSM)
+        if self.findings.get("node_os_eni"):
+            evidence = extract_evidence(self.findings["node_os_eni"])
+            recommendations.append(
+                {
+                    "title": "Resolve Network Interface Issues on Nodes",
+                    "category": "node_os_eni",
+                    "priority": "critical",
+                    "action": "Address AWS-level conntrack/bandwidth allowance exceeded or DOWN interfaces. May require instance type upgrade or node replacement.",
+                    "aws_doc": "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-network-interface-traffic.html",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run via SSM: ethtool -S eth0 | grep -E 'conntrack_allowance|linklocal_allowance'",
+                        "Run via SSM: ip -o link show",
+                        "Check instance type limits: aws ec2 describe-instance-types",
+                    ],
+                }
+            )
+
         # Correlation-based recommendations (v2.0.0)
         if self.correlations:
             for corr in self.correlations:
@@ -20054,6 +22269,32 @@ Environment Variables:
         "--quiet",
         action="store_true",
         help="Suppress progress messages, show only results",
+    )
+
+    # Node OS-level diagnostics options (Phase 1: SSM-based)
+    parser.add_argument(
+        "--enable-node-diagnostics",
+        action="store_true",
+        help="Enable SSM-based node OS-level diagnostics (iptables, conntrack, dmesg, kubelet, etc.). "
+        "Requires AmazonSSMManagedInstanceCore on node IAM role.",
+    )
+    parser.add_argument(
+        "--ssm-timeout",
+        type=int,
+        default=NodeDiagnosticConfig.DEFAULT_SSM_TIMEOUT,
+        help=f"Timeout in seconds for each SSM Run Command execution (default: {NodeDiagnosticConfig.DEFAULT_SSM_TIMEOUT})",
+    )
+    parser.add_argument(
+        "--ssm-mode",
+        choices=["run-command", "automation", "both"],
+        default="run-command",
+        help="SSM execution mode: 'run-command' (FREE, default), 'automation' ($0.008/node), or 'both'",
+    )
+    parser.add_argument(
+        "--ssm-max-nodes",
+        type=int,
+        default=NodeDiagnosticConfig.DEFAULT_MAX_NODES_TO_DIAGNOSE,
+        help=f"Maximum number of nodes to run SSM diagnostics on (default: {NodeDiagnosticConfig.DEFAULT_MAX_NODES_TO_DIAGNOSE})",
     )
 
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -20336,6 +22577,10 @@ def main():
             namespace=args.namespace,
             progress=progress,
             kube_context=args.kube_context,
+            enable_node_diagnostics=args.enable_node_diagnostics,
+            ssm_timeout=args.ssm_timeout,
+            ssm_mode=args.ssm_mode,
+            ssm_max_nodes=args.ssm_max_nodes,
         )
 
         # Run analysis

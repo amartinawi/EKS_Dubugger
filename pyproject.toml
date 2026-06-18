@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eks-comprehensive-debugger"
-version = "3.8.0"
+version = "5.0.0"
 description = "Production-grade diagnostic tool for Amazon EKS cluster troubleshooting"
 readme = "README.md"
 license = {text = "MIT"}
@@ -40,15 +40,18 @@ dependencies = [
 
 [project.optional-dependencies]
 yaml = ["pyyaml>=6.0"]
+mcp = ["mcp>=1.0.0"]
 dev = [
     "pytest>=8.0.0",
     "pytest-mock>=3.12.0",
     "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.0.0",
     "ruff>=0.8.0",
     "mypy>=1.13.0",
+    "boto3-stubs[eks,ec2,cloudwatch,logs,ssm,bedrock-runtime]",
 ]
 all = [
-    "eks-comprehensive-debugger[yaml,dev]",
+    "eks-comprehensive-debugger[yaml,mcp,dev]",
 ]
 
 [project.scripts]

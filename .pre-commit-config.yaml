@@ -18,11 +18,11 @@ repos:
       - id: mypy
         args: [--ignore-missing-imports]
         additional_dependencies:
-          - boto3-stubs[eks,ec2,cloudwatch,logs,service-quotas]
+          - boto3-stubs[eks,ec2,cloudwatch,logs,ssm,bedrock-runtime,service-quotas]
           - types-python-dateutil
           - types-pytz
         pass_filenames: false
-        entry: mypy eks_comprehensive_debugger.py
+        entry: mypy eks_comprehensive_debugger.py eks_mcp_server.py
 
   # General hooks
   - repo: https://github.com/pre-commit/pre-commit-hooks

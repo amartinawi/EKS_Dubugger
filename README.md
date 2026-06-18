@@ -4,17 +4,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![AWS EKS](https://img.shields.io/badge/AWS-EKS-orange.svg)](https://aws.amazon.com/eks/)
 [![Catalog Coverage](https://img.shields.io/badge/catalog%20coverage-100%25-green.svg)](#catalog-coverage)
-[![Tests](https://img.shields.io/badge/tests-215%20passing-brightgreen.svg)](#unit-tests)
+[![Tests](https://img.shields.io/badge/tests-359-brightgreen.svg)](#unit-tests)
 
 A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 3.8.1 | **Analysis Methods:** 74 | **Catalog Coverage:** 100% | **Tests:** 215
+**Version:** 5.0.0 | **Analysis Methods:** 84 | **Catalog Coverage:** 100% | **Tests:** 359
 
 ---
 
 ## Features
 
-### Comprehensive Issue Detection (74 Analysis Methods)
+### Comprehensive Issue Detection (84 Analysis Methods)
 
 #### Pod & Workload Issues
 - **CrashLoopBackOff** - Container crash detection with exit code analysis
@@ -95,6 +95,18 @@ A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting
 - **Container Insights** - Metrics availability
 - **EKS Addons** - VPC-CNI, CoreDNS, kube-proxy
 - **Deprecated APIs** - Upgrade readiness check (v3.6.0)
+
+#### Node OS-Level Diagnostics (v4.0.0 — SSM-based, opt-in via `--enable-node-diagnostics`)
+- **iptables** - DNS DROP rules, missing KUBE-SERVICES/AWS-SNAT chains
+- **Conntrack** - Table saturation >75%/90%, drops, AWS allowance exceeded
+- **Kernel (dmesg)** - OOM kills, hardware errors, conntrack full, disk I/O, ENA driver
+- **Kubelet** - PLEG not healthy, certificate expiry, API server unreachable, eviction
+- **containerd** - Image pull auth/not-found, disk full, rate limiting, sandbox failures
+- **IPAMD (VPC CNI)** - IP allocation failure, ENI creation, subnet exhaustion, IAM error
+- **Route Tables** - Blackhole routes, missing default route, missing VPC DNS route
+- **CNI Config** - Missing config, wrong MTU, multiple conflicting configurations
+- **sysctl** - Low conntrack_max, wrong rp_filter, narrow port range
+- **ENI Metadata** - conntrack/linklocal allowance exceeded, interface DOWN
 
 ### Finding Type Classification
 Each finding is classified as either:
@@ -194,6 +206,10 @@ pip install -r requirements.txt
    - `cloudtrail:LookupEvents` (optional, for IAM correlation)
    - `sts:GetCallerIdentity`
 
+**For Node OS Diagnostics (v4.0.0, optional `--enable-node-diagnostics`):**
+- `ssm:SendCommand`, `ssm:GetCommandInvocation`, `ssm:DescribeInstanceInformation`
+- Node IAM role must have `AmazonSSMManagedInstanceCore` managed policy
+
 ---
 
 ## Quick Start
@@ -245,6 +261,10 @@ python eks_comprehensive_debugger.py \
 | `--namespace` | No | Focus on specific namespace |
 | `--verbose` | No | Enable verbose output |
 | `--quiet` | No | Suppress progress messages |
+| `--enable-node-diagnostics` | No | Enable SSM-based node OS-level diagnostics (v4.0.0) |
+| `--ssm-timeout` | No | SSM command timeout in seconds (default: 300) |
+| `--ssm-mode` | No | SSM mode: run-command (default), automation, or both |
+| `--ssm-max-nodes` | No | Max nodes to diagnose (default: 50) |
 
 ---
 
@@ -354,6 +374,25 @@ python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
   --days 1
 ```
 
+### Node OS-Level Diagnostics (v4.0.0)
+```bash
+# Enable SSM-based node OS diagnostics (iptables, conntrack, dmesg, kubelet, etc.)
+python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
+  --cluster-name production \
+  --days 2 \
+  --enable-node-diagnostics
+
+# With custom SSM settings
+python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
+  --cluster-name production \
+  --days 1 \
+  --enable-node-diagnostics \
+  --ssm-timeout 600 \
+  --ssm-max-nodes 20
+```
+
+**Requires:** `AmazonSSMManagedInstanceCore` managed policy on node IAM role. Nodes without SSM Agent are silently skipped.
+
 ---
 
 ## Exit Codes
@@ -390,6 +429,80 @@ For private endpoints, connect via:
 
 ---
 
+## MCP Server (v5.0.0 — AI Agent Interoperability)
+
+The EKS Debugger ships with a built-in [Model Context Protocol](https://modelcontextprotocol.io/) server (`eks_mcp_server.py`) that exposes all 84 analysis methods, the 5D correlation engine, and the remediation library as **18 discoverable tools** for AI agents.
+
+Supported AI agent runtimes:
+- **Claude Desktop** (Anthropic) — via stdio transport
+- **AWS DevOps Agent** — via HTTP transport
+- **GitHub Copilot CLI** — via stdio transport
+- **Any MCP-compatible client**
+
+### Quick Start
+
+```bash
+# Start the MCP server (stdio transport — for Claude Desktop)
+python eks_mcp_server.py
+
+# Start with HTTP transport (for remote access)
+python eks_mcp_server.py --transport streamable-http --port 8080
+
+# Inspect tools interactively in a web UI
+npx @modelcontextprotocol/inspector python eks_mcp_server.py
+```
+
+### Claude Desktop Configuration
+
+Add the following to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "eks-debugger": {
+      "command": "python",
+      "args": ["/absolute/path/to/eks_mcp_server.py"],
+      "env": {
+        "AWS_PROFILE": "production",
+        "AWS_REGION": "us-east-1"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop after saving. You can then ask Claude things like:
+- *"Connect to my production EKS cluster and check for critical issues"*
+- *"Analyze pod health in the kube-system namespace"*
+- *"What's the root cause of the recent pod evictions?"*
+- *"Give me remediation commands for the OOMKilled pods"*
+
+### Tool Catalog (18 tools in 5 tiers)
+
+| Tier | Tools | Purpose |
+|------|-------|---------|
+| **1. Connection** | `connect`, `cluster_health` | Establish session, quick health overview |
+| **2. Analysis** | `analyze_pods`, `analyze_nodes`, `analyze_networking`, `analyze_control_plane`, `analyze_storage`, `analyze_iam`, `run_full_analysis` | Domain-grouped analysis (7 tools) |
+| **3. Results** | `get_findings`, `get_correlations`, `get_summary`, `search_findings`, `get_timeline` | Query and filter results (5 tools) |
+| **4. Remediation** | `get_remediation`, `get_recommendations` | Diagnostic + fix commands + AWS docs |
+| **5. Advanced** | `collect_node_diagnostics`, `format_for_llm` | Phase 1 SSM integration + LLM export |
+
+### Session Management
+
+- Each AI agent session gets its own `ComprehensiveEKSDebugger` instance (no shared state)
+- Sessions auto-expire after **30 minutes** of inactivity
+- All tools return structured JSON; no tool ever raises exceptions to the caller
+
+### CLI Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--transport` | `stdio` (default, for Claude Desktop) or `streamable-http` (for remote) |
+| `--port` | Port for HTTP transport (default: 8000) |
+| `--log-level` | Log level (default: WARNING) |
+
+---
+
 ## Unit Tests
 
 The debugger includes a comprehensive test suite covering security and core functionality:
@@ -413,6 +526,10 @@ python3 -m pytest tests/ -v --cov=. --cov-report=term-missing
 | `test_api_cache.py` | 11 | TTL expiration, thread safety, key generation |
 | `test_incremental_cache.py` | 14 | Delta reporting, save/load, file permissions |
 | `test_performance_tracker.py` | 9 | Timing aggregation, slowest methods, thread safety |
+| `test_ssm_integration.py` | 28 | SSM node mapping, polling, batching, command execution (Phase 1) |
+| `test_node_os_parsers.py` | 37 | All 10 output parsers (v4.0.0) |
+| `test_node_selection.py` | 10 | Node priority selection (v4.0.0) |
+| `test_mcp_server.py` | 69 | All 18 MCP tools, session lifecycle, error handling (v5.0.0) |
 
 ---
 

@@ -6,12 +6,14 @@ Guidelines for AI coding agents working in the EKS Health Check Dashboard codeba
 
 Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file application (`eks_comprehensive_debugger.py`) that analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports.
 
-**Version:** 3.8.0  
-**Lines of Code:** ~20,400  
-**Analysis Methods:** 73  
-**Remediation Patterns:** 30+  
+**Version:** 5.0.0  
+**Lines of Code:** ~23,400 (debugger) + ~800 (MCP server)  
+**Analysis Methods:** 84  
+**Correlation Rules:** 18  
+**Remediation Patterns:** 45+  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)  
-**Unit Tests:** 215 tests
+**MCP Tools:** 18 (AI-agent discoverable via Model Context Protocol)  
+**Unit Tests:** 359 tests (357 passing, 2 pre-existing structlog failures)
 
 ## Quick Commands
 
@@ -25,6 +27,15 @@ python eks_comprehensive_debugger.py --profile <profile> --region <region> --clu
 # With custom kubectl context
 python eks_comprehensive_debugger.py --profile <profile> --region <region> --cluster-name <cluster> --kube-context <context-name> --days 1
 
+# Run MCP server (stdio transport — for Claude Desktop)
+python eks_mcp_server.py
+
+# Run MCP server with HTTP transport (for remote access)
+python eks_mcp_server.py --transport streamable-http --port 8080
+
+# Inspect MCP tools interactively (web UI)
+npx @modelcontextprotocol/inspector python eks_mcp_server.py
+
 # Run unit tests
 python3 -m pytest tests/ -v
 
@@ -36,12 +47,13 @@ mypy eks_comprehensive_debugger.py --ignore-missing-imports
 ## File Structure
 
 ```
-eks_comprehensive_debugger.py  # Main debugger (~19,000 lines, all-in-one)
+eks_comprehensive_debugger.py  # Main debugger (~22,600 lines, all-in-one)
+eks_mcp_server.py              # MCP server — 18 tools for AI agents (Phase 2)
 requirements.txt               # Python dependencies (includes test deps)
 .gitignore                     # Git ignore rules
-README-EKS-DEBUGGER.md         # User documentation
+README.md                      # User documentation
 AGENTS.md                      # This file
-tests/                         # Unit tests (158 tests)
+tests/                         # Unit tests (359 tests)
 ├── __init__.py
 ├── conftest.py                # Shared fixtures
 ├── test_severity_classification.py  # Severity logic tests
@@ -50,13 +62,18 @@ tests/                         # Unit tests (158 tests)
 ├── test_kubectl_execution.py        # Kubectl shell safety tests
 ├── test_api_cache.py                # APICache tests
 ├── test_incremental_cache.py        # IncrementalCache tests
-└── test_performance_tracker.py      # PerformanceTracker tests
+├── test_performance_tracker.py      # PerformanceTracker tests
+├── test_ssm_integration.py          # SSM node diagnostics tests (Phase 1)
+├── test_node_os_parsers.py          # Node OS output parser tests (Phase 1)
+├── test_node_selection.py           # Node priority selection tests (Phase 1)
+└── test_mcp_server.py               # MCP server tool tests (Phase 2)
 venv/                          # Virtual environment (gitignored)
 ```
 
 ## Dependencies
 
-Required: `boto3>=1.26.0`, `python-dateutil>=2.8.0`, `pytz>=2023.0`
+Required: `boto3>=1.26.0`, `python-dateutil>=2.8.0`, `pytz>=2023.0`, `tenacity>=8.0.0`, `structlog>=24.1.0`
+MCP Server: `mcp>=1.0.0` (for AI agent interoperability via Model Context Protocol)
 Optional: `pyyaml>=6.0` (for YAML output)
 Testing: `pytest>=8.0.0`, `pytest-mock>=3.12.0`
 
@@ -414,6 +431,10 @@ The debugger performs intelligent correlation across data sources to identify ro
 | `certificate_cascade` | Cert issues + Webhook failures | Certificate expiry |
 | `subnet_exhaustion_cascade` | Subnet IP exhaustion + CNI/scheduling failures | IP address exhaustion |
 | `cluster_upgrade` | Mass node/pod events + AWS API confirmation | Upgrade in progress |
+| `conntrack_exhaustion_cascade` | SSM conntrack saturation + network/DNS failures on same node | Conntrack table exhaustion (v4.0.0) |
+| `iptables_dns_block` | SSM iptables DROP on port 53 + DNS issues on same node | Firewall blocking DNS (v4.0.0) |
+| `kubelet_pleg_cascade` | SSM PLEG error + node NotReady on same node | Kubelet PLEG failure (v4.0.0) |
+| `ipamd_exhaustion_cascade` | SSM IPAMD failure + FailedScheduling/ContainerCreating on same node | VPC CNI IP exhaustion (v4.0.0) |
 
 **Output Structure:**
 ```python
@@ -486,6 +507,9 @@ The debugger performs intelligent correlation across data sources to identify ro
 | `TimezoneManager` | Centralized timezone handling |
 | `ConfigLoader` | Load configuration from YAML/JSON files |
 | `Thresholds` | Threshold configuration for alerts |
+| `NodeDiagnosticConfig` | SSM diagnostics configuration constants (v4.0.0) |
+| `SSMNodeDiagnosticsManager` | SSM Run Command execution, polling, node mapping (v4.0.0) |
+| `NodeOSOutputParser` | Parse 10 SSM diagnostic output types into findings (v4.0.0) |
 | `FindingType` | Finding type constants (current state vs historical) |
 
 ### Exception Hierarchy
@@ -515,6 +539,9 @@ The test suite covers critical security and functionality areas:
 | `test_api_cache.py` | 11 | TTL expiration, thread safety, key generation |
 | `test_incremental_cache.py` | 14 | Delta reporting, save/load, file permissions |
 | `test_performance_tracker.py` | 9 | Timing aggregation, slowest methods, thread safety |
+| `test_ssm_integration.py` | 28 | SSM node mapping, managed check, polling, batching, command execution (Phase 1) |
+| `test_node_os_parsers.py` | 37 | All 10 output parsers: iptables, conntrack, dmesg, kubelet, etc. (Phase 1) |
+| `test_node_selection.py` | 10 | Priority selection, max_nodes enforcement, baseline inclusion (Phase 1) |
 
 **Run Tests:**
 ```bash
@@ -523,7 +550,7 @@ python3 -m pytest tests/ -v
 
 ---
 
-## Analysis Methods (73 total)
+## Analysis Methods (84 total)
 
 ### Pod Lifecycle & Health (13 methods)
 
@@ -653,6 +680,23 @@ python3 -m pytest tests/ -v
 | `analyze_workload_security_posture` | kubectl pods | Privileged containers, host paths (v3.6.0) |
 | `analyze_topology_spread` | kubectl pods | Topology constraint violations (v3.6.0) |
 | `analyze_psa_violations` | kubectl pods/namespaces | Pod Security Admission violations |
+
+### Node OS-Level Diagnostics (10 methods, Phase 1: SSM-based, v4.0.0)
+
+All methods require `--enable-node-diagnostics` flag. Uses SSM Run Command (AWS-RunShellScript) to execute read-only diagnostic commands on EKS worker nodes. Requires `AmazonSSMManagedInstanceCore` on node IAM role.
+
+| Method | Data Source | Catalog Coverage |
+|--------|-------------|------------------|
+| `_parse_iptables` | SSM → iptables-save | DNS DROP rules, missing KUBE-SERVICES/AWS-SNAT chains |
+| `_parse_conntrack` | SSM → conntrack -S, /proc/sys | Conntrack saturation >75%/90%, drops, AWS ethtool limits |
+| `_parse_dmesg` | SSM → dmesg -T | Kernel OOM, hardware errors, conntrack full, disk I/O, ENA driver |
+| `_parse_kubelet` | SSM → journalctl kubelet | PLEG not healthy, cert expired, API server unreachable, eviction |
+| `_parse_containerd` | SSM → journalctl containerd | Image pull auth/not-found, disk full, rate limit, sandbox failures |
+| `_parse_ipamd` | SSM → IPAMD API + log | IP allocation failure, ENI creation, subnet exhaustion, IAM error |
+| `_parse_routes` | SSM → ip route | Blackhole routes, missing default route, missing VPC DNS route |
+| `_parse_cni_config` | SSM → /etc/cni/net.d/ | Missing CNI config, wrong MTU, multiple conflicting configs |
+| `_parse_sysctl` | SSM → sysctl | Low conntrack_max, wrong rp_filter, narrow port range |
+| `_parse_eni_metadata` | SSM → ip addr + ethtool | conntrack_allowance_exceeded, linklocal, interface DOWN |
 
 ---
 
@@ -837,7 +881,18 @@ self.findings = {
     'resource_quota_exceeded': [], # Quota warnings
     'pvc_issues': [],           # Storage issues
     'dns_issues': [],           # CoreDNS problems
-    'addon_issues': []          # EKS addon health
+    'addon_issues': [],          # EKS addon health
+    # Node OS-level diagnostics (Phase 1: SSM-based, v4.0.0)
+    'node_os_iptables': [],      # iptables firewall rule analysis
+    'node_os_conntrack': [],     # Conntrack table saturation/drops
+    'node_os_dmesg': [],         # Kernel messages (OOM, hardware)
+    'node_os_kubelet': [],       # Kubelet journal (PLEG, cert, runtime)
+    'node_os_containerd': [],    # containerd logs (image pull, disk)
+    'node_os_ipamd': [],         # VPC CNI IPAMD state
+    'node_os_routes': [],        # Route table inspection
+    'node_os_cni_config': [],    # CNI configuration files
+    'node_os_sysctl': [],        # Kernel parameters
+    'node_os_eni': [],           # ENI/network interface metadata
 }
 ```
 
@@ -932,6 +987,152 @@ Each recommendation includes evidence from actual findings:
 5. Generate recommendations in `generate_recommendations()`
 6. Update `set_total_steps()` count
 7. Add method to `analysis_methods` list in `run_comprehensive_analysis()`
+
+---
+
+## MCP Server (Phase 2, v5.0.0)
+
+The MCP server (`eks_mcp_server.py`) exposes the debugger's 84 analysis methods, 5D correlation engine, and remediation library as 18 discoverable tools for AI agents (Claude Desktop, AWS DevOps Agent, Copilot, etc.) via the Model Context Protocol.
+
+### Architecture
+
+- **Framework**: `FastMCP` from the official `mcp` Python SDK
+- **Transports**: `stdio` (default, for Claude Desktop) + `streamable-http` (for remote deployment)
+- **Session-based state**: each AI agent session owns its own `ComprehensiveEKSDebugger` instance (no shared mutable state)
+- **Auto-expiry**: sessions expire after 30 minutes of inactivity
+- **Thin wrappers**: tools never reimplement logic — they call existing debugger methods and return structured JSON
+
+### Tool Catalog (18 tools in 5 tiers)
+
+#### Tier 1 — Connection & Setup (2 tools)
+
+| Tool | Purpose |
+|------|---------|
+| `connect(profile, region, cluster_name, hours, namespace, kube_context)` | Establish AWS session, validate credentials, set up kubectl; returns `session_id` |
+| `cluster_health(session_id)` | Quick node/pod status overview (no analysis methods run) |
+
+#### Tier 2 — Analysis (7 tools, grouped by domain)
+
+| Tool | Methods Run | Duration |
+|------|-------------|----------|
+| `analyze_pods(session_id)` | 13 pod methods (CrashLoopBackOff, OOMKilled, probes, PDB, etc.) | ~30-60s |
+| `analyze_nodes(session_id)` | 13 node methods (conditions, saturation, AMI age, PLEG, etc.) | ~20-40s |
+| `analyze_networking(session_id)` | 12 networking methods (VPC CNI, CoreDNS, ALB, conntrack, etc.) | ~30-50s |
+| `analyze_control_plane(session_id)` | 8 control-plane methods (API server, etcd, scheduler, webhooks) | ~30-60s |
+| `analyze_storage(session_id)` | 4 storage methods (PVC, EBS CSI, EFS CSI, snapshots) | fast |
+| `analyze_iam(session_id)` | 5 IAM/security methods (RBAC, IRSA, PSA, deprecated APIs) | fast |
+| `run_full_analysis(session_id)` | All 84 methods + correlation + recommendations | ~2-10 min |
+
+#### Tier 3 — Results & Query (5 tools)
+
+| Tool | Purpose |
+|------|---------|
+| `get_findings(session_id, category?, severity?, limit, offset)` | Paginated, filtered findings with stable IDs (F-0001…) |
+| `get_correlations(session_id, confidence_tier?)` | 5D confidence-scored root causes, filterable by tier |
+| `get_summary(session_id)` | Severity counts, category breakdown, finding-type classification |
+| `search_findings(session_id, query, category?)` | Full-text search across summaries and details |
+| `get_timeline(session_id, hours)` | Chronological event buckets with severity classification |
+
+#### Tier 4 — Remediation (2 tools)
+
+| Tool | Purpose |
+|------|---------|
+| `get_remediation(session_id, finding_id?, category?)` | Diagnostic + fix commands + AWS doc links for specific findings |
+| `get_recommendations(session_id)` | Evidence-based recommendations with priority, diagnostic steps, AWS docs |
+
+#### Tier 5 — Advanced (2 tools)
+
+| Tool | Purpose |
+|------|---------|
+| `collect_node_diagnostics(session_id, node_name?, max_nodes)` | Phase 1 SSM integration — iptables, conntrack, dmesg, kubelet, etc. |
+| `format_for_llm(session_id, include_findings)` | Export all results as LLM-optimized JSON via `LLMJSONOutputFormatter` |
+
+### Session Management
+
+```python
+# In-memory session store keyed by opaque session id
+_sessions: dict[str, _SessionState] = {}
+
+@dataclass
+class _SessionState:
+    debugger: ComprehensiveEKSDebugger
+    created_at: datetime
+    last_activity: datetime  # sliding-window expiry
+    analysis_complete: bool = False
+    
+    def touch(self): self.last_activity = datetime.now(timezone.utc)
+
+SESSION_TIMEOUT_MINUTES = 30
+```
+
+- **`_get_session(session_id)`**: Returns active session or raises `ValueError`; touches `last_activity` on every access.
+- **`_cleanup_expired_sessions()`**: Called by `connect()`; removes sessions older than 30 minutes.
+- **Session isolation**: each session has its own debugger instance. No shared mutable state between sessions.
+
+### Error Handling Contract
+
+**Every tool returns a dict; no tool ever raises to the MCP client.**
+
+```python
+@mcp.tool()
+def some_tool(session_id: str, ...) -> dict[str, Any]:
+    try:
+        session = _get_session(session_id)
+        # ... tool logic ...
+        return {"status": "completed", ...}
+    except Exception as e:
+        return _error_response(e)  # {"status": "error", "error": "..."}
+```
+
+AI agents cannot handle Python exceptions; structured error responses are mandatory.
+
+### Claude Desktop Configuration
+
+```json
+{
+  "mcpServers": {
+    "eks-debugger": {
+      "command": "python",
+      "args": ["/path/to/eks_mcp_server.py"],
+      "env": {
+        "AWS_PROFILE": "production",
+        "AWS_REGION": "us-east-1"
+      }
+    }
+  }
+}
+```
+
+### CLI Interface
+
+```bash
+# stdio transport (default — for Claude Desktop)
+python eks_mcp_server.py
+
+# HTTP transport (for remote access)
+python eks_mcp_server.py --transport streamable-http --port 8080
+
+# Log level
+python eks_mcp_server.py --log-level DEBUG
+```
+
+### Testing
+
+```bash
+# Run MCP server tests only
+python3 -m pytest tests/test_mcp_server.py -v
+
+# Test interactively with MCP Inspector
+npx @modelcontextprotocol/inspector python eks_mcp_server.py
+```
+
+Test coverage (69 tests in `tests/test_mcp_server.py`):
+- Session lifecycle (creation, expiry, cleanup)
+- All 18 tools (success paths + error paths)
+- Error handling contract (every tool returns error dict, never raises)
+- Finding filtering, pagination, severity sorting
+- Correlation filtering by confidence tier
+- Remediation pattern matching
 
 ---
 

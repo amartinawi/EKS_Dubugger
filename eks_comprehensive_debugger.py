@@ -315,6 +315,161 @@ class IncrementalCache:
         }
 
 
+class BaselineTracker:
+    """Track findings that recur across multiple analysis runs for a cluster.
+
+    Findings seen >= threshold times across runs are annotated with
+    ``is_baseline: True`` so they can be visually de-prioritized in reports
+    and filtered out of "new issues" counts.
+
+    Unlike IncrementalCache (24-hour TTL), BaselineTracker persists
+    indefinitely — the value comes from accumulating counts over weeks/months.
+
+    Storage: ``~/.eks-debugger-cache/{cluster}-{region}-baseline.json``
+    Format: ``{"version": 1, "total_runs": N, "fingerprints": {hash: count}}``
+    Permissions: 0o600 (owner-only, consistent with IncrementalCache).
+    """
+
+    BASELINE_VERSION = 1
+
+    # Regex patterns for normalizing dynamic content in finding summaries.
+    # Stripping these ensures that the SAME logical finding produces the same
+    # fingerprint across runs, even when timestamps/pod-hashes/IPs differ.
+    _TS_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[+\d:Z]*")
+    _INSTANCE_PATTERN = re.compile(r"i-[a-f0-9]{8,17}")
+    _POD_HASH_PATTERN = re.compile(r"-[a-z0-9]{9,10}\b")  # k8s generateName suffix
+    _IP_PATTERN = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
+
+    def __init__(self, cluster_name: str, region: str, threshold: int = 10):
+        self.cluster_name = cluster_name
+        self.region = region
+        self.threshold = max(0, threshold)
+        self.cache_key = f"{cluster_name}-{region}"
+        self.cache_file = os.path.join(CACHE_DIR, f"{self.cache_key}-baseline.json")
+        self._fingerprints: dict[str, int] = {}
+        self._total_runs = 0
+        self._loaded = False
+
+    def _normalize_summary(self, summary: str) -> str:
+        """Strip dynamic content (timestamps, IPs, instance IDs, pod hashes) from summary.
+
+        This makes the fingerprint stable across runs for the same logical finding.
+        Regex applied BEFORE lowercasing so uppercase T/Z in ISO timestamps match.
+        """
+        s = summary.strip()
+        s = self._TS_PATTERN.sub("<ts>", s)
+        s = self._INSTANCE_PATTERN.sub("<instance>", s)
+        s = self._POD_HASH_PATTERN.sub("-<hash>", s)
+        s = self._IP_PATTERN.sub("<ip>", s)
+        return s.lower()
+
+    def _fingerprint(self, category: str, summary: str) -> str:
+        """Generate a stable MD5 fingerprint for a finding."""
+        normalized = f"{category}|{self._normalize_summary(summary)}"
+        return hashlib.md5(normalized.encode()).hexdigest()
+
+    def load(self) -> None:
+        """Load baseline frequencies from the cache file (no TTL — persists forever)."""
+        self._loaded = True
+        if not os.path.exists(self.cache_file):
+            return
+        try:
+            with open(self.cache_file) as f:
+                data = json_module.load(f)
+            if data.get("version") == self.BASELINE_VERSION:
+                self._fingerprints = data.get("fingerprints", {})
+                self._total_runs = data.get("total_runs", 0)
+        except (json_module.JSONDecodeError, KeyError, OSError):
+            pass  # Corrupt cache — start fresh silently
+
+    def annotate(self, findings: dict) -> int:
+        """Annotate each finding's ``details`` with ``is_baseline`` and ``baseline_count``.
+
+        Must be called BEFORE update_and_save() so that the current run's
+        count is what was accumulated from PREVIOUS runs.
+
+        Returns:
+            Number of findings marked as baseline (count >= threshold).
+        """
+        if not self._loaded:
+            self.load()
+
+        baseline_marked = 0
+        for category, items in findings.items():
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                summary = item.get("summary", "")
+                fp = self._fingerprint(category, summary)
+                count = self._fingerprints.get(fp, 0)
+
+                details = item.setdefault("details", {})
+                if not isinstance(details, dict):
+                    details = {}
+                    item["details"] = details
+                details["baseline_count"] = count
+                details["is_baseline"] = count >= self.threshold > 0
+                if details["is_baseline"]:
+                    baseline_marked += 1
+
+        return baseline_marked
+
+    def update_and_save(self, findings: dict) -> None:
+        """Increment fingerprint counts with this run's findings, then persist.
+
+        Called after annotate() so the current run's findings are counted
+        toward future runs' baseline detection (not the current run's).
+        """
+        if not self._loaded:
+            self.load()
+
+        # Collect unique fingerprints from this run (a finding appearing
+        # multiple times in one run should only increment the count by 1).
+        current_fps: set[str] = set()
+        for category, items in findings.items():
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                summary = item.get("summary", "")
+                fp = self._fingerprint(category, summary)
+                current_fps.add(fp)
+
+        for fp in current_fps:
+            self._fingerprints[fp] = self._fingerprints.get(fp, 0) + 1
+
+        self._total_runs += 1
+
+        # Persist (best-effort — non-fatal if save fails)
+        try:
+            os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+            fd = os.open(self.cache_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json_module.dump(
+                    {
+                        "version": self.BASELINE_VERSION,
+                        "total_runs": self._total_runs,
+                        "last_run": time.time(),
+                        "cluster": self.cache_key,
+                        "threshold": self.threshold,
+                        "fingerprints": self._fingerprints,
+                    },
+                    f,
+                    default=str,
+                )
+        except (OSError, TypeError):
+            pass  # Non-fatal — baseline tracking is best-effort
+
+    def get_summary(self) -> dict:
+        """Return summary stats for reporting."""
+        return {
+            "enabled": self.threshold > 0,
+            "total_runs": self._total_runs,
+            "threshold": self.threshold,
+            "unique_fingerprints_tracked": len(self._fingerprints),
+            "fingerprints_at_or_above_threshold": sum(1 for c in self._fingerprints.values() if c >= self.threshold),
+        }
+
+
 class Thresholds:
     """Threshold configuration for alerts"""
 
@@ -4520,10 +4675,15 @@ class HTMLOutputFormatter(OutputFormatter):
             color: #fbbf24;
         }}
         
-        [data-theme="dark"] .severity-badge.info {{
-            background: rgba(34, 211, 238, 0.2);
-            color: #22d3ee;
-        }}
+[data-theme="dark"] .severity-badge.info {{
+    background: rgba(72, 219, 251, 0.15);
+    color: #48dbfb;
+}}
+[data-theme="dark"] .severity-badge.baseline {{
+    background: #374151;
+    color: #9ca3af;
+    border-color: #4b5563;
+}}
         
         [data-theme="dark"] .section-header:hover {{
             background: var(--bg-details);
@@ -5954,9 +6114,10 @@ class HTMLOutputFormatter(OutputFormatter):
             text-transform: uppercase;
         }}
         
-        .severity-badge.critical {{ background: #fee2e2; color: #dc2626; }}
-        .severity-badge.warning {{ background: #fef3c7; color: #d97706; }}
-        .severity-badge.info {{ background: #e0f2fe; color: #0284c7; }}
+.severity-badge.critical {{ background: #fee2e2; color: #dc2626; }}
+.severity-badge.warning {{ background: #fef3c7; color: #d97706; }}
+.severity-badge.info {{ background: #e0f2fe; color: #0284c7; }}
+.severity-badge.baseline {{ background: #f3f4f6; color: #6b7280; border: 1px solid #d1d5db; }}
         
         .source-badge {{
             padding: 0.2rem 0.5rem;
@@ -7112,6 +7273,12 @@ class HTMLOutputFormatter(OutputFormatter):
                         item_severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
                         source_badge = self._get_source_icon(item.get("details", {}))
                         finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
+                        _details = item.get("details", {})
+                        baseline_badge = (
+                            f'<span class="severity-badge baseline" title="Seen in {_details.get("baseline_count", 0)} previous analyses">🔄 Known</span>'
+                            if _details.get("is_baseline")
+                            else ""
+                        )
                         finding_id = f"{cat}-{idx}"
 
                         all_findings_json.append(
@@ -7133,6 +7300,7 @@ class HTMLOutputFormatter(OutputFormatter):
                                 <span class="severity-badge {item_severity}">{item_severity}</span>
                                 {finding_type_badge}
                                 {source_badge}
+                                {baseline_badge}
                                 <span class="finding-expand" role="button" aria-label="Expand">▼</span>
                             </div>
                         </div>
@@ -7310,6 +7478,12 @@ class HTMLOutputFormatter(OutputFormatter):
                     item_severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
                     source_badge = self._get_source_icon(item.get("details", {}))
                     finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
+                    _details2 = item.get("details", {})
+                    baseline_badge2 = (
+                        f'<span class="severity-badge baseline" title="Seen in {_details2.get("baseline_count", 0)} previous analyses">🔄 Known</span>'
+                        if _details2.get("is_baseline")
+                        else ""
+                    )
                     escaped_summary2 = self._escape_html(item.get("summary", "N/A"))
 
                     html += f'''
@@ -7320,6 +7494,7 @@ class HTMLOutputFormatter(OutputFormatter):
                             <span class="severity-badge {item_severity}">{item_severity}</span>
                             {finding_type_badge}
                             {source_badge}
+                            {baseline_badge2}
                             <span class="finding-expand" role="button" aria-label="Expand">▼</span>
                             </div>
                         </div>
@@ -9218,6 +9393,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         ssm_timeout: int = NodeDiagnosticConfig.DEFAULT_SSM_TIMEOUT,
         ssm_mode: str = "run-command",
         ssm_max_nodes: int = NodeDiagnosticConfig.DEFAULT_MAX_NODES_TO_DIAGNOSE,
+        baseline_threshold: int = 10,
     ) -> None:
         """
         Initialize debugger
@@ -9269,6 +9445,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.ssm_timeout = min(ssm_timeout, NodeDiagnosticConfig.MAX_SSM_TIMEOUT)
         self.ssm_mode = ssm_mode if ssm_mode in ("run-command", "automation", "both") else "run-command"
         self.ssm_max_nodes = max(1, ssm_max_nodes)
+
+        # Baseline noise subtraction (Phase 4)
+        # Findings seen >= threshold times across runs are marked is_baseline.
+        # 0 disables baseline tracking.
+        self.baseline_threshold = max(0, baseline_threshold)
 
         # API response cache
         self._api_cache = APICache(ttl_seconds=API_CACHE_TTL_SECONDS)
@@ -21348,6 +21529,22 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 )
             self._incremental_cache.save(results)
 
+        # Baseline noise subtraction — annotate findings seen across many runs
+        if self.baseline_threshold > 0 and self.cluster_name:
+            try:
+                tracker = BaselineTracker(self.cluster_name, self.region, self.baseline_threshold)
+                baseline_count = tracker.annotate(self.findings)
+                results["baseline"] = tracker.get_summary()
+                results["baseline"]["baseline_findings_count"] = baseline_count
+                tracker.update_and_save(self.findings)
+                if baseline_count > 0:
+                    self.progress.info(
+                        f"Baseline: {baseline_count} findings marked as known/recurring "
+                        f"(threshold={self.baseline_threshold}, total_runs={tracker._total_runs})"
+                    )
+            except Exception as e:
+                self._add_error("baseline_tracking", str(e))
+
         return results
 
     def _run_analysis_sequential(self, analysis_methods: list) -> None:
@@ -22296,6 +22493,12 @@ Environment Variables:
         default=NodeDiagnosticConfig.DEFAULT_MAX_NODES_TO_DIAGNOSE,
         help=f"Maximum number of nodes to run SSM diagnostics on (default: {NodeDiagnosticConfig.DEFAULT_MAX_NODES_TO_DIAGNOSE})",
     )
+    parser.add_argument(
+        "--baseline-threshold",
+        type=int,
+        default=10,
+        help="Mark findings seen >= N times across runs as baseline/known issues (default: 10, 0 to disable)",
+    )
 
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
 
@@ -22581,6 +22784,7 @@ def main():
             ssm_timeout=args.ssm_timeout,
             ssm_mode=args.ssm_mode,
             ssm_max_nodes=args.ssm_max_nodes,
+            baseline_threshold=args.baseline_threshold,
         )
 
         # Run analysis

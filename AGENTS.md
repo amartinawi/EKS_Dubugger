@@ -13,7 +13,7 @@ Python-based diagnostic tool for Amazon EKS cluster troubleshooting. Single-file
 **Remediation Patterns:** 45+  
 **Catalog Coverage:** 100% (79 issues across 3 catalogs)  
 **MCP Tools:** 18 (AI-agent discoverable via Model Context Protocol)  
-**Unit Tests:** 359 tests (357 passing, 2 pre-existing structlog failures)
+**Unit Tests:** 383 tests (381 passing, 2 slow performance tests)
 
 ## Quick Commands
 
@@ -504,6 +504,7 @@ The debugger performs intelligent correlation across data sources to identify ro
 | `APICache` | Thread-safe TTL cache for AWS API responses |
 | `PerformanceTracker` | Track execution times for analysis methods |
 | `IncrementalCache` | Store previous results for delta reporting |
+| `BaselineTracker` | Track recurring findings across runs; annotate known/noise issues (Phase 4) |
 | `TimezoneManager` | Centralized timezone handling |
 | `ConfigLoader` | Load configuration from YAML/JSON files |
 | `Thresholds` | Threshold configuration for alerts |

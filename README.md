@@ -4,11 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![AWS EKS](https://img.shields.io/badge/AWS-EKS-orange.svg)](https://aws.amazon.com/eks/)
 [![Catalog Coverage](https://img.shields.io/badge/catalog%20coverage-100%25-green.svg)](#catalog-coverage)
-[![Tests](https://img.shields.io/badge/tests-359-brightgreen.svg)](#unit-tests)
+[![Tests](https://img.shields.io/badge/tests-383-brightgreen.svg)](#unit-tests)
 
 A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 5.0.0 | **Analysis Methods:** 84 | **Catalog Coverage:** 100% | **Tests:** 359
+**Version:** 5.0.0 | **Analysis Methods:** 84 | **Catalog Coverage:** 100% | **Tests:** 383
 
 ---
 
@@ -265,6 +265,7 @@ python eks_comprehensive_debugger.py \
 | `--ssm-timeout` | No | SSM command timeout in seconds (default: 300) |
 | `--ssm-mode` | No | SSM mode: run-command (default), automation, or both |
 | `--ssm-max-nodes` | No | Max nodes to diagnose (default: 50) |
+| `--baseline-threshold` | No | Mark findings seen >= N times as baseline/known (default: 10, 0 to disable) |
 
 ---
 
@@ -530,6 +531,7 @@ python3 -m pytest tests/ -v --cov=. --cov-report=term-missing
 | `test_node_os_parsers.py` | 37 | All 10 output parsers (v4.0.0) |
 | `test_node_selection.py` | 10 | Node priority selection (v4.0.0) |
 | `test_mcp_server.py` | 69 | All 18 MCP tools, session lifecycle, error handling (v5.0.0) |
+| `test_baseline_tracker.py` | 24 | Baseline finding tracking, fingerprint normalization, persistence |
 
 ---
 

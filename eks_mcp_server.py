@@ -55,6 +55,7 @@ from eks_comprehensive_debugger import (
     ProgressTracker,
     ComprehensiveEKSDebugger,
     get_remediation_commands,
+    validate_input,
 )
 
 # MCP server instance — all @mcp.tool() decorators register against this
@@ -144,6 +145,42 @@ def _category_summary(debugger: ComprehensiveEKSDebugger, categories: list[str])
     return {"critical": critical, "warning": warning, "info": info}
 
 
+def _build_finding_index(
+    debugger: ComprehensiveEKSDebugger,
+) -> list[dict[str, Any]]:
+    """Build a flat, deterministically-indexed list of ALL findings.
+
+    IDs (F-0001…) are assigned in ``debugger.findings`` dict iteration order,
+    then by position within each category. This ensures that the same finding
+    always gets the same ID regardless of which tool (get_findings,
+    search_findings, get_remediation) is looking it up or what filters are
+    applied downstream.
+
+    Returns:
+        List of finding dicts with keys: id, category, severity,
+        finding_type, summary, details, timestamp (optional).
+    """
+    indexed: list[dict[str, Any]] = []
+    counter = 0
+    for cat, items in debugger.findings.items():
+        for item in items:
+            counter += 1
+            details = (item.get("details") or {}) if isinstance(item, dict) else {}
+            entry = {
+                "id": f"F-{counter:04d}",
+                "category": cat,
+                "severity": details.get("severity", "info"),
+                "finding_type": details.get("finding_type", FindingType.CURRENT_STATE),
+                "summary": (item.get("summary", "") if isinstance(item, dict) else ""),
+                "details": {k: v for k, v in details.items() if k != "finding_type"},
+            }
+            ts = details.get("timestamp") or details.get("event_time")
+            if ts:
+                entry["timestamp"] = str(ts)
+            indexed.append(entry)
+    return indexed
+
+
 def _run_analysis_group(
     debugger: ComprehensiveEKSDebugger, methods: list[Callable[[], None]]
 ) -> tuple[int, list[dict[str, str]]]:
@@ -203,6 +240,16 @@ def connect(
         cluster metadata, and node/pod counts from the pre-fetched snapshot.
     """
     try:
+        # Validate inputs at the MCP boundary (defense-in-depth; the debugger
+        # constructor also validates, but we want clear errors here).
+        validate_input("profile", profile)
+        validate_input("region", region)
+        validate_input("cluster_name", cluster_name)
+        if namespace:
+            validate_input("namespace", namespace)
+        if kube_context:
+            validate_input("kube_context", kube_context)
+
         _cleanup_expired_sessions()
 
         end_date = datetime.now(timezone.utc)
@@ -439,9 +486,9 @@ def analyze_nodes(session_id: str) -> dict[str, Any]:
         debugger.analyze_workload_security_posture,
         debugger.analyze_karpenter_drift,
     ]
-    # Node analysis also benefits from any Phase 1 SSM findings already collected
-    categories = _NODE_CATEGORIES + _NODE_OS_CATEGORIES
-    return _analyze_domain(session_id, "nodes", methods, categories)
+    # analyze_nodes only runs kubectl-based methods, not SSM diagnostics.
+    # Don't count node_os_* categories (those come from collect_node_diagnostics).
+    return _analyze_domain(session_id, "nodes", methods, _NODE_CATEGORIES)
 
 
 @mcp.tool()
@@ -677,33 +724,25 @@ def get_findings(
                 "error": (f"Unknown category {category!r}. Available: {available}"),
             }
 
-        all_findings: list[dict[str, Any]] = []
-        finding_counter = 0
-        for cat in categories:
-            for item in debugger.findings.get(cat, []):
-                finding_counter += 1
-                details = item.get("details", {}) or {}
-                item_severity = details.get("severity", "info")
-                if severity and item_severity != severity:
-                    continue
-                finding_entry = {
-                    "id": f"F-{finding_counter:04d}",
-                    "category": cat,
-                    "severity": item_severity,
-                    "finding_type": details.get("finding_type", FindingType.CURRENT_STATE),
-                    "summary": item.get("summary", ""),
-                    "details": {k: v for k, v in details.items() if k != "finding_type"},
-                }
-                timestamp = details.get("timestamp") or details.get("event_time")
-                if timestamp:
-                    finding_entry["timestamp"] = str(timestamp)
-                all_findings.append(finding_entry)
+        # Build stable index over ALL findings first (IDs must be consistent
+        # across get_findings, search_findings, and get_remediation).
+        all_indexed = _build_finding_index(debugger)
 
+        # Apply category filter
+        if category is not None:
+            all_indexed = [f for f in all_indexed if f["category"] == category]
+
+        # Apply severity filter
+        if severity is not None:
+            all_indexed = [f for f in all_indexed if f["severity"] == severity]
+
+        # Sort by severity (critical → warning → info)
         severity_order = {"critical": 0, "warning": 1, "info": 2}
-        all_findings.sort(key=lambda f: severity_order.get(f["severity"], 3))
+        all_indexed.sort(key=lambda f: severity_order.get(f["severity"], 3))
 
-        total = len(all_findings)
-        paginated = all_findings[offset : offset + limit]
+        # Paginate
+        total = len(all_indexed)
+        paginated = all_indexed[offset : offset + limit]
 
         return {
             "status": "completed",
@@ -905,37 +944,24 @@ def search_findings(
                 "error": (f"Unknown category {category!r}. Available: {sorted(debugger.findings.keys())}"),
             }
 
-        categories = [category] if category else list(debugger.findings.keys())
+        # Build stable index over ALL findings (IDs consistent across tools)
+        all_indexed = _build_finding_index(debugger)
+
+        # Apply category filter
+        if category is not None:
+            all_indexed = [f for f in all_indexed if f["category"] == category]
+
+        # Search across summary + details values
         matches: list[dict[str, Any]] = []
-        finding_counter = 0
-        for cat in categories:
-            for item in debugger.findings.get(cat, []):
-                finding_counter += 1
-                summary = item.get("summary", "") or ""
-                details = item.get("details", {}) or {}
-
-                # Build a searchable blob: summary + all stringified detail values
-                values = [summary]
-                for v in details.values():
-                    if v is None:
-                        continue
-                    values.append(str(v))
-                blob = " ".join(values).lower()
-
-                if needle not in blob:
+        for f in all_indexed:
+            values = [f["summary"]]
+            for v in f["details"].values():
+                if v is None:
                     continue
-
-                severity = details.get("severity", "info")
-                matches.append(
-                    {
-                        "id": f"F-{finding_counter:04d}",
-                        "category": cat,
-                        "severity": severity,
-                        "finding_type": details.get("finding_type", FindingType.CURRENT_STATE),
-                        "summary": summary,
-                        "details": {k: v for k, v in details.items() if k != "finding_type"},
-                    }
-                )
+                values.append(str(v))
+            blob = " ".join(values).lower()
+            if needle in blob:
+                matches.append(f)
 
         severity_order = {"critical": 0, "warning": 1, "info": 2}
         matches.sort(key=lambda f: severity_order.get(f["severity"], 3))
@@ -964,7 +990,7 @@ def get_timeline(session_id: str, hours: int = 24) -> dict[str, Any]:
             Set to a large value (e.g., 168) to see the full analysis window.
 
     Returns:
-        Timeline buckets (newest first), total event count, and the
+        Timeline buckets (oldest first), total event count, and the
         earliest bucket timestamp (likely the incident start).
     """
     try:
@@ -991,6 +1017,9 @@ def get_timeline(session_id: str, hours: int = 24) -> dict[str, Any]:
             except (ValueError, TypeError):
                 # If we can't parse, keep the bucket rather than dropping it
                 filtered.append(bucket)
+
+        # Sort by time_bucket (oldest first) for consistent earliest/latest
+        filtered.sort(key=lambda b: b.get("time_bucket", ""))
 
         total_events = sum(b.get("event_count", 0) for b in filtered)
         earliest = filtered[0].get("time_bucket") if filtered else None
@@ -1056,29 +1085,22 @@ def get_remediation(
                 "error": (f"Unknown category {category!r}. Available: {sorted(debugger.findings.keys())}"),
             }
 
-        # Build a flat, indexed list of findings so we can resolve finding_id
-        flat: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
-        counter = 0
-        for cat, items in debugger.findings.items():
-            for item in items:
-                counter += 1
-                fid = f"F-{counter:04d}"
-                flat.append((fid, cat, item.get("details", {}) or {}, item))
+        # Build stable index (same IDs as get_findings / search_findings)
+        all_indexed = _build_finding_index(debugger)
 
         if finding_id:
-            match = next((t for t in flat if t[0] == finding_id), None)
+            match = next((f for f in all_indexed if f["id"] == finding_id), None)
             if not match:
                 return {
                     "status": "error",
                     "error": (f"finding_id {finding_id!r} not found. Use get_findings() to list valid ids."),
                 }
-            _fid, cat, details, item = match
-            remediation = get_remediation_commands(item.get("summary", ""), details)
+            remediation = get_remediation_commands(match["summary"], match["details"])
             return {
                 "status": "completed",
                 "finding_id": finding_id,
-                "category": cat,
-                "summary": item.get("summary", ""),
+                "category": match["category"],
+                "summary": match["summary"],
                 "remediation": remediation
                 or {
                     "diagnostic": [],
@@ -1090,17 +1112,17 @@ def get_remediation(
 
         # category branch
         entries: list[dict[str, Any]] = []
-        for fid, cat, details, item in flat:
-            if cat != category:
+        for f in all_indexed:
+            if f["category"] != category:
                 continue
-            remediation = get_remediation_commands(item.get("summary", ""), details)
+            remediation = get_remediation_commands(f["summary"], f["details"])
             if not remediation:
                 continue
             entries.append(
                 {
-                    "finding_id": fid,
-                    "summary": item.get("summary", ""),
-                    "severity": details.get("severity", "info"),
+                    "finding_id": f["id"],
+                    "summary": f["summary"],
+                    "severity": f["severity"],
                     "remediation": remediation,
                 }
             )
@@ -1245,7 +1267,7 @@ def collect_node_diagnostics(
 
         return {
             "status": "completed",
-            "nodes_targeted": debugger.ssm_max_nodes,
+            "max_nodes_requested": debugger.ssm_max_nodes,
             "target_node": node_name,
             "total_findings": total_findings,
             "findings_by_category": category_counts,

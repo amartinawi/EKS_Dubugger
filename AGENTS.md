@@ -53,7 +53,7 @@ requirements.txt               # Python dependencies (includes test deps)
 .gitignore                     # Git ignore rules
 README.md                      # User documentation
 AGENTS.md                      # This file
-tests/                         # Unit tests (359 tests)
+tests/                         # Unit tests (383 tests)
 ├── __init__.py
 ├── conftest.py                # Shared fixtures
 ├── test_severity_classification.py  # Severity logic tests

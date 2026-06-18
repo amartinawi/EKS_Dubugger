@@ -113,6 +113,12 @@ class TestFingerprintNormalization:
         fp2 = tracker._fingerprint("pod_errors", "pod crash")
         assert fp1 == fp2
 
+    def test_different_summaries_different_fingerprint(self, tracker):
+        """Genuinely different findings must produce different fingerprints."""
+        fp1 = tracker._fingerprint("pod_errors", "Pod crashed due to OOM")
+        fp2 = tracker._fingerprint("pod_errors", "Pod crashed due to network timeout")
+        assert fp1 != fp2
+
 
 # ---------------------------------------------------------------------------
 # Load / Save / Update Cycle

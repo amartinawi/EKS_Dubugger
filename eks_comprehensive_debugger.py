@@ -992,6 +992,28 @@ CRITICAL_CATEGORIES = [
     "node_issues",
 ]
 
+# Human readable names for finding categories, used wherever a category key
+# would otherwise be shown to a reader
+CATEGORY_DISPLAY_NAMES = {
+    "memory_pressure": "Memory Pressure",
+    "disk_pressure": "Disk Pressure",
+    "pod_errors": "Pod Errors",
+    "node_issues": "Node Issues",
+    "oom_killed": "OOM Killed",
+    "control_plane_issues": "Control Plane",
+    "scheduling_failures": "Scheduling",
+    "network_issues": "Network",
+    "rbac_issues": "RBAC/IAM",
+    "workload_security": "Workload Security",
+    "image_pull_failures": "Image Pull",
+    "resource_quota_exceeded": "Resource Quotas",
+    "pvc_issues": "Storage/PVC",
+    "dns_issues": "DNS",
+    "addon_issues": "EKS Addons",
+    "quota_issues": "Service Quotas",
+}
+
+
 CONTROL_PLANE_BENIGN_PATTERNS = [
     "required revision has been compacted",
     "falling back to the standard LIST semantics",
@@ -2681,7 +2703,7 @@ class ExecutiveSummaryGenerator:
                 "category": "health",
             },
             "restart_policy": {
-                "keywords": ["crashloopbackoff", "back-off restarting", "restarted"],
+                "keywords": ["crashloopbackoff", "back-off restarting", "restarted", "high restart count"],
                 "title": "Investigate Restarting Pod",
                 "solution": "Check logs and fix application error",
                 "time": "10 min",
@@ -2692,8 +2714,19 @@ class ExecutiveSummaryGenerator:
         # Scan findings for quick win opportunities
         detected_issues = set()
 
-        for category, items in findings.items():
-            for item in items:
+        # Worst first, so the quick win points at the most severe example rather
+        # than whichever finding happened to be scanned first
+        severity_rank = {"critical": 0, "warning": 1, "info": 2}
+        ordered = [
+            (category, item)
+            for category, items in findings.items()
+            for item in items
+            if isinstance(item, dict)
+        ]
+        ordered.sort(key=lambda ci: severity_rank.get(ci[1].get("details", {}).get("severity", "info"), 3))
+
+        for category, item in ordered:
+            if True:
                 summary = item.get("summary", "").lower()
                 details = item.get("details", {})
 
@@ -2829,23 +2862,7 @@ class ExecutiveSummaryGenerator:
         """Get breakdown of issues by category"""
         breakdown = []
 
-        category_names = {
-            "memory_pressure": "Memory Pressure",
-            "disk_pressure": "Disk Pressure",
-            "pod_errors": "Pod Errors",
-            "node_issues": "Node Issues",
-            "oom_killed": "OOM Killed",
-            "control_plane_issues": "Control Plane",
-            "scheduling_failures": "Scheduling",
-            "network_issues": "Network",
-            "rbac_issues": "RBAC/IAM",
-            "workload_security": "Workload Security",
-            "image_pull_failures": "Image Pull",
-            "resource_quota_exceeded": "Resource Quotas",
-            "pvc_issues": "Storage/PVC",
-            "dns_issues": "DNS",
-            "addon_issues": "EKS Addons",
-        }
+        category_names = CATEGORY_DISPLAY_NAMES
 
         for category, items in findings.items():
             if not items:
@@ -7177,10 +7194,10 @@ class HTMLOutputFormatter(OutputFormatter):
                     <div class="summary-value">{summary["warning"]}</div>
                     <div class="summary-label">Warnings</div>
                 </div>
-                <div class="summary-card healthy">
+                <div class="summary-card healthy" title="Finding categories that produced no findings">
                     <div class="summary-icon">✅</div>
                     <div class="summary-value">{summary.get("healthy_checks", 0)}</div>
-                    <div class="summary-label">Healthy Checks</div>
+                    <div class="summary-label">Categories Clear</div>
                 </div>
             </div>
 
@@ -16177,12 +16194,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             # Add impact events from correlation
             impact = primary_correlation.get("impact", "")
-            if impact:
+            # Only attach the impact to a real event time. Falling back to the
+            # analysis time produced an "08:18 to 08:18" incident window.
+            if impact and timeline_events:
                 timeline_events.append(
                     {
-                        "timestamp": timeline_events[0]["timestamp"]
-                        if timeline_events
-                        else datetime.now(tz=timezone.utc),
+                        "timestamp": timeline_events[0]["timestamp"],
                         "category": "impact",
                         "summary": impact[:150],
                         "severity": primary_correlation.get("severity", "warning"),
@@ -16515,7 +16532,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     def _generate_story_summary(self, narrative_events: list, primary_correlation: dict | None) -> str:
         """Generate a summary paragraph of the incident."""
-        if not narrative_events:
+        has_findings = any(
+            items for category, items in self.findings.items() if category != "healthy_components" and items
+        )
+        # Findings without timestamps produce no narrative events. That is not the
+        # same as a clean cluster, and must not be reported as one.
+        if not narrative_events and not has_findings:
             return "No significant issues detected during the analysis period."
 
         # Count issues by severity from all findings (not just narrative events)
@@ -16541,9 +16563,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         if narrative_events:
             start_time = narrative_events[0]["time"]
             end_time = narrative_events[-1]["time"]
-            time_range = f"{start_time} to {end_time}"
+            time_range = f"{start_time} to {end_time}" if start_time != end_time else start_time
         else:
-            time_range = "N/A"
+            time_range = ""
 
         # Get primary root cause
         if primary_correlation:
@@ -16555,7 +16577,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # Build summary
         summary_parts = [
-            f"**Incident Summary** ({time_range})",
+            f"**Incident Summary** ({time_range})" if time_range else "**Incident Summary**",
             "",
             f"**Root Cause**: {root_cause}",
             "",
@@ -16568,9 +16590,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             summary_parts.append("")
 
         # Add key affected areas
-        categories = list(set(e["category"] for e in narrative_events[:10]))
-        if categories:
-            summary_parts.append(f"**Affected Areas**: {', '.join(categories[:5])}")
+        # "impact" is an internal bucket, not a cluster area, and raw category
+        # keys are not names a reader recognises
+        categories = sorted({e["category"] for e in narrative_events[:10] if e["category"] != "impact"})
+        display = [CATEGORY_DISPLAY_NAMES.get(c, c.replace("_", " ").title()) for c in categories]
+        if display:
+            summary_parts.append(f"**Affected Areas**: {', '.join(display[:5])}")
 
         return "\n".join(summary_parts)
 
@@ -22530,7 +22555,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     info_count += 1
 
                 # Extract affected resources
-                for key in ["node", "pod", "namespace", "pvc", "service", "subnet_id"]:
+                # Namespaces are not resources; listing one among pod names made
+                # the affected-resource list unreadable
+                for key in ["node", "pod", "owner", "workload", "nodegroup", "pvc", "service", "subnet_id"]:
                     if details.get(key):
                         affected_resources.add(str(details[key]))
 

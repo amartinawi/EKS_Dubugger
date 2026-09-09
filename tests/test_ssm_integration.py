@@ -8,17 +8,15 @@ Tests cover:
 - End-to-end run_diagnostic_commands with {hours} substitution
 """
 
+from unittest.mock import MagicMock
+
 import pytest
-from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError
 
 from eks_comprehensive_debugger import (
     ComprehensiveEKSDebugger,
     SSMNodeDiagnosticsManager,
-    NodeDiagnosticConfig,
-    FindingType,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────
 

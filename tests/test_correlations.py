@@ -1,7 +1,9 @@
 """Tests for correlation and root cause analysis logic."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
-from datetime import datetime, timezone, timedelta
+
 from eks_comprehensive_debugger import ComprehensiveEKSDebugger
 
 

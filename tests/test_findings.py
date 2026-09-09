@@ -1,8 +1,10 @@
 """Tests for findings management (limits, thread safety)."""
 
-import pytest
 import threading
-from eks_comprehensive_debugger import ComprehensiveEKSDebugger, MAX_FINDINGS_PER_CATEGORY
+
+import pytest
+
+from eks_comprehensive_debugger import ComprehensiveEKSDebugger
 
 
 class TestAddFinding:

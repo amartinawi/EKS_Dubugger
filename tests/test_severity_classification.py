@@ -1,6 +1,7 @@
 """Tests for severity classification logic."""
 
 import pytest
+
 from eks_comprehensive_debugger import classify_severity
 
 

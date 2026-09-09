@@ -5,12 +5,14 @@ Tests the main debugger class with mocked AWS services and kubectl commands.
 """
 
 import json
+from unittest.mock import Mock, patch
+
 import pytest
-from unittest.mock import Mock, MagicMock, patch
+
 from eks_comprehensive_debugger import (
-    validate_input,
     ComprehensiveEKSDebugger,
     InputValidationError,
+    validate_input,
 )
 
 

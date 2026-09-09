@@ -1,10 +1,12 @@
 """Tests for performance optimization features."""
 
-import pytest
-import time
 import json
-from unittest.mock import Mock, patch, MagicMock
+import time
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
 from eks_comprehensive_debugger import ComprehensiveEKSDebugger, PerformanceTracker
 
 

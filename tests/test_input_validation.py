@@ -1,7 +1,8 @@
 """Tests for input validation (shell injection prevention)."""
 
 import pytest
-from eks_comprehensive_debugger import validate_input, InputValidationError
+
+from eks_comprehensive_debugger import InputValidationError, validate_input
 
 
 class TestValidateInput:

@@ -471,6 +471,18 @@ class BaselineTracker:
         }
 
 
+# Namespaces whose workloads legitimately need host access (node agents, CSI drivers)
+SYSTEM_NAMESPACES = frozenset(
+    {"kube-system", "amazon-cloudwatch", "calico-system", "kube-node-lease", "eks-system"}
+)
+
+# Host paths that give a workload meaningful control over the node
+SENSITIVE_HOST_PATHS_EXACT = frozenset(
+    {"/", "/etc", "/var/run/docker.sock", "/var/run/containerd", "/var/lib/docker"}
+)
+SENSITIVE_HOST_PREFIXES = ("/etc/", "/var/run/", "/var/lib/docker", "/proc", "/sys")
+
+
 class Thresholds:
     """Threshold configuration for alerts"""
 
@@ -2779,6 +2791,10 @@ class ExecutiveSummaryGenerator:
             "scheduling_failures": ("Scheduler", "No scheduling failures"),
             "network_issues": ("Network", "No network issues detected"),
             "rbac_issues": ("RBAC/IAM", "No authorization failures"),
+            "workload_security": (
+                "Workload Security",
+                "No privileged or host-mounted workloads outside system namespaces",
+            ),
             "image_pull_failures": ("Images", "All images pulling successfully"),
             "pvc_issues": ("Storage", "No PVC issues detected"),
             "dns_issues": ("DNS", "CoreDNS operating normally"),
@@ -2810,6 +2826,7 @@ class ExecutiveSummaryGenerator:
             "scheduling_failures": "Scheduling",
             "network_issues": "Network",
             "rbac_issues": "RBAC/IAM",
+            "workload_security": "Workload Security",
             "image_pull_failures": "Image Pull",
             "resource_quota_exceeded": "Resource Quotas",
             "pvc_issues": "Storage/PVC",
@@ -3948,6 +3965,12 @@ class HTMLOutputFormatter(OutputFormatter):
                 "title": "RBAC Issues",
                 "source": "kubectl events + audit logs",
                 "color": "#6c5ce7",
+            },
+            "workload_security": {
+                "icon": "🛡️",
+                "title": "Workload Security",
+                "source": "kubectl pod specs",
+                "color": "#8e7cc3",
             },
             "image_pull_failures": {
                 "icon": "📦",
@@ -7419,6 +7442,7 @@ class HTMLOutputFormatter(OutputFormatter):
             "image_pull_failures": 10,
             "dns_issues": 11,
             "rbac_issues": 12,
+            "workload_security": 12,
             "addon_issues": 13,
             "resource_quota_exceeded": 14,  # Informational/best-practice last
             "quota_issues": 15,
@@ -9482,6 +9506,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "scheduling_failures": [],
             "network_issues": [],
             "rbac_issues": [],
+            "workload_security": [],
             "image_pull_failures": [],
             "resource_quota_exceeded": [],
             "pvc_issues": [],
@@ -12414,17 +12439,26 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self.progress.info(f"Cluster Insights not available: {response}")
                 return
 
-            insight_summaries = response.get("insightSummaries", [])
+            # The ListInsights response key is "insights". Reading "insightSummaries"
+            # made this check a silent no-op on every cluster.
+            insight_summaries = response.get("insights", [])
 
             if not insight_summaries:
                 self.progress.info("No cluster insights found")
                 return
 
+            reported = 0
             for summary in insight_summaries:
                 insight_id = summary.get("id", "")
                 category = summary.get("category", "Unknown")
-                status = summary.get("status", "Unknown")
+                status_block = summary.get("insightStatus") or {}
+                status = status_block.get("status", "UNKNOWN")
                 description = summary.get("description", "N/A")
+                name = summary.get("name", "EKS insight")
+
+                # PASSING and UNKNOWN insights are not problems; only report real ones.
+                if status not in ("WARNING", "ERROR"):
+                    continue
 
                 # Get detailed insight information
                 success, detail_response = self.safe_api_call(
@@ -12440,32 +12474,30 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 recommendations = insight.get("recommendation", "")
                 resources = insight.get("kubernetesResourceUri", [])
 
-                # Map category to severity
-                severity_map = {
-                    "UPGRADE_READINESS": "critical",
-                    "SECURITY": "critical",
-                    "RELIABILITY": "warning",
-                    "PERFORMANCE": "warning",
-                }
-                severity = severity_map.get(category, "info")
+                # Severity follows the insight status, not its category
+                severity = "critical" if status == "ERROR" else "warning"
 
                 # Map category to finding category
                 category_map = {
                     "UPGRADE_READINESS": "control_plane_issues",
-                    "SECURITY": "rbac_issues",
+                    "SECURITY": "workload_security",
                     "RELIABILITY": "node_issues",
                     "PERFORMANCE": "pod_errors",
                 }
                 finding_category = category_map.get(category, "pod_errors")
+                reported += 1
 
+                detail_text = status_block.get("reason") or description
                 self._add_finding_dict(
                     finding_category,
                     {
-                        "summary": f"EKS Insight [{category}]: {description[:100]}{'...' if len(description) > 100 else ''}",
+                        "summary": f"EKS Insight {name} [{category}] is {status}: {detail_text[:100]}{'...' if len(detail_text) > 100 else ''}",
                         "details": {
                             "insight_id": insight_id,
+                            "insight_name": name,
                             "category": category,
                             "status": status,
+                            "status_reason": status_block.get("reason", ""),
                             "description": description,
                             "recommendation": recommendations,
                             "resources": resources[:5] if resources else [],
@@ -12476,7 +12508,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     },
                 )
 
-            self.progress.info(f"Checked {len(insight_summaries)} cluster insights")
+            self.progress.info(
+                f"Checked {len(insight_summaries)} cluster insights, {reported} in WARNING or ERROR state"
+            )
 
         except Exception as e:
             self._add_error("check_eks_cluster_insights", str(e))
@@ -14369,6 +14403,25 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_karpenter_drift", str(e))
 
+    def _workload_owner(self, pod: dict) -> tuple[str, str, str]:
+        """Return (owner_kind, owner_name, namespace) for a pod.
+
+        ReplicaSet and Job owners are rolled up to their Deployment or CronJob so
+        that a finding is reported once per workload rather than once per pod.
+        """
+        meta = pod.get("metadata", {})
+        ns = meta.get("namespace", "")
+        owners = meta.get("ownerReferences") or []
+        if not owners:
+            return ("Pod", meta.get("name", ""), ns)
+        kind = owners[0].get("kind", "Pod")
+        name = owners[0].get("name", meta.get("name", ""))
+        if kind == "ReplicaSet":
+            kind, name = "Deployment", re.sub(r"-[a-f0-9]{5,10}$", "", name)
+        elif kind == "Job" and re.search(r"-\d{6,}$", name):
+            kind, name = "CronJob", re.sub(r"-\d{6,}$", "", name)
+        return (kind, name, ns)
+
     def analyze_workload_security_posture(self):
         """
         Analyze workload security posture.
@@ -14376,7 +14429,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Gap addressed: analyze_psa_violations() checks PSA labels but doesn't
         scan actual pod specs for dangerous security configurations.
 
-        Detection:
+        Detection (reported once per owning workload, not once per pod):
         - Privileged containers
         - Containers with dangerous capabilities (SYS_ADMIN)
         - Pods mounting sensitive host paths
@@ -14388,81 +14441,105 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 return
             pods = json.loads(pods_json).get("items", [])
 
-            # Exact match for root paths, prefix match for subdirectories
-            SENSITIVE_HOST_PATHS_EXACT = {"/", "/etc", "/var/run/docker.sock", "/var/run/containerd", "/var/lib/docker"}
-            SENSITIVE_HOST_PREFIXES = ["/etc/", "/var/run/", "/var/lib/docker", "/proc", "/sys"]
+            privileged: dict[tuple, dict] = {}
+            sys_admin: dict[tuple, dict] = {}
+            host_mounts: dict[tuple, dict] = {}
 
             for pod in pods:
-                pod_name = pod.get("metadata", {}).get("name", "")
                 namespace = pod.get("metadata", {}).get("namespace", "")
+                pod_name = pod.get("metadata", {}).get("name", "")
 
-                # Skip system namespaces
-                if namespace in ("kube-system", "amazon-cloudwatch", "calico-system", "kube-node-lease", "eks-system"):
+                # Node agents and CSI drivers legitimately need host access
+                if namespace in SYSTEM_NAMESPACES:
                     continue
 
-                # Check container security contexts
+                owner = self._workload_owner(pod)
+
                 for container in pod.get("spec", {}).get("containers", []):
                     container_name = container.get("name", "")
-                    sc = container.get("securityContext", {})
+                    sc = container.get("securityContext") or {}
 
                     if sc.get("privileged"):
-                        self._add_finding(
-                            "rbac_issues",
-                            f"Privileged container {container_name} in {namespace}/{pod_name}",
-                            {
-                                "container": container_name,
-                                "pod": pod_name,
-                                "namespace": namespace,
-                                "severity": "critical",
-                                "finding_type": FindingType.CURRENT_STATE,
-                                "impact": "Container has full host access, can escape to node",
-                                "diagnostic_steps": [
-                                    f"kubectl get pod {pod_name} -n {namespace} -o yaml | grep -A 10 securityContext",
-                                    "Review if privileged mode is actually required",
-                                ],
-                            },
-                        )
+                        entry = privileged.setdefault(owner, {"containers": set(), "pods": set()})
+                        entry["containers"].add(container_name)
+                        entry["pods"].add(pod_name)
 
-                    added_caps = sc.get("capabilities", {}).get("add", [])
-                    if added_caps and "SYS_ADMIN" in added_caps:
-                        self._add_finding(
-                            "rbac_issues",
-                            f"Container {container_name} in {namespace}/{pod_name} has SYS_ADMIN capability",
-                            {
-                                "container": container_name,
-                                "pod": pod_name,
-                                "namespace": namespace,
-                                "added_capabilities": added_caps,
-                                "severity": "critical",
-                                "finding_type": FindingType.CURRENT_STATE,
-                                "impact": "Container can perform system administration tasks",
-                            },
-                        )
+                    added_caps = (sc.get("capabilities") or {}).get("add") or []
+                    if "SYS_ADMIN" in added_caps:
+                        entry = sys_admin.setdefault(owner, {"containers": set(), "pods": set()})
+                        entry["containers"].add(container_name)
+                        entry["pods"].add(pod_name)
 
-                # Check host path mounts
-                for volume in pod.get("spec", {}).get("volumes", []):
-                    if volume.get("hostPath"):
-                        path = volume["hostPath"].get("path", "")
-                        volume_name = volume.get("name", "")
+                for volume in pod.get("spec", {}).get("volumes", []) or []:
+                    path = (volume.get("hostPath") or {}).get("path", "")
+                    if not path:
+                        continue
+                    is_sensitive = path in SENSITIVE_HOST_PATHS_EXACT or any(
+                        path.startswith(prefix) for prefix in SENSITIVE_HOST_PREFIXES
+                    )
+                    if is_sensitive:
+                        entry = host_mounts.setdefault(owner, {"paths": set(), "pods": set()})
+                        entry["paths"].add(path)
+                        entry["pods"].add(pod_name)
 
-                        # Use exact match for root paths, prefix match for subdirectories
-                        is_sensitive = path in SENSITIVE_HOST_PATHS_EXACT or any(
-                            path.startswith(prefix) for prefix in SENSITIVE_HOST_PREFIXES
-                        )
-                        if is_sensitive:
-                            self._add_finding(
-                                "rbac_issues",
-                                f"Pod {namespace}/{pod_name} mounts sensitive host path: {path}",
-                                {
-                                    "pod": pod_name,
-                                    "namespace": namespace,
-                                    "volume_name": volume_name,
-                                    "host_path": path,
-                                    "severity": "critical",
-                                    "finding_type": FindingType.CURRENT_STATE,
-                                    "impact": "Pod has access to sensitive host filesystem",
-                                },
-                            )
+            for (kind, name, ns), entry in privileged.items():
+                containers = ", ".join(sorted(entry["containers"]))
+                self._add_finding(
+                    "workload_security",
+                    f"{kind} {ns}/{name} runs privileged container(s) {containers} ({len(entry['pods'])} pods)",
+                    {
+                        "owner_kind": kind,
+                        "owner": name,
+                        "namespace": ns,
+                        "containers": sorted(entry["containers"]),
+                        "pod_count": len(entry["pods"]),
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": (
+                            "Privileged containers can escape to the node. This is expected for node "
+                            "agents and CSI drivers, and a real risk for application workloads."
+                        ),
+                        "diagnostic_steps": [
+                            f"kubectl get {kind.lower()} {name} -n {ns} -o yaml | grep -B2 -A6 securityContext",
+                            "Confirm privileged mode is required, otherwise drop it and add only the needed capabilities",
+                        ],
+                    },
+                )
+
+            for (kind, name, ns), entry in sys_admin.items():
+                containers = ", ".join(sorted(entry["containers"]))
+                self._add_finding(
+                    "workload_security",
+                    f"{kind} {ns}/{name} adds SYS_ADMIN capability to container(s) {containers} ({len(entry['pods'])} pods)",
+                    {
+                        "owner_kind": kind,
+                        "owner": name,
+                        "namespace": ns,
+                        "containers": sorted(entry["containers"]),
+                        "added_capabilities": ["SYS_ADMIN"],
+                        "pod_count": len(entry["pods"]),
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "SYS_ADMIN grants most of what privileged mode grants",
+                    },
+                )
+
+            for (kind, name, ns), entry in host_mounts.items():
+                paths = ", ".join(sorted(entry["paths"]))
+                self._add_finding(
+                    "workload_security",
+                    f"{kind} {ns}/{name} mounts sensitive host path(s): {paths} ({len(entry['pods'])} pods)",
+                    {
+                        "owner_kind": kind,
+                        "owner": name,
+                        "namespace": ns,
+                        "host_paths": sorted(entry["paths"]),
+                        "pod_count": len(entry["pods"]),
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Workload can read or write sensitive parts of the host filesystem",
+                    },
+                )
 
         except Exception as e:
             self._add_error("analyze_workload_security_posture", str(e))
@@ -20383,10 +20460,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         try:
             # Look for common operator patterns
+            # Explicit component selectors only. A bare "app.kubernetes.io/name"
+            # existence selector matches nearly every pod in a cluster, which made
+            # ordinary workloads show up as failing controllers.
             operator_labels = [
                 "control-plane=controller-manager",
                 "app.kubernetes.io/component=controller",
-                "app.kubernetes.io/name",
+                "app.kubernetes.io/component=operator",
+                "app.kubernetes.io/component=manager",
             ]
 
             for label in operator_labels:
@@ -22091,6 +22172,28 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         "Check: kubectl get rolebindings,clusterrolebindings -A",
                         "Review: AWS IAM to Kubernetes RBAC mapping",
                         "Verify: Service account annotations for IRSA",
+                    ],
+                }
+            )
+
+        # Workload security posture recommendations
+        if self.findings["workload_security"]:
+            evidence = extract_evidence(self.findings["workload_security"])
+            recommendations.append(
+                {
+                    "title": "Review privileged and host-mounted workloads",
+                    "category": "workload_security",
+                    "priority": "medium",
+                    "action": (
+                        "Confirm each privileged container and hostPath mount is required. Keep node agents in a "
+                        "dedicated namespace and enforce Pod Security Admission 'restricted' elsewhere"
+                    ),
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/best-practices/pod-security.html",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run: kubectl get pods -A -o json | jq -r '.items[] | select(any(.spec.containers[]; .securityContext.privileged==true)) | .metadata.namespace + \"/\" + .metadata.name'",
+                        "Check: kubectl get ns -L pod-security.kubernetes.io/enforce",
+                        "Review: whether each workload needs host access or only a specific capability",
                     ],
                 }
             )

@@ -1,8 +1,10 @@
 """Tests for kubectl command execution with shell=False."""
 
-import pytest
 import subprocess
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
+
+import pytest
+
 from eks_comprehensive_debugger import ComprehensiveEKSDebugger
 
 

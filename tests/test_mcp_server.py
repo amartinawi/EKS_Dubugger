@@ -21,10 +21,10 @@ import pytest
 import eks_mcp_server
 from eks_mcp_server import (
     SESSION_TIMEOUT_MINUTES,
-    _SessionState,
     _cleanup_expired_sessions,
     _get_session,
     _make_session_id,
+    _SessionState,
     analyze_control_plane,
     analyze_iam,
     analyze_networking,
@@ -44,7 +44,6 @@ from eks_mcp_server import (
     run_full_analysis,
     search_findings,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

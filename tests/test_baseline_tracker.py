@@ -9,14 +9,10 @@ from __future__ import annotations
 import json
 import os
 import stat
-import tempfile
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from eks_comprehensive_debugger import BaselineTracker
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

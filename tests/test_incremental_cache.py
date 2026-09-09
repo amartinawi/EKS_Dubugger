@@ -1,11 +1,12 @@
 """Tests for incremental cache and delta reporting."""
 
-import pytest
-import os
 import json
-import tempfile
+import os
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+
+import pytest
+
 from eks_comprehensive_debugger import IncrementalCache
 
 

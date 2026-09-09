@@ -1,8 +1,8 @@
 """Tests for API caching functionality."""
 
-import pytest
-import time
 import threading
+import time
+
 from eks_comprehensive_debugger import APICache
 
 

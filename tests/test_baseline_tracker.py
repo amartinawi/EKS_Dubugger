@@ -205,8 +205,8 @@ class TestAnnotation:
         assert count == 0
         for items in sample_findings.values():
             for item in items:
-                assert item["details"]["is_baseline"] is False
-                assert item["details"]["baseline_count"] == 0
+                assert item["baseline"]["is_baseline"] is False
+                assert item["baseline"]["count"] == 0
 
     def test_baseline_after_threshold_runs(self, tracker, sample_findings):
         """After threshold runs, findings should be marked baseline."""
@@ -219,8 +219,8 @@ class TestAnnotation:
         assert count == 3  # all 3 findings are baseline
         for items in sample_findings.values():
             for item in items:
-                assert item["details"]["is_baseline"] is True
-                assert item["details"]["baseline_count"] == 3
+                assert item["baseline"]["is_baseline"] is True
+                assert item["baseline"]["count"] == 3
 
     def test_below_threshold_not_baseline(self, tracker, sample_findings):
         """Findings seen fewer times than threshold should NOT be baseline."""
@@ -232,8 +232,8 @@ class TestAnnotation:
         assert count == 0  # none are baseline yet (count=2, threshold=3)
         for items in sample_findings.values():
             for item in items:
-                assert item["details"]["is_baseline"] is False
-                assert item["details"]["baseline_count"] == 2
+                assert item["baseline"]["is_baseline"] is False
+                assert item["baseline"]["count"] == 2
 
     def test_threshold_zero_disables_baseline(self, temp_cache_dir):
         """threshold=0 means baseline tracking is disabled."""
@@ -247,7 +247,7 @@ class TestAnnotation:
 
         count = tracker.annotate(findings)
         assert count == 0  # disabled, nothing is baseline
-        assert findings["cat"][0]["details"]["is_baseline"] is False
+        assert findings["cat"][0]["baseline"]["is_baseline"] is False
 
     def test_annotate_then_update_order(self, tracker, sample_findings):
         """annotate() should reflect PREVIOUS runs, not current.
@@ -263,7 +263,7 @@ class TestAnnotation:
         # Annotate (should see count=2, below threshold=3)
         count = tracker.annotate(sample_findings)
         assert count == 0
-        assert sample_findings["pod_errors"][0]["details"]["baseline_count"] == 2
+        assert sample_findings["pod_errors"][0]["baseline"]["count"] == 2
 
         # Now update (increment to 3)
         tracker.update_and_save(sample_findings)
@@ -292,7 +292,7 @@ class TestAnnotation:
         count = tracker.annotate(findings)
         tracker.update_and_save(findings)
         # The two "good" findings should have been processed
-        assert findings["cat"][0]["details"].get("baseline_count") is not None
+        assert findings["cat"][0]["baseline"].get("count") is not None
 
 
 # ---------------------------------------------------------------------------

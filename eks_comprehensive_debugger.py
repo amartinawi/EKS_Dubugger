@@ -393,7 +393,7 @@ class BaselineTracker:
             pass  # Corrupt cache — start fresh silently
 
     def annotate(self, findings: dict) -> int:
-        """Annotate each finding's ``details`` with ``is_baseline`` and ``baseline_count``.
+        """Annotate each finding with a ``baseline`` block: count and is_baseline.
 
         Must be called BEFORE update_and_save() so that the current run's
         count is what was accumulated from PREVIOUS runs.
@@ -413,13 +413,15 @@ class BaselineTracker:
                 fp = self._fingerprint(category, summary)
                 count = self._fingerprints.get(fp, 0)
 
-                details = item.setdefault("details", {})
-                if not isinstance(details, dict):
-                    details = {}
-                    item["details"] = details
-                details["baseline_count"] = count
-                details["is_baseline"] = count >= self.threshold > 0
-                if details["is_baseline"]:
+                # Bookkeeping belongs beside the finding, not inside its details,
+                # where report templates render it as if it were evidence.
+                is_baseline = count >= self.threshold > 0
+                item["baseline"] = {"count": count, "is_baseline": is_baseline}
+                details = item.get("details")
+                if isinstance(details, dict):
+                    details.pop("baseline_count", None)
+                    details.pop("is_baseline", None)
+                if is_baseline:
                     baseline_marked += 1
 
         return baseline_marked
@@ -7310,10 +7312,10 @@ class HTMLOutputFormatter(OutputFormatter):
                         item_severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
                         source_badge = self._get_source_icon(item.get("details", {}))
                         finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
-                        _details = item.get("details", {})
+                        _baseline = item.get("baseline", {})
                         baseline_badge = (
-                            f'<span class="severity-badge baseline" title="Seen in {_details.get("baseline_count", 0)} previous analyses">🔄 Known</span>'
-                            if _details.get("is_baseline")
+                            f'<span class="severity-badge baseline" title="Seen in {_baseline.get("count", 0)} previous analyses">🔄 Known</span>'
+                            if _baseline.get("is_baseline")
                             else ""
                         )
                         finding_id = f"{cat}-{idx}"
@@ -7516,10 +7518,10 @@ class HTMLOutputFormatter(OutputFormatter):
                     item_severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
                     source_badge = self._get_source_icon(item.get("details", {}))
                     finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
-                    _details2 = item.get("details", {})
+                    _baseline2 = item.get("baseline", {})
                     baseline_badge2 = (
-                        f'<span class="severity-badge baseline" title="Seen in {_details2.get("baseline_count", 0)} previous analyses">🔄 Known</span>'
-                        if _details2.get("is_baseline")
+                        f'<span class="severity-badge baseline" title="Seen in {_baseline2.get("count", 0)} previous analyses">🔄 Known</span>'
+                        if _baseline2.get("is_baseline")
                         else ""
                     )
                     escaped_summary2 = self._escape_html(item.get("summary", "N/A"))
@@ -10914,6 +10916,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             if category not in self.findings:
                 self.findings[category] = []
             if len(self.findings[category]) >= self.max_findings:
+                return False
+            # The same pod can be reached by more than one analyzer. Counting it
+            # twice inflates the totals and the report's severity banner.
+            if any(f.get("summary") == summary for f in self.findings[category]):
                 return False
             if details is None:
                 details = {}

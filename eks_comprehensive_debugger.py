@@ -3683,13 +3683,15 @@ class HTMLOutputFormatter(OutputFormatter):
         """
 
         kubelet_versions = infra.get("kubelet_versions", [])
-        if kubelet_versions:
+        control_plane_version = infra.get("control_plane_version")
+        if kubelet_versions or control_plane_version:
             versions_str = ", ".join(self._escape_html(v) for v in kubelet_versions[:3])
             if len(kubelet_versions) > 3:
                 versions_str += f" (+{len(kubelet_versions) - 3} more)"
+            cp_str = self._escape_html(control_plane_version) if control_plane_version else "unknown"
             html += f"""
                             <div class="stat-footer">
-                                <span class="stat-note">K8s Versions: {versions_str}</span>
+                                <span class="stat-note">Control plane: {cp_str} | Kubelets: {versions_str or "unknown"}</span>
                             </div>
         """
 
@@ -10040,6 +10042,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         kube_versions.add(kv)
                     statistics["infrastructure"]["kubelet_versions"] = list(kube_versions)
 
+                    # Control plane version, so the report shows the skew rather than
+                    # only the kubelet versions
+                    cp_version = self._shared_data.get("control_plane_version")
+                    if not cp_version:
+                        success, cluster_resp = self.safe_api_call(
+                            self.eks_client.describe_cluster, name=self.cluster_name
+                        )
+                        if success and isinstance(cluster_resp, dict):
+                            cp_version = (cluster_resp.get("cluster") or {}).get("version")
+                    statistics["infrastructure"]["control_plane_version"] = cp_version or "unknown"
+
                 except json.JSONDecodeError:
                     pass
 
@@ -13759,14 +13772,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     def analyze_version_skew(self):
         """
-        Analyze kubelet version skew between control plane and nodes.
+        Analyze Kubernetes version skew between control plane, nodes and node groups.
 
-        Gap addressed: Kubernetes supports N-2 minor versions between control plane
-        and nodes. Version skew beyond this is unsupported and risky.
+        Kubernetes supports N-2 minor versions between control plane and kubelet.
+        A one minor gap is supported but is the signal that a node upgrade is due,
+        so it is reported as information rather than hidden.
 
         Detection:
         - Nodes with kubelet >2 minor versions behind control plane (critical)
-        - Nodes at maximum allowed skew (warning - will break on next upgrade)
+        - Nodes at maximum allowed skew (warning)
+        - Nodes one minor behind, aggregated into a single finding (info)
+        - Node groups behind the control plane, including scaled-to-zero groups
         """
         self.progress.step("Analyzing Kubernetes version skew...")
         try:
@@ -13774,11 +13790,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             cluster_info = self.eks_client.describe_cluster(name=self.cluster_name)
             cp_version = cluster_info["cluster"]["version"]  # e.g., "1.29"
             cp_minor = int(cp_version.split(".")[1])
+            with self._shared_data_lock:
+                self._shared_data["control_plane_version"] = cp_version
 
             nodes_json = self._get_cached_kubectl("kubectl get nodes -o json")
-            if not nodes_json:
-                return
-            nodes = json.loads(nodes_json).get("items", [])
+            nodes = json.loads(nodes_json).get("items", []) if nodes_json else []
+
+            one_minor_behind = []
 
             for node in nodes:
                 node_name = node.get("metadata", {}).get("name", "")
@@ -13786,45 +13804,116 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 # Parse kubelet version (e.g., "v1.27.9-eks-...")
                 version_match = re.search(r"v1\.(\d+)", kubelet_version)
-                if version_match:
-                    node_minor = int(version_match.group(1))
-                    skew = cp_minor - node_minor
+                if not version_match:
+                    continue
 
-                    if skew > 2:
-                        self._add_finding(
-                            "node_issues",
-                            f"Node {node_name} kubelet {kubelet_version} is {skew} minor versions "
-                            f"behind control plane {cp_version} (unsupported skew)",
-                            {
-                                "node": node_name,
-                                "kubelet_version": kubelet_version,
-                                "control_plane_version": cp_version,
-                                "version_skew": skew,
-                                "severity": "critical",
-                                "finding_type": FindingType.CURRENT_STATE,
-                                "impact": "Node may lose API compatibility at any time. "
-                                "Kubernetes only supports N-2 version skew.",
-                                "diagnostic_steps": [
-                                    "Update node group to use a supported Kubernetes version",
-                                    "Consider creating a new node group with updated AMI",
-                                ],
-                            },
-                        )
-                    elif skew == 2:
-                        self._add_finding(
-                            "node_issues",
-                            f"Node {node_name} kubelet {kubelet_version} at maximum allowed skew "
-                            f"from control plane {cp_version}",
-                            {
-                                "node": node_name,
-                                "kubelet_version": kubelet_version,
-                                "control_plane_version": cp_version,
-                                "version_skew": skew,
-                                "severity": "warning",
-                                "finding_type": FindingType.CURRENT_STATE,
-                                "impact": "Next control plane upgrade will make this node incompatible",
-                            },
-                        )
+                node_minor = int(version_match.group(1))
+                skew = cp_minor - node_minor
+
+                if skew > 2:
+                    self._add_finding(
+                        "node_issues",
+                        f"Node {node_name} kubelet {kubelet_version} is {skew} minor versions "
+                        f"behind control plane {cp_version} (unsupported skew)",
+                        {
+                            "node": node_name,
+                            "kubelet_version": kubelet_version,
+                            "control_plane_version": cp_version,
+                            "version_skew": skew,
+                            "severity": "critical",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "impact": "Node may lose API compatibility at any time. "
+                            "Kubernetes only supports N-2 version skew.",
+                            "diagnostic_steps": [
+                                "Update node group to use a supported Kubernetes version",
+                                "Consider creating a new node group with updated AMI",
+                            ],
+                        },
+                    )
+                elif skew == 2:
+                    self._add_finding(
+                        "node_issues",
+                        f"Node {node_name} kubelet {kubelet_version} at maximum allowed skew "
+                        f"from control plane {cp_version}",
+                        {
+                            "node": node_name,
+                            "kubelet_version": kubelet_version,
+                            "control_plane_version": cp_version,
+                            "version_skew": skew,
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "impact": "Next control plane upgrade will make this node incompatible",
+                        },
+                    )
+                elif skew == 1:
+                    one_minor_behind.append({"node": node_name, "kubelet_version": kubelet_version})
+
+            if one_minor_behind:
+                self._add_finding(
+                    "node_issues",
+                    f"{len(one_minor_behind)} nodes run kubelet 1.{cp_minor - 1} while the control plane "
+                    f"is {cp_version}; the node upgrade is one minor behind",
+                    {
+                        "nodes": [n["node"] for n in one_minor_behind][:20],
+                        "node_count": len(one_minor_behind),
+                        "control_plane_version": cp_version,
+                        "version_skew": 1,
+                        "severity": "info",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Supported today; becomes maximum skew after the next control plane upgrade",
+                        "diagnostic_steps": [
+                            f"aws eks update-nodegroup-version --cluster-name {self.cluster_name} "
+                            "--nodegroup-name <nodegroup> --kubernetes-version " + cp_version,
+                        ],
+                    },
+                )
+
+            # Node groups carry their own version, including groups scaled to zero
+            # that have no nodes to inspect.
+            success, response = self.safe_api_call(self.eks_client.list_nodegroups, clusterName=self.cluster_name)
+            nodegroup_names = response.get("nodegroups", []) if success and isinstance(response, dict) else []
+
+            for nodegroup_name in nodegroup_names:
+                success, detail = self.safe_api_call(
+                    self.eks_client.describe_nodegroup,
+                    clusterName=self.cluster_name,
+                    nodegroupName=nodegroup_name,
+                )
+                if not success or not isinstance(detail, dict):
+                    continue
+
+                nodegroup = detail.get("nodegroup", {})
+                ng_version = nodegroup.get("version", "")
+                match = re.search(r"1\.(\d+)", ng_version)
+                if not match:
+                    continue
+
+                ng_skew = cp_minor - int(match.group(1))
+                if ng_skew < 1:
+                    continue
+
+                severity = "critical" if ng_skew > 2 else ("warning" if ng_skew == 2 else "info")
+                desired = (nodegroup.get("scalingConfig") or {}).get("desiredSize")
+                self._add_finding(
+                    "node_issues",
+                    f"Node group {nodegroup_name} is at Kubernetes {ng_version}, {ng_skew} minor version(s) "
+                    f"behind control plane {cp_version} (desired size {desired})",
+                    {
+                        "nodegroup": nodegroup_name,
+                        "nodegroup_version": ng_version,
+                        "control_plane_version": cp_version,
+                        "version_skew": ng_skew,
+                        "desired_size": desired,
+                        "severity": severity,
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Scaling this node group up would add nodes at an outdated version",
+                        "diagnostic_steps": [
+                            f"aws eks update-nodegroup-version --cluster-name {self.cluster_name} "
+                            f"--nodegroup-name {nodegroup_name} --kubernetes-version {cp_version}",
+                            "Delete the node group if it is no longer used",
+                        ],
+                    },
+                )
 
         except Exception as e:
             self._add_error("analyze_version_skew", str(e))
@@ -14139,71 +14228,136 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_topology_spread", str(e))
 
+    _AMI_SSM_PATHS = {
+        "AL2023_x86_64_STANDARD": "amazon-linux-2023/x86_64/standard",
+        "AL2023_ARM_64_STANDARD": "amazon-linux-2023/arm64/standard",
+        "AL2023_x86_64_NVIDIA": "amazon-linux-2023/x86_64/nvidia",
+        "AL2023_x86_64_NEURON": "amazon-linux-2023/x86_64/neuron",
+        "AL2_x86_64": "amazon-linux-2",
+        "AL2_ARM_64": "amazon-linux-2-arm64",
+        "AL2_x86_64_GPU": "amazon-linux-2-gpu",
+        "BOTTLEROCKET_x86_64": "bottlerocket/x86_64",
+        "BOTTLEROCKET_ARM_64": "bottlerocket/arm64",
+    }
+
+    def _recommended_ami_release(self, k8s_version: str, ami_type: str) -> str | None:
+        """Return the AMI release version AWS currently recommends for this node group."""
+        path = self._AMI_SSM_PATHS.get(ami_type)
+        if not path or not k8s_version:
+            return None
+        name = f"/aws/service/eks/optimized-ami/{k8s_version}/{path}/recommended/release_version"
+        success, response = self.safe_api_call(self.ssm_client.get_parameter, Name=name)
+        if not success or not isinstance(response, dict):
+            return None
+        return (response.get("Parameter") or {}).get("Value")
+
+    @staticmethod
+    def _ami_release_date(release: str) -> datetime | None:
+        """Parse the trailing -YYYYMMDD build stamp of an EKS AMI release version."""
+        match = re.search(r"-(\d{8})$", release or "")
+        if not match:
+            return None
+        try:
+            return datetime.strptime(match.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
     def analyze_node_ami_age(self):
         """
-        Analyze node AMI age for security patch status.
+        Analyze node group AMI patch level.
 
-        Gap addressed: Old AMIs miss kernel patches and containerd fixes.
+        Gap addressed: old AMIs miss kernel patches and containerd fixes.
+
+        Node uptime says nothing about patch level: a node booted yesterday from
+        a six month old AMI is just as unpatched as one booted six months ago.
+        This compares each node group's releaseVersion against the release AWS
+        currently recommends for that Kubernetes version and AMI type.
 
         Detection:
-        - Nodes older than 90 days (warning)
-        - Nodes older than 180 days (critical)
+        - Node group AMI more than 180 days behind the recommended release (critical)
+        - Node group AMI behind the recommended release (warning)
+        - Custom AMIs, which cannot be assessed (info)
         """
-        self.progress.step("Analyzing node AMI age...")
+        self.progress.step("Analyzing node AMI patch level...")
         try:
-            nodes_json = self._get_cached_kubectl("kubectl get nodes -o json")
-            if not nodes_json:
+            success, response = self.safe_api_call(self.eks_client.list_nodegroups, clusterName=self.cluster_name)
+            if not success or not isinstance(response, dict):
                 return
-            nodes = json.loads(nodes_json).get("items", [])
+            nodegroup_names = response.get("nodegroups", [])
 
-            for node in nodes:
-                node_name = node.get("metadata", {}).get("name", "")
-                creation_ts = node.get("metadata", {}).get("creationTimestamp", "")
-                os_image = node.get("status", {}).get("nodeInfo", {}).get("osImage", "")
-                kubelet_version = node.get("status", {}).get("nodeInfo", {}).get("kubeletVersion", "")
+            recommended_cache: dict[tuple[str, str], str | None] = {}
 
-                if creation_ts:
-                    from dateutil import parser as date_parser
+            for nodegroup_name in nodegroup_names:
+                success, detail = self.safe_api_call(
+                    self.eks_client.describe_nodegroup,
+                    clusterName=self.cluster_name,
+                    nodegroupName=nodegroup_name,
+                )
+                if not success or not isinstance(detail, dict):
+                    continue
 
-                    created = date_parser.parse(creation_ts)
-                    if created.tzinfo is None:
-                        created = created.replace(tzinfo=timezone.utc)
-                    age_days = (TimezoneManager.now_utc() - created).days
+                nodegroup = detail.get("nodegroup", {})
+                release = nodegroup.get("releaseVersion", "")
+                k8s_version = nodegroup.get("version", "")
+                ami_type = nodegroup.get("amiType", "")
+                desired = (nodegroup.get("scalingConfig") or {}).get("desiredSize")
 
-                    if age_days > 180:
-                        self._add_finding(
-                            "node_issues",
-                            f"Node {node_name} is {age_days} days old — AMI likely missing critical security patches",
-                            {
-                                "node": node_name,
-                                "age_days": age_days,
-                                "os_image": os_image,
-                                "kubelet_version": kubelet_version,
-                                "created_at": creation_ts,
-                                "severity": "critical",
-                                "finding_type": FindingType.CURRENT_STATE,
-                                "impact": "Node may be vulnerable to known security issues",
-                                "diagnostic_steps": [
-                                    "Check node group AMI release version",
-                                    "Consider rolling replacement with updated AMI",
-                                    "Review AWS security bulletins for EKS AMI updates",
-                                ],
-                            },
-                        )
-                    elif age_days > 90:
-                        self._add_finding(
-                            "node_issues",
-                            f"Node {node_name} is {age_days} days old — AMI may be missing security patches",
-                            {
-                                "node": node_name,
-                                "age_days": age_days,
-                                "os_image": os_image,
-                                "kubelet_version": kubelet_version,
-                                "created_at": creation_ts,
-                                "severity": "warning",
-                                "finding_type": FindingType.CURRENT_STATE,
-                            },
-                        )
+                current_date = self._ami_release_date(release)
+                if current_date is None:
+                    self._add_finding(
+                        "node_issues",
+                        f"Node group {nodegroup_name} uses a custom AMI ({release or 'unknown'}); "
+                        "patch level cannot be assessed automatically",
+                        {
+                            "nodegroup": nodegroup_name,
+                            "ami_type": ami_type,
+                            "current_release": release,
+                            "desired_size": desired,
+                            "severity": "info",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "impact": "Patch status of custom AMIs must be tracked outside this tool",
+                        },
+                    )
+                    continue
+
+                cache_key = (k8s_version, ami_type)
+                if cache_key not in recommended_cache:
+                    recommended_cache[cache_key] = self._recommended_ami_release(k8s_version, ami_type)
+                recommended = recommended_cache[cache_key]
+
+                if not recommended or recommended == release:
+                    continue
+
+                recommended_date = self._ami_release_date(recommended)
+                if recommended_date is None or recommended_date <= current_date:
+                    continue
+
+                days_behind = (recommended_date - current_date).days
+                severity = "critical" if days_behind > 180 else "warning"
+
+                self._add_finding(
+                    "node_issues",
+                    f"Node group {nodegroup_name} runs AMI release {release}; the recommended release for "
+                    f"Kubernetes {k8s_version} is {recommended} ({days_behind} days newer)",
+                    {
+                        "nodegroup": nodegroup_name,
+                        "ami_type": ami_type,
+                        "kubernetes_version": k8s_version,
+                        "current_release": release,
+                        "recommended_release": recommended,
+                        "days_behind": days_behind,
+                        "desired_size": desired,
+                        "severity": severity,
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Nodes are missing kernel, containerd, and kubelet patches from newer AMI builds",
+                        "diagnostic_steps": [
+                            f"aws eks describe-nodegroup --cluster-name {self.cluster_name} "
+                            f"--nodegroup-name {nodegroup_name} --query 'nodegroup.releaseVersion'",
+                            f"aws eks update-nodegroup-version --cluster-name {self.cluster_name} "
+                            f"--nodegroup-name {nodegroup_name}",
+                        ],
+                    },
+                )
 
         except Exception as e:
             self._add_error("analyze_node_ami_age", str(e))

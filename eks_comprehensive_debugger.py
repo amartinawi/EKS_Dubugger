@@ -2750,32 +2750,31 @@ class ExecutiveSummaryGenerator:
         ]
         ordered.sort(key=lambda ci: severity_rank.get(ci[1].get("details", {}).get("severity", "info"), 3))
 
-        for category, item in ordered:
-            if True:
-                summary = item.get("summary", "").lower()
-                details = item.get("details", {})
+        for _category, item in ordered:
+            summary = item.get("summary", "").lower()
+            details = item.get("details", {})
 
-                for pattern_key, pattern_info in quick_win_patterns.items():
-                    for keyword in pattern_info["keywords"]:
-                        if keyword in summary and pattern_key not in detected_issues:
-                            detected_issues.add(pattern_key)
+            for pattern_key, pattern_info in quick_win_patterns.items():
+                for keyword in pattern_info["keywords"]:
+                    if keyword in summary and pattern_key not in detected_issues:
+                        detected_issues.add(pattern_key)
 
-                            # Extract affected resources
-                            affected_pod = details.get("pod", "")
-                            affected_namespace = details.get("namespace", "")
+                        # Extract affected resources
+                        affected_pod = details.get("pod", "")
+                        affected_namespace = details.get("namespace", "")
 
-                            quick_wins.append(
-                                {
-                                    "title": pattern_info["title"],
-                                    "solution": pattern_info["solution"],
-                                    "time": pattern_info["time"],
-                                    "category": pattern_info["category"],
-                                    "affected_pod": affected_pod,
-                                    "affected_namespace": affected_namespace,
-                                    "evidence": item.get("summary", ""),
-                                }
-                            )
-                            break
+                        quick_wins.append(
+                            {
+                                "title": pattern_info["title"],
+                                "solution": pattern_info["solution"],
+                                "time": pattern_info["time"],
+                                "category": pattern_info["category"],
+                                "affected_pod": affected_pod,
+                                "affected_namespace": affected_namespace,
+                                "evidence": item.get("summary", ""),
+                            }
+                        )
+                        break
 
         # Also check recommendations for quick wins
         for rec in recommendations:

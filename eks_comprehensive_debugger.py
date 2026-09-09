@@ -33,6 +33,11 @@ import boto3
 import structlog
 from botocore.exceptions import BotoCoreError, ClientError, NoRegionError, PartialCredentialsError, ProfileNotFound
 from dateutil import parser as date_parser
+
+try:
+    from croniter import croniter
+except ImportError:  # pragma: no cover - optional dependency
+    croniter = None
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 # Configure structlog for structured logging (console output suppressed by default)
@@ -13491,6 +13496,81 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_init_container_failures", str(e))
 
+    def analyze_missing_pdbs(self):
+        """
+        Flag Deployments and StatefulSets that have no PodDisruptionBudget.
+
+        Gap addressed: analyze_pdb_violations only inspects PDBs that exist. A
+        workload with many replicas and no PDB at all can lose every replica at
+        once during a node drain or a managed node group upgrade.
+
+        Detection:
+        - Deployment or StatefulSet with more than one replica outside system
+          namespaces and no PDB whose selector matches its pod labels
+        """
+        self.progress.step("Analyzing workloads without PodDisruptionBudgets...")
+        try:
+
+            def _items(cmd: str) -> list:
+                raw = self._get_cached_kubectl(cmd)
+                try:
+                    return json.loads(raw).get("items", []) if raw else []
+                except (ValueError, AttributeError):
+                    return []
+
+            scope = f"-n {self.namespace}" if self.namespace else "--all-namespaces"
+            pdbs = _items(f"kubectl get pdb {scope} -o json")
+            workloads = [("Deployment", d) for d in _items(f"kubectl get deploy {scope} -o json")]
+            workloads += [("StatefulSet", w) for w in _items(f"kubectl get statefulset {scope} -o json")]
+
+            for kind, workload in workloads:
+                namespace = workload["metadata"]["namespace"]
+                name = workload["metadata"]["name"]
+                replicas = workload.get("spec", {}).get("replicas") or 0
+
+                if namespace in SYSTEM_NAMESPACES or replicas < 2:
+                    continue
+
+                labels = workload.get("spec", {}).get("template", {}).get("metadata", {}).get("labels") or {}
+                covered = False
+                for pdb in pdbs:
+                    if pdb["metadata"]["namespace"] != namespace:
+                        continue
+                    match_labels = (pdb.get("spec", {}).get("selector") or {}).get("matchLabels") or {}
+                    if match_labels and match_labels.items() <= labels.items():
+                        covered = True
+                        break
+
+                if covered:
+                    continue
+
+                self._add_finding(
+                    "scheduling_failures",
+                    f"{kind} {namespace}/{name} ({replicas} replicas) has no PodDisruptionBudget",
+                    {
+                        "workload": name,
+                        "kind": kind,
+                        "namespace": namespace,
+                        "replicas": replicas,
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "A node drain or managed node group upgrade can remove all replicas at once",
+                        "recommendation": (
+                            f"Create a PodDisruptionBudget for {kind.lower()}/{name} with minAvailable set to "
+                            f"at least half of {replicas}"
+                        ),
+                        "diagnostic_steps": [
+                            f"kubectl get pdb -n {namespace}",
+                            f"kubectl get {kind.lower()} {name} -n {namespace} "
+                            "-o jsonpath='{.spec.template.metadata.labels}'",
+                        ],
+                        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managed-node-update-behavior.html",
+                    },
+                )
+
+        except Exception as e:
+            self._add_error("analyze_missing_pdbs", f"Unexpected error: {e}")
+
     def analyze_pdb_violations(self):
         """
         Analyze Pod Disruption Budget violations.
@@ -20112,6 +20192,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_deployment_rollouts", str(e))
             self.progress.warning(f"Deployment rollout analysis failed: {e}")
 
+    @staticmethod
+    def _cron_period_seconds(schedule: str) -> float | None:
+        """Return the interval between two consecutive runs of a cron schedule."""
+        if croniter is None or not schedule:
+            return None
+        try:
+            iterator = croniter(schedule, datetime.now(timezone.utc))
+            first = iterator.get_next(datetime)
+            second = iterator.get_next(datetime)
+            return (second - first).total_seconds()
+        except (ValueError, KeyError, AttributeError):
+            return None
+
     def analyze_jobs_cronjobs(self):
         """
         Analyze Job and CronJob failures
@@ -20197,6 +20290,24 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             if output and "not found" not in output.lower():
                 cronjobs = json.loads(output)
 
+                # Index active jobs by the CronJob that owns them so schedule
+                # analysis can see how long the current run has been going
+                cronjob_owned_jobs: dict[tuple[str, str], list] = {}
+                jobs_output = self.safe_kubectl_call(
+                    f"kubectl get jobs -n {self.namespace} -o json"
+                    if self.namespace
+                    else "kubectl get jobs --all-namespaces -o json"
+                )
+                if jobs_output:
+                    try:
+                        for job in json.loads(jobs_output).get("items", []):
+                            for owner in job["metadata"].get("ownerReferences") or []:
+                                if owner.get("kind") == "CronJob":
+                                    key = (job["metadata"]["namespace"], owner.get("name", ""))
+                                    cronjob_owned_jobs.setdefault(key, []).append(job)
+                    except (ValueError, KeyError):
+                        pass
+
                 for cj in cronjobs.get("items", []):
                     cj_name = cj["metadata"]["name"]
                     namespace = cj["metadata"]["namespace"]
@@ -20211,34 +20322,73 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if not suspended and last_schedule:
                         try:
-                            from dateutil import parser as date_parser
-
                             last_schedule_dt = date_parser.parse(last_schedule)
-                            time_since_schedule = datetime.now(timezone.utc) - last_schedule_dt
+                            if last_schedule_dt.tzinfo is None:
+                                last_schedule_dt = last_schedule_dt.replace(tzinfo=timezone.utc)
+                            now = datetime.now(timezone.utc)
+                            time_since_schedule = now - last_schedule_dt
+                            period = self._cron_period_seconds(schedule)
+                            concurrency = spec.get("concurrencyPolicy", "Allow")
 
-                            # If last schedule was more than 2x the expected interval, flag it
-                            # This is a heuristic - could be improved with cron parsing
-                            if time_since_schedule.total_seconds() > 3600:  # > 1 hour
+                            # Longest running job owned by this CronJob
+                            running_hours = None
+                            for job in cronjob_owned_jobs.get((namespace, cj_name), []):
+                                start = job.get("status", {}).get("startTime")
+                                if not start or job.get("status", {}).get("completionTime"):
+                                    continue
+                                start_dt = date_parser.parse(start)
+                                if start_dt.tzinfo is None:
+                                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+                                hours = (now - start_dt).total_seconds() / 3600
+                                running_hours = hours if running_hours is None else max(running_hours, hours)
+
+                            details = {
+                                "cronjob": cj_name,
+                                "namespace": namespace,
+                                "schedule": schedule,
+                                "last_schedule": last_schedule,
+                                "last_successful": last_successful,
+                                "suspended": suspended,
+                                "concurrency_policy": concurrency,
+                                "period_hours": round(period / 3600, 2) if period else None,
+                                "running_hours": round(running_hours, 1) if running_hours else None,
+                                "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
+                            }
+
+                            if period and running_hours is not None and running_hours * 3600 > period:
+                                details["root_causes"] = [
+                                    "Job runtime exceeds the schedule period, so later runs cannot start on time",
+                                ]
+                                if concurrency == "Forbid":
+                                    details["root_causes"].append(
+                                        "concurrencyPolicy Forbid skips every run while the previous job is active"
+                                    )
+                                self._add_finding_dict(
+                                    "pod_errors",
+                                    {
+                                        "summary": (
+                                            f"CronJob {namespace}/{cj_name} has a job running for "
+                                            f"{running_hours:.0f}h, longer than its {period / 3600:.0f}h schedule "
+                                            f"period (concurrencyPolicy {concurrency})"
+                                        ),
+                                        "details": details,
+                                    },
+                                )
+                            elif (period and time_since_schedule.total_seconds() > 2 * period) or (
+                                period is None and time_since_schedule.total_seconds() > 3600
+                            ):
+                                details["root_causes"] = [
+                                    "CronJob controller issues",
+                                    "Previous job still running",
+                                    "Concurrency policy blocking",
+                                    "startingDeadlineSeconds exceeded",
+                                ]
                                 self._add_finding_dict(
                                     "pod_errors",
                                     {
                                         "summary": f"CronJob {namespace}/{cj_name} may have missed schedules",
-                                        "details": {
-                                            "cronjob": cj_name,
-                                            "namespace": namespace,
-                                            "schedule": schedule,
-                                            "last_schedule": last_schedule,
-                                            "last_successful": last_successful,
-                                            "suspended": suspended,
-                                            "severity": "warning",
-                                            "finding_type": FindingType.CURRENT_STATE,
-                                            "root_causes": [
-                                                "CronJob controller issues",
-                                                "Previous job still running",
-                                                "Concurrency policy blocking",
-                                                "startingDeadlineSeconds exceeded",
-                                            ],
-                                        },
+                                        "details": details,
                                     },
                                 )
                         except Exception:
@@ -21598,30 +21748,40 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             pods_without_limits = []
             pods_without_requests = []
             qos_breakdown = {"Guaranteed": 0, "Burstable": 0, "BestEffort": 0}
+            system_pods_excluded = 0
 
             for pod in pods.get("items", []):
                 pod_name = pod["metadata"]["name"]
                 namespace = pod["metadata"]["namespace"]
                 spec = pod.get("spec", {})
 
+                # System pods are managed by AWS and their sizing is not the
+                # operator's to change, so counting them makes the number useless
+                if namespace in SYSTEM_NAMESPACES:
+                    system_pods_excluded += 1
+                    continue
+
                 has_limits = False
                 has_requests = False
                 all_containers_have_limits = True
                 all_containers_have_requests = True
 
-                containers = spec.get("containers", []) + spec.get("initContainers", [])
+                # initContainers run to completion and do not hold capacity for
+                # the life of the pod, so they are not part of this count
+                containers = spec.get("containers", [])
 
                 for container in containers:
                     resources = container.get("resources", {})
                     limits = resources.get("limits", {})
                     requests = resources.get("requests", {})
 
-                    if limits:
+                    # A cpu-only limit still leaves memory unbounded
+                    if limits.get("cpu") and limits.get("memory"):
                         has_limits = True
                     else:
                         all_containers_have_limits = False
 
-                    if requests:
+                    if requests.get("cpu") and requests.get("memory"):
                         has_requests = True
                     else:
                         all_containers_have_requests = False
@@ -21665,9 +21825,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self._add_finding_dict(
                     "resource_quota_exceeded",
                     {
-                        "summary": f"{len(pods_without_limits)} pods without resource limits",
+                        "summary": f"{len(pods_without_limits)} pods without memory or CPU limits",
                         "details": {
                             "count": len(pods_without_limits),
+                            "pod_count": len(pods_without_limits),
+                            "system_namespace_pods_excluded": system_pods_excluded,
                             "examples": pods_without_limits[:10],
                             "severity": "warning",
                             "finding_type": FindingType.CURRENT_STATE,
@@ -21682,9 +21844,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self._add_finding_dict(
                     "resource_quota_exceeded",
                     {
-                        "summary": f"{len(pods_without_requests)} pods without resource requests",
+                        "summary": f"{len(pods_without_requests)} pods without memory or CPU requests",
                         "details": {
                             "count": len(pods_without_requests),
+                            "pod_count": len(pods_without_requests),
+                            "system_namespace_pods_excluded": system_pods_excluded,
                             "examples": pods_without_requests[:10],
                             "severity": "info",
                             "finding_type": FindingType.CURRENT_STATE,
@@ -21745,7 +21909,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             ClusterNotFoundError: If the cluster doesn't exist.
             KubectlNotAvailableError: If kubectl is not in PATH.
         """
-        self.progress.set_total_steps(76)
+        self.progress.set_total_steps(77)
 
         # Step 1-3: Basic setup
         try:
@@ -21856,6 +22020,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             # HIGH PRIORITY
             self.analyze_init_container_failures,
             self.analyze_pdb_violations,
+            self.analyze_missing_pdbs,
             self.analyze_sidecar_health,
             self.analyze_node_resource_saturation,
             self.analyze_version_skew,

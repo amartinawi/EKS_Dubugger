@@ -303,17 +303,39 @@ class IncrementalCache:
         except (OSError, TypeError):
             return False
 
+    # Numbers that are counters rather than identity. Normalising these keeps a
+    # growing restart count from looking like one issue resolved and one new on
+    # every run, while "Error 1" and "Error 2" stay distinct findings.
+    _COUNTER_PATTERNS = (
+        (re.compile(r"(count:\s*)\d+", re.IGNORECASE), r"\1N"),
+        (
+            re.compile(
+                r"\b\d+(\s+(?:times|restarts|days|hours|minutes|pods|replicas|nodes|containers|issues))\b",
+                re.IGNORECASE,
+            ),
+            r"N\1",
+        ),
+    )
+
+    @classmethod
+    def _delta_key(cls, summary: str) -> str:
+        """Normalise counters out of a summary so the delta tracks real changes."""
+        key = summary or ""
+        for pattern, replacement in cls._COUNTER_PATTERNS:
+            key = pattern.sub(replacement, key)
+        return key
+
     def compute_delta(self, current: dict, previous: dict | None) -> dict:
         if not previous:
             return {"is_first_run": True, "new_issues": 0, "resolved_issues": 0}
         current_summaries = set()
         for items in current.get("findings", {}).values():
             for item in items:
-                current_summaries.add(item.get("summary", ""))
+                current_summaries.add(self._delta_key(item.get("summary", "")))
         previous_summaries = set()
         for items in previous.get("findings", {}).values():
             for item in items:
-                previous_summaries.add(item.get("summary", ""))
+                previous_summaries.add(self._delta_key(item.get("summary", "")))
         new = current_summaries - previous_summaries
         resolved = previous_summaries - current_summaries
         return {
@@ -1997,6 +2019,8 @@ class LLMJSONOutputFormatter(OutputFormatter):
             "correlations_by_confidence_tier": correlations_by_tier,
             "timeline": timeline,
             "potential_root_causes": potential_root_causes,
+            "errors": results.get("errors", []),
+            "delta": results.get("delta"),
             "recommendations": [
                 {
                     "title": rec.get("title"),
@@ -3005,6 +3029,40 @@ class HTMLOutputFormatter(OutputFormatter):
                 html_parts.append(f"<p>{p}</p>")
 
         return "\n".join(html_parts)
+
+    def _generate_delta_html(self, delta: dict | None) -> str:
+        """Render what changed since the previous run, if incremental data exists."""
+        if not delta or delta.get("is_first_run"):
+            return ""
+
+        new_items = delta.get("new_issue_examples") or delta.get("new") or []
+        resolved_items = delta.get("resolved_issue_examples") or delta.get("resolved") or []
+        new_count = delta.get("new_issues", len(new_items))
+        resolved_count = delta.get("resolved_issues", len(resolved_items))
+
+        if not new_count and not resolved_count:
+            return ""
+
+        def _list(items):
+            if not items:
+                return "<li>None</li>"
+            return "".join(f"<li>{self._escape_html(str(item))[:160]}</li>" for item in items[:10])
+
+        return f"""
+            <div class="section" id="changes-since-last-run">
+                <div class="section-header">
+                    <span>🔁 Changes Since Last Run</span>
+                </div>
+                <div class="section-content">
+                    <p><strong>{new_count}</strong> new, <strong>{resolved_count}</strong> resolved
+                       since the previous analysis of this cluster.</p>
+                    <h4>New</h4>
+                    <ul>{_list(new_items)}</ul>
+                    <h4>Resolved</h4>
+                    <ul>{_list(resolved_items)}</ul>
+                </div>
+            </div>
+        """
 
     def _generate_executive_summary_html(self, exec_summary: dict, cluster_stats: dict | None = None) -> str:
         """Generate HTML for the Executive Summary section with Phase 1 & 2 enhancements"""
@@ -7265,6 +7323,9 @@ class HTMLOutputFormatter(OutputFormatter):
 
         html += self._generate_executive_summary_html(exec_summary, cluster_stats)
 
+        # Changes since the previous run for this cluster
+        html += self._generate_delta_html(results.get("delta"))
+
         # What Happened section (right after Executive Summary)
         html += self._generate_what_happened_html(results)
 
@@ -9445,6 +9506,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         namespace: str | None = None,
         progress: ProgressTracker | None = None,
         kube_context: str | None = None,
+        parallel: bool = True,
+        max_findings: int = MAX_FINDINGS_PER_CATEGORY,
+        enable_cache: bool = True,
+        enable_incremental: bool = True,
         pagination_limit: int = 1000,
         enable_node_diagnostics: bool = False,
         ssm_timeout: int = NodeDiagnosticConfig.DEFAULT_SSM_TIMEOUT,
@@ -9491,10 +9556,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.namespace = namespace
         self.progress = progress or ProgressTracker()
         self.kube_context = kube_context
-        self.parallel = True
-        self.max_findings = MAX_FINDINGS_PER_CATEGORY
-        self.enable_cache = True
-        self.enable_incremental = True
+        self.parallel = parallel
+        self.max_findings = max_findings
+        self.enable_cache = enable_cache
+        self.enable_incremental = enable_incremental
         self.pagination_limit = pagination_limit
 
         # Node OS diagnostics configuration (Phase 1)
@@ -23162,6 +23227,12 @@ Output:
     - {cluster}-eks-report-{timestamp}.html      - Interactive HTML dashboard
     - {cluster}-eks-findings-{timestamp}.json    - LLM-ready JSON for AI analysis
 
+Exit codes:
+  0  Analysis completed, no issues found
+  1  Analysis completed, issues found
+  2  Fatal error, no usable results
+  3  Analysis completed with issues, but some analyzers failed (partial results)
+
 Environment Variables:
   EKS_DEBUGGER_PROFILE       - AWS profile
   EKS_DEBUGGER_REGION        - AWS region
@@ -23508,16 +23579,20 @@ def get_exit_code(results):
     Determine exit code based on results
 
     0 = success, no issues
-    1 = success, but issues found
-    2 = error during analysis
+    1 = success, issues found
+    2 = fatal error, no usable results
+    3 = partial results: analysis completed but some analyzers failed
+
+    A failed analyzer used to share exit code 2 with an authentication
+    failure, so CI could not tell partial results from no results.
     """
-    if results.get("errors"):
-        # Check if errors are critical
+    errors = results.get("errors") or []
+    summary = results.get("summary")
+    if not isinstance(summary, dict):
         return 2
-    elif results["summary"]["total_issues"] > 0:
-        return 1
-    else:
-        return 0
+    if errors:
+        return 3
+    return 1 if summary.get("total_issues", 0) > 0 else 0
 
 
 # === SECTION 8: MAIN ENTRY POINT ===
@@ -23527,6 +23602,15 @@ def main():
     """Main entry point"""
     parser = create_argument_parser()
     args = parser.parse_args()
+
+    # A --config file supplies defaults; anything given on the command line wins
+    if args.config:
+        file_config = ConfigLoader.load(args.config)
+        known = vars(args)
+        overrides = {k: v for k, v in file_config.items() if k in known}
+        if overrides:
+            parser.set_defaults(**overrides)
+            args = parser.parse_args()
 
     # Create progress tracker
     progress = ProgressTracker(verbose=args.verbose, quiet=args.quiet)
@@ -23565,6 +23649,10 @@ def main():
             namespace=args.namespace,
             progress=progress,
             kube_context=args.kube_context,
+            parallel=not args.no_parallel,
+            max_findings=args.max_findings,
+            enable_cache=not args.no_cache,
+            enable_incremental=not args.no_incremental,
             enable_node_diagnostics=args.enable_node_diagnostics,
             ssm_timeout=args.ssm_timeout,
             ssm_mode=args.ssm_mode,

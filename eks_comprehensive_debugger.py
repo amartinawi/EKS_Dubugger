@@ -1903,7 +1903,9 @@ class LLMJSONOutputFormatter(OutputFormatter):
             )
 
         for corr in correlations:
-            if corr.get("root_cause"):
+            # A low-confidence correlation is context, not a root cause. Promoting
+            # one made an informational finding the headline of the report.
+            if corr.get("root_cause") and corr.get("confidence_tier", "low") in ("high", "medium"):
                 potential_root_causes.append(
                     {
                         "correlation_type": corr.get("correlation_type"),
@@ -14998,6 +15000,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_volume_snapshots", str(e))
 
+    def _actionable(self, category: str) -> list:
+        """Return only findings in a category that are warning level or worse.
+
+        Correlations assert a root cause. An informational observation, such as a
+        count of pods using the default ndots setting, is not evidence of one.
+        """
+        return [
+            f
+            for f in self.findings.get(category, [])
+            if f.get("details", {}).get("severity", "info") in ("critical", "warning")
+        ]
+
     def correlate_findings(self):
         """
         Smart correlation of findings across data sources.
@@ -15039,7 +15053,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         timeline_events.sort(key=lambda x: x["timestamp"])
 
         # Correlation Rule 1: Node Pressure → Pod Evictions
-        if self.findings["memory_pressure"] or self.findings["disk_pressure"]:
+        if self._actionable("memory_pressure") or self._actionable("disk_pressure"):
             pressure_type = "memory" if self.findings["memory_pressure"] else "disk"
             affected_nodes = set()
 
@@ -15084,7 +15098,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 )
 
         # Correlation Rule 2: CNI Issues → Network Failures
-        if self.findings["network_issues"]:
+        if self._actionable("network_issues"):
             cni_issues = [
                 f
                 for f in self.findings["network_issues"]
@@ -15123,7 +15137,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 )
 
         # Correlation Rule 3: OOMKilled → Memory pressure or low limits
-        if self.findings["oom_killed"]:
+        if self._actionable("oom_killed"):
             oom_pods = self.findings["oom_killed"]
             oom_times = []
 
@@ -15158,7 +15172,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         # Correlation Rule 4: Control Plane Errors → API issues
-        if self.findings["control_plane_issues"]:
+        if self._actionable("control_plane_issues"):
             critical_cp = [
                 f for f in self.findings["control_plane_issues"] if f.get("details", {}).get("severity") == "critical"
             ]
@@ -15192,7 +15206,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 )
 
         # Correlation Rule 5: Image Pull Failures → Registry/Auth issues
-        if self.findings["image_pull_failures"]:
+        if self._actionable("image_pull_failures"):
             image_failures = self.findings["image_pull_failures"]
             ecr_failures = [
                 f
@@ -15237,7 +15251,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         # Correlation Rule 6: Scheduling Failures → Resource constraints
-        if self.findings["scheduling_failures"]:
+        if self._actionable("scheduling_failures"):
             sched_failures = self.findings["scheduling_failures"]
             resource_failures = [f for f in sched_failures if "insufficient" in f.get("summary", "").lower()]
             affinity_failures = [f for f in sched_failures if "affinity" in f.get("summary", "").lower()]
@@ -15274,12 +15288,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         # Correlation Rule 7: DNS Issues → CoreDNS health
-        if self.findings["dns_issues"]:
-            dns_failures = self.findings["dns_issues"]
+        dns_failures = self._actionable("dns_issues")
+        coredns_issues = [f for f in dns_failures if "coredns" in f.get("summary", "").lower()]
 
-            # Check if CoreDNS is also unhealthy
-            coredns_issues = [f for f in dns_failures if "coredns" in f.get("summary", "").lower()]
-
+        # Naming CoreDNS as the root cause requires evidence about CoreDNS itself
+        if dns_failures and coredns_issues:
             dns_times = []
             for f in dns_failures:
                 ts = self._extract_timestamp(f.get("details", {}))
@@ -22472,6 +22485,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         """
         recommendations = []
 
+        def priority_for(findings_list):
+            """Priority follows the strongest evidence in the category.
+
+            A static per-category literal made "Resolve Node Health Issues"
+            critical even when every node finding was informational.
+            """
+            severities = {f.get("details", {}).get("severity", "info") for f in findings_list}
+            if "critical" in severities:
+                return "critical"
+            if "warning" in severities:
+                return "high"
+            return "low"
+
         # Helper function to extract evidence from findings
         def extract_evidence(findings_list, max_examples=3):
             """Extract evidence summary from findings list"""
@@ -22531,7 +22557,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Memory Pressure Issues",
                     "category": "memory_pressure",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("memory_pressure", [])),
                     "action": "Increase pod memory limits, scale up node instance types, or enable cluster autoscaler",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-memory-pressure",
                     "evidence": evidence,
@@ -22551,7 +22577,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Disk Pressure Issues",
                     "category": "disk_pressure",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("disk_pressure", [])),
                     "action": "Increase EBS volume size, configure kubelet garbage collection, or add ephemeral storage limits",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-disk-pressure",
                     "evidence": evidence,
@@ -22571,7 +22597,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Fix Out of Memory Kills",
                     "category": "oom_killed",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("oom_killed", [])),
                     "action": "Set appropriate memory requests/limits and review application memory usage",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/best-practices/windows-oom.html",
                     "evidence": evidence,
@@ -22591,7 +22617,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Pod Scheduling Failures",
                     "category": "scheduling_failures",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("scheduling_failures", [])),
                     "action": "Review resource requests, node capacity, node selectors, and taints/tolerations",
                     "aws_doc": "https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/",
                     "evidence": evidence,
@@ -22611,7 +22637,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Fix Network Issues",
                     "category": "network_issues",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("network_issues", [])),
                     "action": "Check VPC-CNI health, security groups, and network policies",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html#troubleshoot-network",
                     "evidence": evidence,
@@ -22631,7 +22657,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Image Pull Failures",
                     "category": "image_pull_failures",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("image_pull_failures", [])),
                     "action": "Verify image exists, check registry authentication, and review pull secrets",
                     "aws_doc": "https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/",
                     "evidence": evidence,
@@ -22651,7 +22677,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Fix PVC and Storage Issues",
                     "category": "pvc_issues",
-                    "priority": "medium",
+                    "priority": priority_for(self.findings.get("pvc_issues", [])),
                     "action": "Check storage class, EBS CSI driver, and volume availability zones",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html",
                     "evidence": evidence,
@@ -22671,7 +22697,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Update or Fix EKS Addons",
                     "category": "addon_issues",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("addon_issues", [])),
                     "action": "Update addons to latest compatible version or troubleshoot specific addon issues",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html",
                     "evidence": evidence,
@@ -22691,7 +22717,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Investigate Control Plane Errors",
                     "category": "control_plane_issues",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("control_plane_issues", [])),
                     "action": "Review CloudWatch control plane logs, check API server latency, and verify IAM authenticator configuration",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
                     "evidence": evidence,
@@ -22711,7 +22737,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Fix RBAC Authorization Issues",
                     "category": "rbac_issues",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("rbac_issues", [])),
                     "action": "Review RoleBindings, ClusterRoleBindings, and service account permissions",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/access-entries.html",
                     "evidence": evidence,
@@ -22731,7 +22757,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Review privileged and host-mounted workloads",
                     "category": "workload_security",
-                    "priority": "medium",
+                    "priority": priority_for(self.findings.get("workload_security", [])),
                     "action": (
                         "Confirm each privileged container and hostPath mount is required. Keep node agents in a "
                         "dedicated namespace and enforce Pod Security Admission 'restricted' elsewhere"
@@ -22753,7 +22779,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Node Health Issues",
                     "category": "node_issues",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_issues", [])),
                     "action": "Check EC2 instance health, kubelet logs, and node capacity",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managed-node-groups.html",
                     "evidence": evidence,
@@ -22773,7 +22799,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Fix CoreDNS Issues",
                     "category": "dns_issues",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("dns_issues", [])),
                     "action": "Check CoreDNS pod health, verify ConfigMap settings, and review DNS throttling",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/coredns.html",
                     "evidence": evidence,
@@ -22793,7 +22819,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Review Resource Quotas",
                     "category": "resource_quota_exceeded",
-                    "priority": "medium",
+                    "priority": priority_for(self.findings.get("resource_quota_exceeded", [])),
                     "action": "Increase quota limits, optimize resource requests, or implement namespace isolation",
                     "aws_doc": "https://kubernetes.io/docs/concepts/policy/resource-quotas/",
                     "evidence": evidence,
@@ -22813,7 +22839,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Investigate Pod Errors",
                     "category": "pod_errors",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("pod_errors", [])),
                     "action": "Review pod events, container logs, and resource constraints",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                     "evidence": evidence,
@@ -22833,7 +22859,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve iptables Firewall Issues on Nodes",
                     "category": "node_os_iptables",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_iptables", [])),
                     "action": "Remove iptables DROP rules blocking DNS (port 53), restart kube-proxy if KUBE-SERVICES chain is missing",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-dns-failures",
                     "evidence": evidence,
@@ -22852,7 +22878,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Conntrack Table Saturation on Nodes",
                     "category": "node_os_conntrack",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_conntrack", [])),
                     "action": "Increase nf_conntrack_max or upgrade to larger instance type with higher conntrack allowance",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-conntrack-exhaustion",
                     "evidence": evidence,
@@ -22871,7 +22897,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Investigate Kernel-Level Errors Detected via dmesg",
                     "category": "node_os_dmesg",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_dmesg", [])),
                     "action": "Address kernel OOM kills, hardware errors, or disk I/O issues. May require node replacement for hardware failures.",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-oomkilled-pods",
                     "evidence": evidence,
@@ -22890,7 +22916,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Kubelet Journal Errors on Nodes",
                     "category": "node_os_kubelet",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("node_os_kubelet", [])),
                     "action": "Address PLEG failures, certificate expiry, or API server connectivity issues. Restart kubelet or drain node if persistent.",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-node-status-ready",
                     "evidence": evidence,
@@ -22909,7 +22935,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve containerd Runtime Issues on Nodes",
                     "category": "node_os_containerd",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("node_os_containerd", [])),
                     "action": "Address image pull failures, disk space, or runtime unavailability. Clean unused images or increase disk size.",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/eks-optimized-ami.html",
                     "evidence": evidence,
@@ -22928,7 +22954,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve VPC CNI IP Allocation Failures",
                     "category": "node_os_ipamd",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_ipamd", [])),
                     "action": "Check subnet IP availability, enable prefix delegation, or add secondary CIDR ranges",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/prefix-delegation.html",
                     "evidence": evidence,
@@ -22947,7 +22973,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Kernel Route Table Issues on Nodes",
                     "category": "node_os_routes",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("node_os_routes", [])),
                     "action": "Remove blackhole routes, ensure default route exists, restart VPC CNI for stale pod routes",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html",
                     "evidence": evidence,
@@ -22966,7 +22992,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve CNI Configuration Issues on Nodes",
                     "category": "node_os_cni_config",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_cni_config", [])),
                     "action": "Reinstall VPC CNI, fix MTU settings, resolve conflicting CNI configurations",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html",
                     "evidence": evidence,
@@ -22985,7 +23011,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Optimize Kernel Parameters on Nodes",
                     "category": "node_os_sysctl",
-                    "priority": "warning",
+                    "priority": priority_for(self.findings.get("node_os_sysctl", [])),
                     "action": "Adjust nf_conntrack_max, rp_filter, ip_local_port_range, and other kernel parameters to EKS best practices",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                     "evidence": evidence,
@@ -23004,7 +23030,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Network Interface Issues on Nodes",
                     "category": "node_os_eni",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_eni", [])),
                     "action": "Address AWS-level conntrack/bandwidth allowance exceeded or DOWN interfaces. May require instance type upgrade or node replacement.",
                     "aws_doc": "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-network-interface-traffic.html",
                     "evidence": evidence,
@@ -23019,11 +23045,20 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         # Correlation-based recommendations (v2.0.0)
         if self.correlations:
             for corr in self.correlations:
+                tier = corr.get("confidence_tier", "low")
+                # Low-confidence correlations do not earn a recommendation slot
+                if tier == "low":
+                    continue
+                if tier == "high":
+                    corr_priority = "critical" if corr.get("severity") == "critical" else "high"
+                else:
+                    corr_priority = "medium"
                 recommendations.append(
                     {
                         "title": f"Root Cause: {corr['root_cause']}",
                         "category": corr["correlation_type"],
-                        "priority": "critical" if corr.get("severity") == "critical" else "high",
+                        "priority": corr_priority,
+                        "confidence_tier": tier,
                         "action": corr["recommendation"],
                         "aws_doc": corr.get("aws_doc", ""),
                         "evidence": {
@@ -23040,7 +23075,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
         def sort_key(rec):
-            is_corr = 0 if rec.get("is_correlation") else 1  # Correlations first
+            # Only a high-confidence correlation earns the top slot
+            is_corr = 0 if rec.get("is_correlation") and rec.get("confidence_tier") == "high" else 1
             priority = priority_order.get(rec.get("priority", "info"), 4)
             critical_count = (
                 rec.get("evidence", {}).get("critical_count", 0) if isinstance(rec.get("evidence"), dict) else 0

@@ -73,6 +73,7 @@ else:
 log = structlog.get_logger()
 
 VERSION = "5.0.0"
+DEFAULT_REPORT_CLUSTER_NAME = "eks-cluster"  # filename prefix when no cluster name is known
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -22644,7 +22645,9 @@ def validate_and_parse_dates(args) -> tuple[datetime, datetime]:
 # === SECTION 7: OUTPUT HANDLING ===
 
 
-def output_results(results, cluster_name: str, timezone_name: str = "UTC", output_dir: str | None = None):
+def output_results(
+    results, cluster_name: str | None, timezone_name: str = "UTC", output_dir: str | None = None
+):
     """
     Output results as both HTML and LLM-JSON files.
 
@@ -22663,7 +22666,7 @@ def output_results(results, cluster_name: str, timezone_name: str = "UTC", outpu
     llm_formatter = LLMJSONOutputFormatter()
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe_cluster_name = cluster_name.replace("_", "-").replace(".", "-").lower()
+    safe_cluster_name = (cluster_name or DEFAULT_REPORT_CLUSTER_NAME).replace("_", "-").replace(".", "-").lower()
 
     html_filename = f"{safe_cluster_name}-eks-report-{timestamp}.html"
     json_filename = f"{safe_cluster_name}-eks-findings-{timestamp}.json"
@@ -22791,7 +22794,9 @@ def main():
         results = debugger.run_comprehensive_analysis()
 
         # Output results (always generates HTML + LLM-JSON)
-        output_results(results, args.cluster_name, args.timezone, args.output_dir)
+        # Use the resolved cluster name: args.cluster_name is None when the
+        # cluster was auto-detected or selected interactively.
+        output_results(results, debugger.cluster_name, args.timezone, args.output_dir)
 
         # Exit with appropriate code
         sys.exit(get_exit_code(results))

@@ -86,6 +86,10 @@ MAX_API_RETRIES = 3
 RETRY_DELAY_SECONDS = 1
 MAX_LOG_STREAMS = 50
 MAX_EVENTS_PER_STREAM = 100
+
+# Logs Insights polling for control plane analysis
+CONTROL_PLANE_QUERY_POLLS = 30
+CONTROL_PLANE_QUERY_POLL_SECONDS = 2
 MAX_CONSOLE_DISPLAY = 10
 MAX_HTML_DISPLAY = 50
 DATE_RANGE_WARNING_DAYS = 7
@@ -10911,7 +10915,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 return False
             if details is None:
                 details = {}
-            details["finding_type"] = finding_type
+            # An explicit finding_type in details wins: callers that classify a
+            # finding as historical must not have it silently reset to current.
+            details.setdefault("finding_type", finding_type)
             self.findings[category].append({"summary": summary, "details": details})
             return True
 
@@ -11685,21 +11691,132 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     # === NEW: Comprehensive Analysis Methods ===
 
+    @staticmethod
+    def _control_plane_query() -> str:
+        """Build the Logs Insights query used to aggregate control plane errors."""
+        patterns = list(CONTROL_PLANE_ERROR_PATTERNS) + [
+            "Evict",
+            "NotReady",
+            "FailedScheduling",
+            "OOM",
+        ]
+        alternation = "|".join(patterns)
+        return (
+            "fields @timestamp, @logStream, @message\n"
+            "| filter @logStream not like /audit|authenticator/\n"
+            f"| filter @message like /(?i)({alternation})/\n"
+            f"| parse @message /(?i)(?<pattern>{alternation})/\n"
+            "| parse @logStream /^(?<comp>[a-z-]+?)-[0-9a-f]{8}/\n"
+            "| stats count(*) as n, min(@timestamp) as first, max(@timestamp) as last by comp, pattern\n"
+            "| sort n desc"
+        )
+
+    def _run_logs_insights(self, query: str, limit: int = 100) -> list[dict] | None:
+        """Run a CloudWatch Logs Insights query over the analysis window.
+
+        Returns a list of row dicts, or None when Insights cannot be used so the
+        caller can fall back to stream sampling.
+        """
+        log_group = f"/aws/eks/{self.cluster_name}/cluster"
+        try:
+            success, response = self.safe_api_call(
+                self.logs_client.start_query,
+                logGroupName=log_group,
+                startTime=int(self.start_date.timestamp()),
+                endTime=int(self.end_date.timestamp()),
+                queryString=query,
+                limit=limit,
+                use_cache=False,
+            )
+            if not success or not isinstance(response, dict):
+                return None
+            query_id = response.get("queryId")
+            if not query_id:
+                return None
+
+            for _ in range(CONTROL_PLANE_QUERY_POLLS):
+                time.sleep(CONTROL_PLANE_QUERY_POLL_SECONDS)
+                success, result = self.safe_api_call(
+                    self.logs_client.get_query_results, queryId=query_id, use_cache=False
+                )
+                if not success or not isinstance(result, dict):
+                    return None
+                status = result.get("status")
+                if status == "Complete":
+                    return [{field["field"]: field["value"] for field in row} for row in result.get("results", [])]
+                if status in ("Failed", "Cancelled", "Timeout"):
+                    self._add_error("analyze_control_plane_logs", f"Logs Insights query {status.lower()}")
+                    return None
+
+            self._add_error("analyze_control_plane_logs", "Logs Insights query did not complete in time")
+            return None
+        except Exception as e:
+            self._add_error("analyze_control_plane_logs", f"Logs Insights unavailable: {e}")
+            return None
+
     def analyze_control_plane_logs(self):
         """
         Analyze EKS control plane CloudWatch logs for errors.
 
-        Scans API server, scheduler, controller manager, and authenticator
-        logs for error patterns while filtering out benign messages.
+        Uses Logs Insights so the whole analysis window is covered and matching
+        lines are aggregated per component and pattern. Sampling a fixed number
+        of events from a handful of streams misses almost everything on a busy
+        cluster, which is why a 2 million line window used to report nothing.
 
         Populates:
-            self.findings['control_plane_issues']: Errors from control plane logs.
+            self.findings['control_plane_issues']: Aggregated control plane errors.
 
         Reference:
             https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html
         """
         self.progress.step("Analyzing control plane logs...")
 
+        rows = self._run_logs_insights(self._control_plane_query())
+        if rows is None:
+            self.progress.info("Logs Insights unavailable, sampling recent control plane streams")
+            self._sample_control_plane_streams()
+            return
+
+        for row in rows:
+            component = row.get("comp") or "control-plane"
+            pattern = row.get("pattern", "")
+            try:
+                count = int(float(row.get("n", 0) or 0))
+            except (TypeError, ValueError):
+                count = 0
+            if not count:
+                continue
+
+            first_seen = row.get("first", "")
+            last_seen = row.get("last", "")
+            timestamp = first_seen.replace(" ", "T")[:19] + "Z" if first_seen else ""
+            is_critical = any(p.lower() in pattern.lower() for p in CONTROL_PLANE_ERROR_PATTERNS)
+
+            self._add_finding(
+                "control_plane_issues",
+                f"{component}: {count} log lines matching '{pattern}' between "
+                f"{first_seen[:16] or 'unknown'} and {last_seen[:16] or 'unknown'}",
+                {
+                    "component": component,
+                    "pattern": pattern,
+                    "count": count,
+                    "timestamp": timestamp,
+                    "first_seen": first_seen,
+                    "last_seen": last_seen,
+                    "severity": "critical" if is_critical else "warning",
+                    "finding_type": FindingType.HISTORICAL_EVENT,
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
+                },
+            )
+
+        self.progress.info(f"Control plane analysis found {len(rows)} error patterns in the window")
+
+    def _sample_control_plane_streams(self):
+        """Fallback: sample the most recent control plane log streams.
+
+        Used only when Logs Insights is unavailable. Reads a bounded number of
+        events per stream, so it sees a small slice of a busy cluster's logs.
+        """
         log_group = f"/aws/eks/{self.cluster_name}/cluster"
 
         try:

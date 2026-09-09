@@ -77,7 +77,7 @@ else:
 
 log = structlog.get_logger()
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 DEFAULT_REPORT_CLUSTER_NAME = "eks-cluster"  # filename prefix when no cluster name is known
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24

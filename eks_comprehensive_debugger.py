@@ -17020,6 +17020,21 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             endpoints = json.loads(output)
 
+            # An empty endpoint list has three very different causes. Resolve the
+            # backing service and workload so the finding names the real one.
+            def _load_items(command: str) -> list:
+                raw = self._get_cached_kubectl(command)
+                try:
+                    return json.loads(raw).get("items", []) if raw else []
+                except (ValueError, AttributeError):
+                    return []
+
+            ns_scope = f"-n {self.namespace}" if self.namespace else "--all-namespaces"
+            all_services = _load_items(f"kubectl get svc {ns_scope} -o json")
+            all_pods = _load_items(f"kubectl get pods {ns_scope} -o json")
+            all_deployments = _load_items(f"kubectl get deploy {ns_scope} -o json")
+            svc_by_key = {(s["metadata"]["namespace"], s["metadata"]["name"]): s for s in all_services}
+
             for ep in endpoints.get("items", []):
                 ep_name = ep["metadata"]["name"]
                 ep_namespace = ep["metadata"]["namespace"]
@@ -17027,25 +17042,67 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 # Check if service has no endpoints
                 if not subsets:
+                    svc = svc_by_key.get((ep_namespace, ep_name))
+                    selector = (svc or {}).get("spec", {}).get("selector") or {}
+
+                    # No selector: headless, ExternalName, or the default kubernetes endpoint
+                    if svc is None or not selector:
+                        continue
+
+                    matching_pods = [
+                        p
+                        for p in all_pods
+                        if p["metadata"]["namespace"] == ep_namespace
+                        and selector.items() <= (p["metadata"].get("labels") or {}).items()
+                    ]
+                    scaled_to_zero = [
+                        d
+                        for d in all_deployments
+                        if d["metadata"]["namespace"] == ep_namespace
+                        and (d.get("spec", {}).get("replicas") or 0) == 0
+                        and selector.items()
+                        <= ((d.get("spec", {}).get("template", {}).get("metadata", {}).get("labels")) or {}).items()
+                    ]
+
+                    if scaled_to_zero:
+                        deploy_name = scaled_to_zero[0]["metadata"]["name"]
+                        summary = (
+                            f"Service {ep_namespace}/{ep_name} has no endpoints: "
+                            f"backing Deployment {deploy_name} is scaled to zero"
+                        )
+                        severity = "info"
+                        root_causes = [f"Deployment {deploy_name} is intentionally scaled to 0 replicas"]
+                    elif not matching_pods:
+                        summary = f"Service {ep_namespace}/{ep_name} selector matches no pods (orphaned service)"
+                        severity = "info"
+                        root_causes = ["Selector matches no pod; the workload may have been removed"]
+                    else:
+                        summary = (
+                            f"Service {ep_namespace}/{ep_name} has no ready endpoints "
+                            f"({len(matching_pods)} pods not ready)"
+                        )
+                        severity = "warning"
+                        root_causes = [
+                            "Pods exist but are not passing readiness probes",
+                            "Pods are in CrashLoopBackOff",
+                        ]
+
                     self._add_finding_dict(
                         "network_issues",
                         {
-                            "summary": f"Service {ep_namespace}/{ep_name} has no endpoints (pods not ready)",
+                            "summary": summary,
                             "details": {
                                 "service": ep_name,
                                 "namespace": ep_namespace,
-                                "severity": "warning",
+                                "selector": selector,
+                                "matching_pods": len(matching_pods),
+                                "severity": severity,
                                 "finding_type": FindingType.CURRENT_STATE,
-                                "root_causes": [
-                                    "Pod selector does not match any pods",
-                                    "Pods exist but not passing readiness probes",
-                                    "Pods are in CrashLoopBackOff",
-                                ],
+                                "root_causes": root_causes,
                                 "diagnostic_steps": [
-                                    f"kubectl get pods -n {ep_namespace} -l <selector>",
+                                    f"kubectl get pods -n {ep_namespace} -l {','.join(f'{k}={v}' for k, v in selector.items())}",
                                     f"kubectl describe endpoints {ep_name} -n {ep_namespace}",
-                                    f"kubectl get svc {ep_name} -n {ep_namespace} -o yaml | grep selector",
-                                    "Check if pods are running and passing readiness probes",
+                                    f"kubectl get svc {ep_name} -n {ep_namespace} -o yaml | grep -A5 selector",
                                 ],
                                 "aws_doc": "https://kubernetes.io/docs/tasks/debug/debug-application/debug-service/",
                             },
@@ -17621,6 +17678,29 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_cluster_autoscaler", str(e))
             self.progress.warning(f"Cluster Autoscaler analysis failed: {e}")
 
+    @staticmethod
+    def _hpa_metrics_over_target(hpa: dict) -> list[dict]:
+        """Return resource metrics whose current utilisation exceeds the HPA target.
+
+        An HPA sitting at maxReplicas while a metric is far above target usually
+        means the resource request is too small, not that maxReplicas is too low.
+        """
+        targets = {}
+        for metric in hpa.get("spec", {}).get("metrics", []) or []:
+            resource = metric.get("resource") or {}
+            target = resource.get("target") or {}
+            if target.get("type") == "Utilization" and target.get("averageUtilization") is not None:
+                targets[resource.get("name")] = target["averageUtilization"]
+
+        over = []
+        for metric in hpa.get("status", {}).get("currentMetrics", []) or []:
+            resource = metric.get("resource") or {}
+            current = (resource.get("current") or {}).get("averageUtilization")
+            name = resource.get("name")
+            if name in targets and current is not None and current > targets[name]:
+                over.append({"name": name, "current": current, "target": targets[name]})
+        return over
+
     def analyze_hpa_vpa(self):
         """
         Analyze Horizontal/Vertical Pod Autoscaler health
@@ -17665,22 +17745,32 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             )
 
                         if condition.get("type") == "ScalingActive" and condition.get("status") != "True":
+                            reason = condition.get("reason", "Unknown")
+                            # A target deliberately scaled to zero is not a fault
+                            if reason == "ScalingDisabled" and status.get("currentReplicas", 0) == 0:
+                                summary = f"HPA {namespace}/{hpa_name} is inactive because its target is scaled to zero"
+                                severity = "info"
+                                root_causes = ["Target workload is intentionally scaled to 0 replicas"]
+                            else:
+                                summary = f"HPA {namespace}/{hpa_name} scaling not active"
+                                severity = "warning"
+                                root_causes = [
+                                    "Missing metrics",
+                                    "Target resource not found",
+                                    "Invalid metric configuration",
+                                ]
                             self._add_finding_dict(
                                 "pod_errors",
                                 {
-                                    "summary": f"HPA {namespace}/{hpa_name} scaling not active",
+                                    "summary": summary,
                                     "details": {
                                         "hpa": hpa_name,
                                         "namespace": namespace,
-                                        "reason": condition.get("reason", "Unknown"),
+                                        "reason": reason,
                                         "message": condition.get("message", "N/A")[:200],
-                                        "severity": "warning",
+                                        "severity": severity,
                                         "finding_type": FindingType.CURRENT_STATE,
-                                        "root_causes": [
-                                            "Missing metrics",
-                                            "Target resource not found",
-                                            "Invalid metric configuration",
-                                        ],
+                                        "root_causes": root_causes,
                                     },
                                 },
                             )
@@ -17689,19 +17779,41 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     desired_replicas = status.get("desiredReplicas", 0)
                     max_replicas = hpa.get("spec", {}).get("maxReplicas", 0)
 
-                    if current_replicas >= max_replicas and current_replicas > 0:
+                    min_replicas = hpa.get("spec", {}).get("minReplicas", 1) or 1
+
+                    # min == max means the HPA cannot scale by design, so "at max" says nothing
+                    if current_replicas >= max_replicas and current_replicas > 0 and max_replicas > min_replicas:
+                        over_target = self._hpa_metrics_over_target(hpa)
+                        if over_target:
+                            metric_text = ", ".join(
+                                f"{m['name']} {m['current']}% (target {m['target']}%)" for m in over_target
+                            )
+                            names = " and ".join(m["name"] for m in over_target)
+                            summary = (
+                                f"HPA {namespace}/{hpa_name} pinned at max replicas ({max_replicas}) "
+                                f"with {metric_text}"
+                            )
+                            recommendation = (
+                                f"Utilisation is measured against resource requests, so raise the {names} request "
+                                f"to the observed usage or drop {names} from the HPA metrics, then reassess maxReplicas"
+                            )
+                        else:
+                            summary = f"HPA {namespace}/{hpa_name} at max replicas ({max_replicas})"
+                            recommendation = "Consider increasing maxReplicas if workload needs more scaling"
                         self._add_finding_dict(
                             "pod_errors",
                             {
-                                "summary": f"HPA {namespace}/{hpa_name} at max replicas ({max_replicas})",
+                                "summary": summary,
                                 "details": {
                                     "hpa": hpa_name,
                                     "namespace": namespace,
                                     "current_replicas": current_replicas,
                                     "max_replicas": max_replicas,
+                                    "min_replicas": min_replicas,
+                                    "metrics_over_target": over_target,
                                     "severity": "warning",
                                     "finding_type": FindingType.CURRENT_STATE,
-                                    "recommendation": "Consider increasing maxReplicas if workload needs more scaling",
+                                    "recommendation": recommendation,
                                 },
                             },
                         )

@@ -8027,7 +8027,7 @@ class SSMNodeDiagnosticsManager:
         ssm_client: boto3 SSM client (from debugger.session)
     """
 
-    def __init__(self, debugger: "ComprehensiveEKSDebugger"):
+    def __init__(self, debugger: ComprehensiveEKSDebugger):
         """Initialize the SSM diagnostics manager.
 
         Args:
@@ -8450,7 +8450,7 @@ class NodeOSOutputParser:
                         "instance_id": instance_id,
                         "source": "SSM",
                         "rule": match.group(0),
-                        "remediation": f"Remove the blocking rule: iptables -D <chain> ... (see rule above)",
+                        "remediation": "Remove the blocking rule: iptables -D <chain> ... (see rule above)",
                     },
                 },
             )
@@ -11208,12 +11208,42 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_node_conditions", str(e))
             self.progress.warning(f"Node condition analysis failed: {e}")
 
+    def _oom_from_container_statuses(self, pods: list[dict]) -> list[dict]:
+        """Return containers whose last termination was an OOM kill.
+
+        Kubelet no longer emits a durable OOMKilling event on modern clusters,
+        so the container status is the only reliable signal for a running pod
+        that is being killed repeatedly.
+        """
+        results = []
+        for pod in pods:
+            meta = pod.get("metadata", {})
+            limits_by_name = {
+                c.get("name"): ((c.get("resources") or {}).get("limits") or {}).get("memory")
+                for c in pod.get("spec", {}).get("containers", [])
+            }
+            for cs in pod.get("status", {}).get("containerStatuses", []) or []:
+                term = (cs.get("lastState") or {}).get("terminated") or {}
+                if term.get("reason") == "OOMKilled" or term.get("exitCode") == 137:
+                    results.append(
+                        {
+                            "pod": meta.get("name", ""),
+                            "namespace": meta.get("namespace", ""),
+                            "container": cs.get("name", ""),
+                            "restart_count": cs.get("restartCount", 0),
+                            "finished_at": term.get("finishedAt", ""),
+                            "memory_limit": limits_by_name.get(cs.get("name")) or "none",
+                        }
+                    )
+        return results
+
     def check_oom_events(self):
         """
-        Check for OOMKilled (Out of Memory) events within the date range.
+        Check for OOMKilled (Out of Memory) containers and events.
 
-        Queries kubectl events for OOMKilling reason to identify pods
-        that were terminated due to exceeding memory limits.
+        Two sources are used because they cover different situations:
+        - kubectl events with reason=OOMKilling (historical, short lived)
+        - container status lastState.terminated (current, survives event expiry)
 
         Populates:
             self.findings['oom_killed']: Pods killed by OOM killer.
@@ -11226,36 +11256,64 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get events -n {self.namespace} --field-selector reason=OOMKilling -o json"
 
             output = self.safe_kubectl_call(cmd)
-            if not output:
-                self.progress.info("No OOMKilled events found")
-                return
+            event_count = 0
+            if output:
+                events = json.loads(output)
 
-            events = json.loads(output)
+                # Apply date filtering
+                events = self.filter_kubectl_events_by_date(events, self.start_date, self.end_date)
 
-            # Apply date filtering
-            events = self.filter_kubectl_events_by_date(events, self.start_date, self.end_date)
+                for event in events.get("items", []):
+                    pod = event["involvedObject"].get("name", "Unknown")
+                    namespace = event["metadata"]["namespace"]
+                    message = event.get("message", "N/A")
+                    timestamp = event.get("lastTimestamp", "Unknown")
 
-            for event in events.get("items", []):
-                pod = event["involvedObject"].get("name", "Unknown")
-                namespace = event["metadata"]["namespace"]
-                message = event.get("message", "N/A")
-                timestamp = event.get("lastTimestamp", "Unknown")
-
-                self._add_finding_dict(
-                    "oom_killed",
-                    {
-                        "summary": f"Pod {namespace}/{pod} was OOM killed",
-                        "details": {
-                            "pod": pod,
-                            "namespace": namespace,
-                            "timestamp": timestamp,
-                            "message": message,
-                            "finding_type": FindingType.HISTORICAL_EVENT,
+                    self._add_finding_dict(
+                        "oom_killed",
+                        {
+                            "summary": f"Pod {namespace}/{pod} was OOM killed",
+                            "details": {
+                                "pod": pod,
+                                "namespace": namespace,
+                                "timestamp": timestamp,
+                                "message": message,
+                                "finding_type": FindingType.HISTORICAL_EVENT,
+                            },
                         },
+                    )
+                event_count = len(events.get("items", []))
+
+            # Container status is authoritative for pods being killed right now
+            pods_cmd = "kubectl get pods --all-namespaces -o json"
+            if self.namespace:
+                pods_cmd = f"kubectl get pods -n {self.namespace} -o json"
+            pods_json = self._get_cached_kubectl(pods_cmd)
+            pods = json.loads(pods_json).get("items", []) if pods_json else []
+
+            status_hits = self._oom_from_container_statuses(pods)
+            for hit in status_hits:
+                self._add_finding(
+                    "oom_killed",
+                    f"Pod {hit['namespace']}/{hit['pod']} container {hit['container']} was OOMKilled "
+                    f"(memory limit {hit['memory_limit']}, {hit['restart_count']} restarts)",
+                    {
+                        **hit,
+                        "severity": "critical",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Container repeatedly exceeds its memory limit and is killed by the kernel",
+                        "recommendation": (
+                            f"Raise the memory limit for container {hit['container']} above its observed "
+                            "working set, or fix the leak that drives memory growth"
+                        ),
+                        "diagnostic_steps": [
+                            f"kubectl top pod {hit['pod']} -n {hit['namespace']} --containers",
+                            f"kubectl describe pod {hit['pod']} -n {hit['namespace']} | grep -A5 'Last State'",
+                        ],
                     },
                 )
 
-            self.progress.info(f"Found {len(events.get('items', []))} OOM events in date range")
+            self.progress.info(f"Found {event_count} OOM events and {len(status_hits)} OOMKilled containers")
 
         except Exception as e:
             self._add_error("check_oom_events", str(e))
@@ -12592,16 +12650,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             )
 
                     # Check for high restart count
+                    last_reason = ((container_status.get("lastState") or {}).get("terminated") or {}).get("reason", "")
+                    reason_suffix = f" (last exit: {last_reason})" if last_reason else ""
                     if restart_count >= Thresholds.RESTART_CRITICAL:
                         self._add_finding_dict(
                             "pod_errors",
                             {
-                                "summary": f"Pod {namespace}/{pod_name} container {container_name} has high restart count: {restart_count}",
+                                "summary": f"Pod {namespace}/{pod_name} container {container_name} has high restart count: {restart_count}{reason_suffix}",
                                 "details": {
                                     "pod": pod_name,
                                     "namespace": namespace,
                                     "container": container_name,
                                     "restart_count": restart_count,
+                                    "last_termination_reason": last_reason,
                                     "severity": "critical",
                                     "finding_type": FindingType.CURRENT_STATE,
                                 },
@@ -12611,12 +12672,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         self._add_finding_dict(
                             "pod_errors",
                             {
-                                "summary": f"Pod {namespace}/{pod_name} container {container_name} restarted {restart_count} times",
+                                "summary": f"Pod {namespace}/{pod_name} container {container_name} restarted {restart_count} times{reason_suffix}",
                                 "details": {
                                     "pod": pod_name,
                                     "namespace": namespace,
                                     "container": container_name,
                                     "restart_count": restart_count,
+                                    "last_termination_reason": last_reason,
                                     "severity": "warning",
                                     "finding_type": FindingType.CURRENT_STATE,
                                 },

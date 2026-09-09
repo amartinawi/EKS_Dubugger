@@ -350,14 +350,17 @@ class TestKubectlCacheTTL:
 
         debugger._set_kubectl_cache(cmd, output)
 
-        # Verify cache entry exists with timestamp
+        # Verify cache entry exists with timestamp, in the shape the reader expects
         with debugger._shared_data_lock:
             cache = debugger._shared_data["kubectl_cache"]
             assert cmd in cache
-            cached_output, timestamp = cache[cmd]
-            assert cached_output == output
-            assert isinstance(timestamp, float)
-            assert time.time() - timestamp < 1  # Should be recent
+            entry = cache[cmd]
+            assert entry["output"] == output
+            assert isinstance(entry["timestamp"], float)
+            assert time.time() - entry["timestamp"] < 1  # Should be recent
+
+        # What is written must be readable back through the cache reader
+        assert debugger._get_cached_kubectl(cmd) == output
 
     def test_kubectl_cache_returns_cached_data(self, debugger):
         """Test that kubectl cache returns cached data when not expired."""

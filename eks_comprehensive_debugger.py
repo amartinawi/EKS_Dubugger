@@ -27,7 +27,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import boto3
 import structlog
@@ -543,6 +543,7 @@ class NodeDiagnosticConfig:
     # SSM Run Command settings
     DEFAULT_SSM_TIMEOUT = 300  # 5 minutes (per-command execution timeout)
     MAX_SSM_TIMEOUT = 3600  # 1 hour hard cap
+    MIN_SSM_TIMEOUT = 30  # below this a diagnostic command cannot finish
     POLL_INTERVAL = 5  # Seconds between get_command_invocation polls
     MAX_POLL_ATTEMPTS = 120  # 10 minutes max polling (120 * 5s)
 
@@ -9564,7 +9565,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # Node OS diagnostics configuration (Phase 1)
         self.enable_node_diagnostics = enable_node_diagnostics
-        self.ssm_timeout = min(ssm_timeout, NodeDiagnosticConfig.MAX_SSM_TIMEOUT)
+        self.ssm_timeout = max(
+            NodeDiagnosticConfig.MIN_SSM_TIMEOUT,
+            min(ssm_timeout, NodeDiagnosticConfig.MAX_SSM_TIMEOUT),
+        )
         self.ssm_mode = ssm_mode if ssm_mode in ("run-command", "automation", "both") else "run-command"
         self.ssm_max_nodes = max(1, ssm_max_nodes)
 
@@ -9935,8 +9939,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             output: Command output to cache
         """
         with self._shared_data_lock:
-            # Store as tuple (output, timestamp) for compatibility
-            self._shared_data["kubectl_cache"][cmd] = (output, time.time())
+            # Same shape _get_cached_kubectl reads; a tuple here was returned raw
+            self._shared_data["kubectl_cache"][cmd] = {"output": output, "timestamp": time.time()}
 
     def _get_kubectl_cache(self, cmd: str, max_age_seconds: int = 600) -> str | None:
         """Get cached kubectl output with TTL validation.
@@ -10074,10 +10078,46 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "collection_timestamp": TimezoneManager.to_iso_string(TimezoneManager.now_utc()),
         }
 
+        # Fetch every resource this method needs in one parallel batch, then read
+        # the results from cache. Twenty-three sequential kubectl calls dominated
+        # the runtime of a full analysis.
+        scope = f"-n {self.namespace}" if self.namespace else "--all-namespaces"
+        batched_commands = [
+            "kubectl get namespaces -o json",
+            "kubectl get nodes -o json",
+            f"kubectl get deployments {scope} -o json",
+            f"kubectl get statefulsets {scope} -o json",
+            f"kubectl get daemonsets {scope} -o json",
+            f"kubectl get jobs {scope} -o json",
+            f"kubectl get cronjobs {scope} -o json",
+            f"kubectl get replicasets {scope} -o json",
+            f"kubectl get pods {scope} -o json",
+            f"kubectl get services {scope} -o json",
+            f"kubectl get ingresses {scope} -o json",
+            f"kubectl get networkpolicies {scope} -o json",
+            f"kubectl get endpoints {scope} -o json",
+            f"kubectl get pvc {scope} -o json",
+            "kubectl get pv -o json",
+            "kubectl get storageclasses -o json",
+            f"kubectl get configmaps {scope} -o json",
+            f"kubectl get secrets {scope} -o json",
+            f"kubectl get serviceaccounts {scope} -o json",
+            f"kubectl get roles {scope} -o json",
+            f"kubectl get rolebindings {scope} -o json",
+            "kubectl get clusterroles -o json",
+            "kubectl get clusterrolebindings -o json",
+        ]
+        try:
+            for cmd, output in (self._batch_kubectl_calls(batched_commands, parallel=self.parallel) or {}).items():
+                if output:
+                    self._set_kubectl_cache(cmd, output)
+        except Exception as e:
+            self._add_error("collect_cluster_statistics", f"Batch prefetch failed: {e}")
+
         try:
             # === Infrastructure Statistics ===
             # Namespaces
-            ns_output = self.safe_kubectl_call("kubectl get namespaces -o json")
+            ns_output = self._get_cached_kubectl("kubectl get namespaces -o json")
             if ns_output:
                 try:
                     ns_data = json.loads(ns_output)
@@ -10090,7 +10130,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             # Nodes
-            nodes_output = self.safe_kubectl_call("kubectl get nodes -o json")
+            nodes_output = self._get_cached_kubectl("kubectl get nodes -o json")
             if nodes_output:
                 try:
                     nodes_data = json.loads(nodes_output)
@@ -10157,7 +10197,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get deployments -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get deployments --all-namespaces -o json"
-            dep_output = self.safe_kubectl_call(cmd)
+            dep_output = self._get_cached_kubectl(cmd)
             if dep_output:
                 try:
                     dep_data = json.loads(dep_output)
@@ -10191,7 +10231,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get statefulsets -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get statefulsets --all-namespaces -o json"
-            sts_output = self.safe_kubectl_call(cmd)
+            sts_output = self._get_cached_kubectl(cmd)
             if sts_output:
                 try:
                     sts_data = json.loads(sts_output)
@@ -10213,7 +10253,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get daemonsets -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get daemonsets --all-namespaces -o json"
-            ds_output = self.safe_kubectl_call(cmd)
+            ds_output = self._get_cached_kubectl(cmd)
             if ds_output:
                 try:
                     ds_data = json.loads(ds_output)
@@ -10227,7 +10267,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get jobs -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get jobs --all-namespaces -o json"
-            jobs_output = self.safe_kubectl_call(cmd)
+            jobs_output = self._get_cached_kubectl(cmd)
             if jobs_output:
                 try:
                     jobs_data = json.loads(jobs_output)
@@ -10249,7 +10289,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get cronjobs -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get cronjobs --all-namespaces -o json"
-            cj_output = self.safe_kubectl_call(cmd)
+            cj_output = self._get_cached_kubectl(cmd)
             if cj_output:
                 try:
                     cj_data = json.loads(cj_output)
@@ -10263,7 +10303,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get replicasets -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get replicasets --all-namespaces -o json"
-            rs_output = self.safe_kubectl_call(cmd)
+            rs_output = self._get_cached_kubectl(cmd)
             if rs_output:
                 try:
                     rs_data = json.loads(rs_output)
@@ -10277,7 +10317,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get pods -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get pods --all-namespaces -o json"
-            pods_output = self.safe_kubectl_call(cmd)
+            pods_output = self._get_cached_kubectl(cmd)
             if pods_output:
                 try:
                     pods_data = json.loads(pods_output)
@@ -10312,7 +10352,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get services -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get services --all-namespaces -o json"
-            svc_output = self.safe_kubectl_call(cmd)
+            svc_output = self._get_cached_kubectl(cmd)
             if svc_output:
                 try:
                     svc_data = json.loads(svc_output)
@@ -10337,7 +10377,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get ingresses -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get ingresses --all-namespaces -o json"
-            ing_output = self.safe_kubectl_call(cmd)
+            ing_output = self._get_cached_kubectl(cmd)
             if ing_output:
                 try:
                     ing_data = json.loads(ing_output)
@@ -10351,7 +10391,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get networkpolicies -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get networkpolicies --all-namespaces -o json"
-            np_output = self.safe_kubectl_call(cmd)
+            np_output = self._get_cached_kubectl(cmd)
             if np_output:
                 try:
                     np_data = json.loads(np_output)
@@ -10365,7 +10405,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get endpoints -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get endpoints --all-namespaces -o json"
-            ep_output = self.safe_kubectl_call(cmd)
+            ep_output = self._get_cached_kubectl(cmd)
             if ep_output:
                 try:
                     ep_data = json.loads(ep_output)
@@ -10394,7 +10434,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get pvc -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get pvc --all-namespaces -o json"
-            pvc_output = self.safe_kubectl_call(cmd)
+            pvc_output = self._get_cached_kubectl(cmd)
             if pvc_output:
                 try:
                     pvc_data = json.loads(pvc_output)
@@ -10415,7 +10455,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             # PVs
-            pv_output = self.safe_kubectl_call("kubectl get pv -o json")
+            pv_output = self._get_cached_kubectl("kubectl get pv -o json")
             if pv_output:
                 try:
                     pv_data = json.loads(pv_output)
@@ -10425,7 +10465,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             # StorageClasses
-            sc_output = self.safe_kubectl_call("kubectl get storageclasses -o json")
+            sc_output = self._get_cached_kubectl("kubectl get storageclasses -o json")
             if sc_output:
                 try:
                     sc_data = json.loads(sc_output)
@@ -10449,7 +10489,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get configmaps -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get configmaps --all-namespaces -o json"
-            cm_output = self.safe_kubectl_call(cmd)
+            cm_output = self._get_cached_kubectl(cmd)
             if cm_output:
                 try:
                     cm_data = json.loads(cm_output)
@@ -10463,7 +10503,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get secrets -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get secrets --all-namespaces -o json"
-            sec_output = self.safe_kubectl_call(cmd)
+            sec_output = self._get_cached_kubectl(cmd)
             if sec_output:
                 try:
                     sec_data = json.loads(sec_output)
@@ -10485,7 +10525,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get serviceaccounts -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get serviceaccounts --all-namespaces -o json"
-            sa_output = self.safe_kubectl_call(cmd)
+            sa_output = self._get_cached_kubectl(cmd)
             if sa_output:
                 try:
                     sa_data = json.loads(sa_output)
@@ -10499,7 +10539,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get roles -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get roles --all-namespaces -o json"
-            roles_output = self.safe_kubectl_call(cmd)
+            roles_output = self._get_cached_kubectl(cmd)
             if roles_output:
                 try:
                     roles_data = json.loads(roles_output)
@@ -10513,7 +10553,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get rolebindings -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get rolebindings --all-namespaces -o json"
-            rb_output = self.safe_kubectl_call(cmd)
+            rb_output = self._get_cached_kubectl(cmd)
             if rb_output:
                 try:
                     rb_data = json.loads(rb_output)
@@ -10523,7 +10563,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             # ClusterRoles
-            cr_output = self.safe_kubectl_call("kubectl get clusterroles -o json")
+            cr_output = self._get_cached_kubectl("kubectl get clusterroles -o json")
             if cr_output:
                 try:
                     cr_data = json.loads(cr_output)
@@ -10533,7 +10573,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             # ClusterRoleBindings
-            crb_output = self.safe_kubectl_call("kubectl get clusterrolebindings -o json")
+            crb_output = self._get_cached_kubectl("kubectl get clusterrolebindings -o json")
             if crb_output:
                 try:
                     crb_data = json.loads(crb_output)
@@ -22394,6 +22434,22 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             slowest_str = ", ".join(f"{m}: {t:.1f}s" for m, t in slowest)
             self.progress.info(f"Slowest methods: {slowest_str}")
 
+    def _node_os_add_finding(self, sink):
+        """Wrap a finding sink with the analysis window filter.
+
+        Node OS parsers read whatever the host still has on disk, so dmesg can
+        return kernel events from months before the requested window. Findings
+        that carry a timestamp are checked against it; current-state findings,
+        which have none, always pass.
+        """
+
+        def add(category, finding):
+            if not self._is_finding_in_time_window(finding):
+                return False
+            return sink(category, finding)
+
+        return add
+
     def _run_node_os_diagnostics(self) -> None:
         """Execute SSM-based node OS-level diagnostics.
 
@@ -22491,7 +22547,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             stdout,
                             node_name,
                             instance_id,
-                            self._add_finding_dict,
+                            self._node_os_add_finding(self._add_finding_dict),
                         )
                         after_count = sum(len(v) for v in self.findings.values())
                         total_findings += after_count - before_count
@@ -23189,6 +23245,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 # === SECTION 6: CLI HANDLING ===
 
 
+def positive_int(value: str) -> int:
+    """argparse type for values that are meaningless at zero or below."""
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from e
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or greater, got {parsed}")
+    return parsed
+
+
 def create_argument_parser():
     """Create argument parser with all CLI options"""
     parser = argparse.ArgumentParser(
@@ -23266,8 +23333,8 @@ Environment Variables:
         "--start-date",
         help='Start date (ISO 8601: "2026-02-15T00:00:00Z" or "2026-02-15")',
     )
-    date_group.add_argument("--hours", type=int, help="Look back N hours from now")
-    date_group.add_argument("--days", type=int, help="Look back N days from now")
+    date_group.add_argument("--hours", type=positive_int, help="Look back N hours from now")
+    date_group.add_argument("--days", type=positive_int, help="Look back N days from now")
 
     parser.add_argument(
         "--end-date",
@@ -23297,7 +23364,7 @@ Environment Variables:
     )
     parser.add_argument(
         "--max-findings",
-        type=int,
+        type=positive_int,
         default=MAX_FINDINGS_PER_CATEGORY,
         help=f"Maximum findings per category (default: {MAX_FINDINGS_PER_CATEGORY})",
     )
@@ -23331,7 +23398,7 @@ Environment Variables:
     )
     parser.add_argument(
         "--ssm-timeout",
-        type=int,
+        type=positive_int,
         default=NodeDiagnosticConfig.DEFAULT_SSM_TIMEOUT,
         help=f"Timeout in seconds for each SSM Run Command execution (default: {NodeDiagnosticConfig.DEFAULT_SSM_TIMEOUT})",
     )
@@ -23376,7 +23443,10 @@ def parse_flexible_date(date_str: str, tz_name: str = "UTC") -> datetime:
     if not date_str:
         raise DateValidationError("Date string cannot be empty")
 
-    tz = ZoneInfo(tz_name)
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        raise DateValidationError(f"Unknown timezone {tz_name!r}: {e}") from e
 
     # Handle relative dates
     if date_str.lower() == "now":
@@ -23470,6 +23540,9 @@ def validate_and_parse_dates(args) -> tuple[datetime, datetime]:
         end_date = parse_flexible_date(args.end_date, args.timezone)
 
     # Parse start date based on different options
+    if args.hours and args.days:
+        raise DateValidationError("Use either --hours or --days, not both")
+
     if args.start_date:
         start_date = parse_flexible_date(args.start_date, args.timezone)
     elif args.hours:

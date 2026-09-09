@@ -618,9 +618,11 @@ class TestSearchFindings:
 
 class TestGetTimeline:
     def test_returns_timeline_buckets(self, session_id, mock_debugger):
+        # Buckets must be relative to now, otherwise this test expires
+        now = datetime.now(timezone.utc)
         mock_debugger.timeline = [
-            {"time_bucket": "2026-06-18 10:00", "event_count": 5},
-            {"time_bucket": "2026-06-18 11:00", "event_count": 2},
+            {"time_bucket": (now - timedelta(hours=2)).strftime("%Y-%m-%d %H:00"), "event_count": 5},
+            {"time_bucket": (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:00"), "event_count": 2},
         ]
         result = get_timeline(session_id, hours=168)  # wide window
         assert result["status"] == "completed"

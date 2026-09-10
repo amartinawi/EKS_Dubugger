@@ -1939,13 +1939,23 @@ class LLMJSONOutputFormatter(OutputFormatter):
 
         potential_root_causes = []
         if first_issue:
+            # Same record shape as the correlation entries below. A heterogeneous
+            # array cannot be processed by a consumer without type sniffing.
             potential_root_causes.append(
                 {
+                    "correlation_type": "earliest_issue",
+                    "severity": "info",
+                    "root_cause": first_issue.get("summary") or "Earliest detected issue",
+                    "impact": f"First issue observed in category {first_issue.get('category', 'unknown')}",
+                    "recommendation": "Check whether this is the trigger for the later findings",
+                    "aws_doc": "",
                     "timestamp": first_issue.get("timestamp"),
                     "category": first_issue.get("category"),
-                    "summary": first_issue.get("summary"),
                     "is_potential_root_cause": first_issue.get("potential_root_cause", False),
                     "confidence_tier": "unknown",
+                    "composite_confidence": 0.0,
+                    "root_cause_score": 0,
+                    "ranking_tier": "contextual",
                 }
             )
 
@@ -11471,15 +11481,22 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             status_hits = self._oom_from_container_statuses(pods)
             for hit in status_hits:
+                # A container killed once is worth knowing. One killed repeatedly
+                # is an outage in progress, and the two should not read alike.
+                looping = hit["restart_count"] >= Thresholds.RESTART_CRITICAL
                 self._add_finding(
                     "oom_killed",
                     f"Pod {hit['namespace']}/{hit['pod']} container {hit['container']} was OOMKilled "
                     f"(memory limit {hit['memory_limit']}, {hit['restart_count']} restarts)",
                     {
                         **hit,
-                        "severity": "critical",
+                        "severity": "critical" if looping else "warning",
                         "finding_type": FindingType.CURRENT_STATE,
-                        "impact": "Container repeatedly exceeds its memory limit and is killed by the kernel",
+                        "impact": (
+                            "Container repeatedly exceeds its memory limit and is killed by the kernel"
+                            if looping
+                            else "Container exceeded its memory limit and was killed by the kernel"
+                        ),
                         "recommendation": (
                             f"Raise the memory limit for container {hit['container']} above its observed "
                             "working set, or fix the leak that drives memory growth"

@@ -39,13 +39,16 @@ def test_oom_detected_from_last_state_without_events():
     assert oom[0]["details"]["finding_type"] == "current_state"
 
 
-def test_restart_finding_names_oom_reason():
-    dbg = make_debugger({"get pods": json.dumps({"items": [OOM_POD]})})
+def test_non_oom_restart_finding_names_its_reason():
+    """Restart findings carry the termination reason; OOM cases are owned by the OOM analyzer."""
+    pod = json.loads(json.dumps(OOM_POD))
+    pod["status"]["containerStatuses"][0]["lastState"]["terminated"]["reason"] = "Error"
+    dbg = make_debugger({"get pods": json.dumps({"items": [pod]})})
     dbg.analyze_pod_health_deep()
     restarts = [f for f in findings(dbg, "pod_errors") if "restart" in f["summary"].lower()]
     assert restarts, "restart finding missing"
-    assert restarts[0]["details"]["last_termination_reason"] == "OOMKilled"
-    assert "OOMKilled" in restarts[0]["summary"]
+    assert restarts[0]["details"]["last_termination_reason"] == "Error"
+    assert "Error" in restarts[0]["summary"]
 
 
 def test_healthy_pod_produces_no_oom_finding():

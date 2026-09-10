@@ -12964,10 +12964,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 },
                             )
 
-                    # Check for high restart count
+                    # Check for high restart count. An OOM-killed container is
+                    # reported by check_oom_events, which also names the memory
+                    # limit, so reporting it here as well is pure duplication.
                     last_reason = ((container_status.get("lastState") or {}).get("terminated") or {}).get("reason", "")
                     reason_suffix = f" (last exit: {last_reason})" if last_reason else ""
-                    if restart_count >= Thresholds.RESTART_CRITICAL:
+                    oom_owned = last_reason == "OOMKilled"
+                    if not oom_owned and restart_count >= Thresholds.RESTART_CRITICAL:
                         self._add_finding_dict(
                             "pod_errors",
                             {
@@ -12983,7 +12986,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 },
                             },
                         )
-                    elif restart_count >= Thresholds.RESTART_WARNING:
+                    elif not oom_owned and restart_count >= Thresholds.RESTART_WARNING:
                         self._add_finding_dict(
                             "pod_errors",
                             {

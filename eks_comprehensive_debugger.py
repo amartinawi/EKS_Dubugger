@@ -11490,6 +11490,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     f"(memory limit {hit['memory_limit']}, {hit['restart_count']} restarts)",
                     {
                         **hit,
+                        # Canonical key so correlations and the timeline can anchor
+                        # this finding in time rather than reporting "Unknown"
+                        "timestamp": hit["finished_at"],
                         "severity": "critical" if looping else "warning",
                         "finding_type": FindingType.CURRENT_STATE,
                         "impact": (
@@ -13527,6 +13530,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             or details.get("eventTime")
             or details.get("firstTimestamp")
             or details.get("creationTimestamp")
+            # Container termination and aggregated-log findings carry their own keys
+            or details.get("finished_at")
+            or details.get("first_seen")
+            or details.get("last_seen")
         )
         if ts:
             try:
@@ -15182,19 +15189,29 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         correlations = []
         timeline_events = []
 
-        # Build timeline from all findings
+        # Build timeline from findings that fall inside the analysis window. A
+        # container killed months ago is still current state worth reporting, but
+        # it does not belong on the timeline of a 24 hour report.
+        window_start = TimezoneManager.ensure_utc(self.start_date) if self.start_date else None
+        window_end = TimezoneManager.ensure_utc(self.end_date) if self.end_date else None
+
         for category, findings_list in self.findings.items():
             for finding in findings_list:
                 ts = self._extract_timestamp(finding.get("details", {}))
-                if ts:
-                    timeline_events.append(
-                        {
-                            "timestamp": ts,
-                            "category": category,
-                            "summary": finding.get("summary", ""),
-                            "details": finding.get("details", {}),
-                        }
-                    )
+                if not ts:
+                    continue
+                if window_start and window_end:
+                    ts_utc = TimezoneManager.ensure_utc(ts)
+                    if not (window_start <= ts_utc <= window_end):
+                        continue
+                timeline_events.append(
+                    {
+                        "timestamp": ts,
+                        "category": category,
+                        "summary": finding.get("summary", ""),
+                        "details": finding.get("details", {}),
+                    }
+                )
 
         # Sort by timestamp
         timeline_events.sort(key=lambda x: x["timestamp"])

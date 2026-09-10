@@ -91,7 +91,25 @@ cause while the dashboard showed "OOM: healthy".
   context. They now mock the real interface and an autouse guard fails any
   test that reaches subprocess. That module went from 28s to under 1s.
 - The MCP timeline test used a hardcoded date and expired in June 2026.
-- Test suite: 478 tests, all passing, about 12s, no cluster access.
+- Test suite: 485 tests, all passing, no cluster access.
+
+### Verified
+
+Rerun against `levelshoes-prod`, the cluster the audit was performed on:
+
+| Measure | 5.0.0 | 5.1.0 |
+|---|---|---|
+| Total findings | 112 | 57 |
+| Critical | 82 | 7 |
+| Critical from security posture | 80 | 0 |
+| OOM findings | 0 | 14 |
+| Node group AMI findings | 0 | 5 |
+| Named root cause | CoreDNS (low confidence) | Pod memory limits (medium) |
+| Exit code | crash | 1 (issues found) |
+
+All seven remaining criticals are real: five node groups on an AMI release
+183 to 315 days behind the recommended one, and two containers being
+OOM-killed against a 128Mi limit.
 
 
 ## [5.0.0] - 2026-06-18

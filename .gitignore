@@ -47,6 +47,11 @@ report*.yaml
 report*.md
 *-eks-report-*.html
 *-eks-findings-*.json
+
+# Audit and planning notes: these quote live cluster state (workload names,
+# node groups, security posture) and must not reach this public repository,
+# for the same reason the generated reports above are ignored.
+docs/superpowers/
 findings-llm.json
 
 # Cache

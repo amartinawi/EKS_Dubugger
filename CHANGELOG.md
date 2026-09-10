@@ -95,7 +95,7 @@ cause while the dashboard showed "OOM: healthy".
 
 ### Verified
 
-Rerun against `levelshoes-prod`, the cluster the audit was performed on:
+Rerun against the production cluster the audit was performed on:
 
 | Measure | 5.0.0 | 5.1.0 |
 |---|---|---|

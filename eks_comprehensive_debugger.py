@@ -504,6 +504,38 @@ class BaselineTracker:
         }
 
 
+# Keys under which an analyzer may record when a finding happened, in priority
+# order. Correlation, the incident timeline and the analysis-window filter all
+# read this one list, so a new key cannot be understood by one and ignored by
+# another. Note that "time" is deliberately absent: Quick Wins use it for an
+# effort estimate such as "10 min", not a clock time.
+FINDING_TIME_KEYS = (
+    "timestamp",
+    "lastTimestamp",
+    "eventTime",
+    "event_time",
+    "firstTimestamp",
+    "creationTimestamp",
+    "finished_at",
+    "first_seen",
+    "last_seen",
+    "created_at",
+    "last_schedule",
+    "deletion_timestamp",
+)
+
+
+def finding_time_value(details: dict):
+    """Return the first recognised time value in a finding's details, or None."""
+    if not isinstance(details, dict):
+        return None
+    for key in FINDING_TIME_KEYS:
+        value = details.get(key)
+        if value and value != "Unknown":
+            return value
+    return None
+
+
 # Namespaces whose workloads legitimately need host access (node agents, CSI drivers)
 SYSTEM_NAMESPACES = frozenset(
     {"kube-system", "amazon-cloudwatch", "calico-system", "kube-node-lease", "eks-system"}
@@ -10002,7 +10034,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             return True
 
         details = finding.get("details", {})
-        timestamp_str = details.get("timestamp")
+        timestamp_str = finding_time_value(details)
 
         if not timestamp_str:
             # Findings without timestamp are assumed to be in window
@@ -13524,17 +13556,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     def _extract_timestamp(self, details):
         """Extract timestamp from finding details"""
-        ts = (
-            details.get("timestamp")
-            or details.get("lastTimestamp")
-            or details.get("eventTime")
-            or details.get("firstTimestamp")
-            or details.get("creationTimestamp")
-            # Container termination and aggregated-log findings carry their own keys
-            or details.get("finished_at")
-            or details.get("first_seen")
-            or details.get("last_seen")
-        )
+        ts = finding_time_value(details)
         if ts:
             try:
                 if isinstance(ts, datetime):

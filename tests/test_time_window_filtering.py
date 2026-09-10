@@ -1,8 +1,10 @@
 """Tests for time window filtering in correlation detection."""
 
-import pytest
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
+
+import pytest
+
 from eks_comprehensive_debugger import ComprehensiveEKSDebugger, FindingType
 
 

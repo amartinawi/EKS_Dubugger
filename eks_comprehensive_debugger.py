@@ -27,12 +27,17 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import boto3
 import structlog
 from botocore.exceptions import BotoCoreError, ClientError, NoRegionError, PartialCredentialsError, ProfileNotFound
 from dateutil import parser as date_parser
+
+try:
+    from croniter import croniter
+except ImportError:  # pragma: no cover - optional dependency
+    croniter = None
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 # Configure structlog for structured logging (console output suppressed by default)
@@ -72,7 +77,8 @@ else:
 
 log = structlog.get_logger()
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
+DEFAULT_REPORT_CLUSTER_NAME = "eks-cluster"  # filename prefix when no cluster name is known
 REPO_URL = "https://github.com/amartinawi/EKS_Dubugger"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_TIMEOUT = 30
@@ -80,6 +86,10 @@ MAX_API_RETRIES = 3
 RETRY_DELAY_SECONDS = 1
 MAX_LOG_STREAMS = 50
 MAX_EVENTS_PER_STREAM = 100
+
+# Logs Insights polling for control plane analysis
+CONTROL_PLANE_QUERY_POLLS = 30
+CONTROL_PLANE_QUERY_POLL_SECONDS = 2
 MAX_CONSOLE_DISPLAY = 10
 MAX_HTML_DISPLAY = 50
 DATE_RANGE_WARNING_DAYS = 7
@@ -293,17 +303,39 @@ class IncrementalCache:
         except (OSError, TypeError):
             return False
 
+    # Numbers that are counters rather than identity. Normalising these keeps a
+    # growing restart count from looking like one issue resolved and one new on
+    # every run, while "Error 1" and "Error 2" stay distinct findings.
+    _COUNTER_PATTERNS = (
+        (re.compile(r"(count:\s*)\d+", re.IGNORECASE), r"\1N"),
+        (
+            re.compile(
+                r"\b\d+(\s+(?:times|restarts|days|hours|minutes|pods|replicas|nodes|containers|issues))\b",
+                re.IGNORECASE,
+            ),
+            r"N\1",
+        ),
+    )
+
+    @classmethod
+    def _delta_key(cls, summary: str) -> str:
+        """Normalise counters out of a summary so the delta tracks real changes."""
+        key = summary or ""
+        for pattern, replacement in cls._COUNTER_PATTERNS:
+            key = pattern.sub(replacement, key)
+        return key
+
     def compute_delta(self, current: dict, previous: dict | None) -> dict:
         if not previous:
             return {"is_first_run": True, "new_issues": 0, "resolved_issues": 0}
         current_summaries = set()
         for items in current.get("findings", {}).values():
             for item in items:
-                current_summaries.add(item.get("summary", ""))
+                current_summaries.add(self._delta_key(item.get("summary", "")))
         previous_summaries = set()
         for items in previous.get("findings", {}).values():
             for item in items:
-                previous_summaries.add(item.get("summary", ""))
+                previous_summaries.add(self._delta_key(item.get("summary", "")))
         new = current_summaries - previous_summaries
         resolved = previous_summaries - current_summaries
         return {
@@ -383,7 +415,7 @@ class BaselineTracker:
             pass  # Corrupt cache — start fresh silently
 
     def annotate(self, findings: dict) -> int:
-        """Annotate each finding's ``details`` with ``is_baseline`` and ``baseline_count``.
+        """Annotate each finding with a ``baseline`` block: count and is_baseline.
 
         Must be called BEFORE update_and_save() so that the current run's
         count is what was accumulated from PREVIOUS runs.
@@ -403,13 +435,15 @@ class BaselineTracker:
                 fp = self._fingerprint(category, summary)
                 count = self._fingerprints.get(fp, 0)
 
-                details = item.setdefault("details", {})
-                if not isinstance(details, dict):
-                    details = {}
-                    item["details"] = details
-                details["baseline_count"] = count
-                details["is_baseline"] = count >= self.threshold > 0
-                if details["is_baseline"]:
+                # Bookkeeping belongs beside the finding, not inside its details,
+                # where report templates render it as if it were evidence.
+                is_baseline = count >= self.threshold > 0
+                item["baseline"] = {"count": count, "is_baseline": is_baseline}
+                details = item.get("details")
+                if isinstance(details, dict):
+                    details.pop("baseline_count", None)
+                    details.pop("is_baseline", None)
+                if is_baseline:
                     baseline_marked += 1
 
         return baseline_marked
@@ -470,6 +504,18 @@ class BaselineTracker:
         }
 
 
+# Namespaces whose workloads legitimately need host access (node agents, CSI drivers)
+SYSTEM_NAMESPACES = frozenset(
+    {"kube-system", "amazon-cloudwatch", "calico-system", "kube-node-lease", "eks-system"}
+)
+
+# Host paths that give a workload meaningful control over the node
+SENSITIVE_HOST_PATHS_EXACT = frozenset(
+    {"/", "/etc", "/var/run/docker.sock", "/var/run/containerd", "/var/lib/docker"}
+)
+SENSITIVE_HOST_PREFIXES = ("/etc/", "/var/run/", "/var/lib/docker", "/proc", "/sys")
+
+
 class Thresholds:
     """Threshold configuration for alerts"""
 
@@ -497,6 +543,7 @@ class NodeDiagnosticConfig:
     # SSM Run Command settings
     DEFAULT_SSM_TIMEOUT = 300  # 5 minutes (per-command execution timeout)
     MAX_SSM_TIMEOUT = 3600  # 1 hour hard cap
+    MIN_SSM_TIMEOUT = 30  # below this a diagnostic command cannot finish
     POLL_INTERVAL = 5  # Seconds between get_command_invocation polls
     MAX_POLL_ATTEMPTS = 120  # 10 minutes max polling (120 * 5s)
 
@@ -967,6 +1014,28 @@ CRITICAL_CATEGORIES = [
     "memory_pressure",
     "node_issues",
 ]
+
+# Human readable names for finding categories, used wherever a category key
+# would otherwise be shown to a reader
+CATEGORY_DISPLAY_NAMES = {
+    "memory_pressure": "Memory Pressure",
+    "disk_pressure": "Disk Pressure",
+    "pod_errors": "Pod Errors",
+    "node_issues": "Node Issues",
+    "oom_killed": "OOM Killed",
+    "control_plane_issues": "Control Plane",
+    "scheduling_failures": "Scheduling",
+    "network_issues": "Network",
+    "rbac_issues": "RBAC/IAM",
+    "workload_security": "Workload Security",
+    "image_pull_failures": "Image Pull",
+    "resource_quota_exceeded": "Resource Quotas",
+    "pvc_issues": "Storage/PVC",
+    "dns_issues": "DNS",
+    "addon_issues": "EKS Addons",
+    "quota_issues": "Service Quotas",
+}
+
 
 CONTROL_PLANE_BENIGN_PATTERNS = [
     "required revision has been compacted",
@@ -1870,18 +1939,30 @@ class LLMJSONOutputFormatter(OutputFormatter):
 
         potential_root_causes = []
         if first_issue:
+            # Same record shape as the correlation entries below. A heterogeneous
+            # array cannot be processed by a consumer without type sniffing.
             potential_root_causes.append(
                 {
+                    "correlation_type": "earliest_issue",
+                    "severity": "info",
+                    "root_cause": first_issue.get("summary") or "Earliest detected issue",
+                    "impact": f"First issue observed in category {first_issue.get('category', 'unknown')}",
+                    "recommendation": "Check whether this is the trigger for the later findings",
+                    "aws_doc": "",
                     "timestamp": first_issue.get("timestamp"),
                     "category": first_issue.get("category"),
-                    "summary": first_issue.get("summary"),
                     "is_potential_root_cause": first_issue.get("potential_root_cause", False),
                     "confidence_tier": "unknown",
+                    "composite_confidence": 0.0,
+                    "root_cause_score": 0,
+                    "ranking_tier": "contextual",
                 }
             )
 
         for corr in correlations:
-            if corr.get("root_cause"):
+            # A low-confidence correlation is context, not a root cause. Promoting
+            # one made an informational finding the headline of the report.
+            if corr.get("root_cause") and corr.get("confidence_tier", "low") in ("high", "medium"):
                 potential_root_causes.append(
                     {
                         "correlation_type": corr.get("correlation_type"),
@@ -1949,6 +2030,8 @@ class LLMJSONOutputFormatter(OutputFormatter):
             "correlations_by_confidence_tier": correlations_by_tier,
             "timeline": timeline,
             "potential_root_causes": potential_root_causes,
+            "errors": results.get("errors", []),
+            "delta": results.get("delta"),
             "recommendations": [
                 {
                     "title": rec.get("title"),
@@ -2655,7 +2738,7 @@ class ExecutiveSummaryGenerator:
                 "category": "health",
             },
             "restart_policy": {
-                "keywords": ["crashloopbackoff", "back-off restarting", "restarted"],
+                "keywords": ["crashloopbackoff", "back-off restarting", "restarted", "high restart count"],
                 "title": "Investigate Restarting Pod",
                 "solution": "Check logs and fix application error",
                 "time": "10 min",
@@ -2666,32 +2749,42 @@ class ExecutiveSummaryGenerator:
         # Scan findings for quick win opportunities
         detected_issues = set()
 
-        for category, items in findings.items():
-            for item in items:
-                summary = item.get("summary", "").lower()
-                details = item.get("details", {})
+        # Worst first, so the quick win points at the most severe example rather
+        # than whichever finding happened to be scanned first
+        severity_rank = {"critical": 0, "warning": 1, "info": 2}
+        ordered = [
+            (category, item)
+            for category, items in findings.items()
+            for item in items
+            if isinstance(item, dict)
+        ]
+        ordered.sort(key=lambda ci: severity_rank.get(ci[1].get("details", {}).get("severity", "info"), 3))
 
-                for pattern_key, pattern_info in quick_win_patterns.items():
-                    for keyword in pattern_info["keywords"]:
-                        if keyword in summary and pattern_key not in detected_issues:
-                            detected_issues.add(pattern_key)
+        for _category, item in ordered:
+            summary = item.get("summary", "").lower()
+            details = item.get("details", {})
 
-                            # Extract affected resources
-                            affected_pod = details.get("pod", "")
-                            affected_namespace = details.get("namespace", "")
+            for pattern_key, pattern_info in quick_win_patterns.items():
+                for keyword in pattern_info["keywords"]:
+                    if keyword in summary and pattern_key not in detected_issues:
+                        detected_issues.add(pattern_key)
 
-                            quick_wins.append(
-                                {
-                                    "title": pattern_info["title"],
-                                    "solution": pattern_info["solution"],
-                                    "time": pattern_info["time"],
-                                    "category": pattern_info["category"],
-                                    "affected_pod": affected_pod,
-                                    "affected_namespace": affected_namespace,
-                                    "evidence": item.get("summary", ""),
-                                }
-                            )
-                            break
+                        # Extract affected resources
+                        affected_pod = details.get("pod", "")
+                        affected_namespace = details.get("namespace", "")
+
+                        quick_wins.append(
+                            {
+                                "title": pattern_info["title"],
+                                "solution": pattern_info["solution"],
+                                "time": pattern_info["time"],
+                                "category": pattern_info["category"],
+                                "affected_pod": affected_pod,
+                                "affected_namespace": affected_namespace,
+                                "evidence": item.get("summary", ""),
+                            }
+                        )
+                        break
 
         # Also check recommendations for quick wins
         for rec in recommendations:
@@ -2778,6 +2871,10 @@ class ExecutiveSummaryGenerator:
             "scheduling_failures": ("Scheduler", "No scheduling failures"),
             "network_issues": ("Network", "No network issues detected"),
             "rbac_issues": ("RBAC/IAM", "No authorization failures"),
+            "workload_security": (
+                "Workload Security",
+                "No privileged or host-mounted workloads outside system namespaces",
+            ),
             "image_pull_failures": ("Images", "All images pulling successfully"),
             "pvc_issues": ("Storage", "No PVC issues detected"),
             "dns_issues": ("DNS", "CoreDNS operating normally"),
@@ -2799,22 +2896,7 @@ class ExecutiveSummaryGenerator:
         """Get breakdown of issues by category"""
         breakdown = []
 
-        category_names = {
-            "memory_pressure": "Memory Pressure",
-            "disk_pressure": "Disk Pressure",
-            "pod_errors": "Pod Errors",
-            "node_issues": "Node Issues",
-            "oom_killed": "OOM Killed",
-            "control_plane_issues": "Control Plane",
-            "scheduling_failures": "Scheduling",
-            "network_issues": "Network",
-            "rbac_issues": "RBAC/IAM",
-            "image_pull_failures": "Image Pull",
-            "resource_quota_exceeded": "Resource Quotas",
-            "pvc_issues": "Storage/PVC",
-            "dns_issues": "DNS",
-            "addon_issues": "EKS Addons",
-        }
+        category_names = CATEGORY_DISPLAY_NAMES
 
         for category, items in findings.items():
             if not items:
@@ -2957,6 +3039,40 @@ class HTMLOutputFormatter(OutputFormatter):
                 html_parts.append(f"<p>{p}</p>")
 
         return "\n".join(html_parts)
+
+    def _generate_delta_html(self, delta: dict | None) -> str:
+        """Render what changed since the previous run, if incremental data exists."""
+        if not delta or delta.get("is_first_run"):
+            return ""
+
+        new_items = delta.get("new_issue_examples") or delta.get("new") or []
+        resolved_items = delta.get("resolved_issue_examples") or delta.get("resolved") or []
+        new_count = delta.get("new_issues", len(new_items))
+        resolved_count = delta.get("resolved_issues", len(resolved_items))
+
+        if not new_count and not resolved_count:
+            return ""
+
+        def _list(items):
+            if not items:
+                return "<li>None</li>"
+            return "".join(f"<li>{self._escape_html(str(item))[:160]}</li>" for item in items[:10])
+
+        return f"""
+            <div class="section" id="changes-since-last-run">
+                <div class="section-header">
+                    <span>🔁 Changes Since Last Run</span>
+                </div>
+                <div class="section-content">
+                    <p><strong>{new_count}</strong> new, <strong>{resolved_count}</strong> resolved
+                       since the previous analysis of this cluster.</p>
+                    <h4>New</h4>
+                    <ul>{_list(new_items)}</ul>
+                    <h4>Resolved</h4>
+                    <ul>{_list(resolved_items)}</ul>
+                </div>
+            </div>
+        """
 
     def _generate_executive_summary_html(self, exec_summary: dict, cluster_stats: dict | None = None) -> str:
         """Generate HTML for the Executive Summary section with Phase 1 & 2 enhancements"""
@@ -3665,13 +3781,15 @@ class HTMLOutputFormatter(OutputFormatter):
         """
 
         kubelet_versions = infra.get("kubelet_versions", [])
-        if kubelet_versions:
+        control_plane_version = infra.get("control_plane_version")
+        if kubelet_versions or control_plane_version:
             versions_str = ", ".join(self._escape_html(v) for v in kubelet_versions[:3])
             if len(kubelet_versions) > 3:
                 versions_str += f" (+{len(kubelet_versions) - 3} more)"
+            cp_str = self._escape_html(control_plane_version) if control_plane_version else "unknown"
             html += f"""
                             <div class="stat-footer">
-                                <span class="stat-note">K8s Versions: {versions_str}</span>
+                                <span class="stat-note">Control plane: {cp_str} | Kubelets: {versions_str or "unknown"}</span>
                             </div>
         """
 
@@ -3947,6 +4065,12 @@ class HTMLOutputFormatter(OutputFormatter):
                 "title": "RBAC Issues",
                 "source": "kubectl events + audit logs",
                 "color": "#6c5ce7",
+            },
+            "workload_security": {
+                "icon": "🛡️",
+                "title": "Workload Security",
+                "source": "kubectl pod specs",
+                "color": "#8e7cc3",
             },
             "image_pull_failures": {
                 "icon": "📦",
@@ -7138,10 +7262,10 @@ class HTMLOutputFormatter(OutputFormatter):
                     <div class="summary-value">{summary["warning"]}</div>
                     <div class="summary-label">Warnings</div>
                 </div>
-                <div class="summary-card healthy">
+                <div class="summary-card healthy" title="Finding categories that produced no findings">
                     <div class="summary-icon">✅</div>
                     <div class="summary-value">{summary.get("healthy_checks", 0)}</div>
-                    <div class="summary-label">Healthy Checks</div>
+                    <div class="summary-label">Categories Clear</div>
                 </div>
             </div>
 
@@ -7209,6 +7333,9 @@ class HTMLOutputFormatter(OutputFormatter):
 
         html += self._generate_executive_summary_html(exec_summary, cluster_stats)
 
+        # Changes since the previous run for this cluster
+        html += self._generate_delta_html(results.get("delta"))
+
         # What Happened section (right after Executive Summary)
         html += self._generate_what_happened_html(results)
 
@@ -7273,10 +7400,10 @@ class HTMLOutputFormatter(OutputFormatter):
                         item_severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
                         source_badge = self._get_source_icon(item.get("details", {}))
                         finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
-                        _details = item.get("details", {})
+                        _baseline = item.get("baseline", {})
                         baseline_badge = (
-                            f'<span class="severity-badge baseline" title="Seen in {_details.get("baseline_count", 0)} previous analyses">🔄 Known</span>'
-                            if _details.get("is_baseline")
+                            f'<span class="severity-badge baseline" title="Seen in {_baseline.get("count", 0)} previous analyses">🔄 Known</span>'
+                            if _baseline.get("is_baseline")
                             else ""
                         )
                         finding_id = f"{cat}-{idx}"
@@ -7418,6 +7545,7 @@ class HTMLOutputFormatter(OutputFormatter):
             "image_pull_failures": 10,
             "dns_issues": 11,
             "rbac_issues": 12,
+            "workload_security": 12,
             "addon_issues": 13,
             "resource_quota_exceeded": 14,  # Informational/best-practice last
             "quota_issues": 15,
@@ -7478,10 +7606,10 @@ class HTMLOutputFormatter(OutputFormatter):
                     item_severity = self._classify_severity(item.get("summary", ""), item.get("details", {}))
                     source_badge = self._get_source_icon(item.get("details", {}))
                     finding_type_badge = self._get_finding_type_badge(item.get("details", {}))
-                    _details2 = item.get("details", {})
+                    _baseline2 = item.get("baseline", {})
                     baseline_badge2 = (
-                        f'<span class="severity-badge baseline" title="Seen in {_details2.get("baseline_count", 0)} previous analyses">🔄 Known</span>'
-                        if _details2.get("is_baseline")
+                        f'<span class="severity-badge baseline" title="Seen in {_baseline2.get("count", 0)} previous analyses">🔄 Known</span>'
+                        if _baseline2.get("is_baseline")
                         else ""
                     )
                     escaped_summary2 = self._escape_html(item.get("summary", "N/A"))
@@ -8026,7 +8154,7 @@ class SSMNodeDiagnosticsManager:
         ssm_client: boto3 SSM client (from debugger.session)
     """
 
-    def __init__(self, debugger: "ComprehensiveEKSDebugger"):
+    def __init__(self, debugger: ComprehensiveEKSDebugger):
         """Initialize the SSM diagnostics manager.
 
         Args:
@@ -8449,7 +8577,7 @@ class NodeOSOutputParser:
                         "instance_id": instance_id,
                         "source": "SSM",
                         "rule": match.group(0),
-                        "remediation": f"Remove the blocking rule: iptables -D <chain> ... (see rule above)",
+                        "remediation": "Remove the blocking rule: iptables -D <chain> ... (see rule above)",
                     },
                 },
             )
@@ -9388,6 +9516,10 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         namespace: str | None = None,
         progress: ProgressTracker | None = None,
         kube_context: str | None = None,
+        parallel: bool = True,
+        max_findings: int = MAX_FINDINGS_PER_CATEGORY,
+        enable_cache: bool = True,
+        enable_incremental: bool = True,
         pagination_limit: int = 1000,
         enable_node_diagnostics: bool = False,
         ssm_timeout: int = NodeDiagnosticConfig.DEFAULT_SSM_TIMEOUT,
@@ -9434,15 +9566,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         self.namespace = namespace
         self.progress = progress or ProgressTracker()
         self.kube_context = kube_context
-        self.parallel = True
-        self.max_findings = MAX_FINDINGS_PER_CATEGORY
-        self.enable_cache = True
-        self.enable_incremental = True
+        self.parallel = parallel
+        self.max_findings = max_findings
+        self.enable_cache = enable_cache
+        self.enable_incremental = enable_incremental
         self.pagination_limit = pagination_limit
 
         # Node OS diagnostics configuration (Phase 1)
         self.enable_node_diagnostics = enable_node_diagnostics
-        self.ssm_timeout = min(ssm_timeout, NodeDiagnosticConfig.MAX_SSM_TIMEOUT)
+        self.ssm_timeout = max(
+            NodeDiagnosticConfig.MIN_SSM_TIMEOUT,
+            min(ssm_timeout, NodeDiagnosticConfig.MAX_SSM_TIMEOUT),
+        )
         self.ssm_mode = ssm_mode if ssm_mode in ("run-command", "automation", "both") else "run-command"
         self.ssm_max_nodes = max(1, ssm_max_nodes)
 
@@ -9481,6 +9616,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "scheduling_failures": [],
             "network_issues": [],
             "rbac_issues": [],
+            "workload_security": [],
             "image_pull_failures": [],
             "resource_quota_exceeded": [],
             "pvc_issues": [],
@@ -9812,8 +9948,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             output: Command output to cache
         """
         with self._shared_data_lock:
-            # Store as tuple (output, timestamp) for compatibility
-            self._shared_data["kubectl_cache"][cmd] = (output, time.time())
+            # Same shape _get_cached_kubectl reads; a tuple here was returned raw
+            self._shared_data["kubectl_cache"][cmd] = {"output": output, "timestamp": time.time()}
 
     def _get_kubectl_cache(self, cmd: str, max_age_seconds: int = 600) -> str | None:
         """Get cached kubectl output with TTL validation.
@@ -9951,10 +10087,46 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             "collection_timestamp": TimezoneManager.to_iso_string(TimezoneManager.now_utc()),
         }
 
+        # Fetch every resource this method needs in one parallel batch, then read
+        # the results from cache. Twenty-three sequential kubectl calls dominated
+        # the runtime of a full analysis.
+        scope = f"-n {self.namespace}" if self.namespace else "--all-namespaces"
+        batched_commands = [
+            "kubectl get namespaces -o json",
+            "kubectl get nodes -o json",
+            f"kubectl get deployments {scope} -o json",
+            f"kubectl get statefulsets {scope} -o json",
+            f"kubectl get daemonsets {scope} -o json",
+            f"kubectl get jobs {scope} -o json",
+            f"kubectl get cronjobs {scope} -o json",
+            f"kubectl get replicasets {scope} -o json",
+            f"kubectl get pods {scope} -o json",
+            f"kubectl get services {scope} -o json",
+            f"kubectl get ingresses {scope} -o json",
+            f"kubectl get networkpolicies {scope} -o json",
+            f"kubectl get endpoints {scope} -o json",
+            f"kubectl get pvc {scope} -o json",
+            "kubectl get pv -o json",
+            "kubectl get storageclasses -o json",
+            f"kubectl get configmaps {scope} -o json",
+            f"kubectl get secrets {scope} -o json",
+            f"kubectl get serviceaccounts {scope} -o json",
+            f"kubectl get roles {scope} -o json",
+            f"kubectl get rolebindings {scope} -o json",
+            "kubectl get clusterroles -o json",
+            "kubectl get clusterrolebindings -o json",
+        ]
+        try:
+            for cmd, output in (self._batch_kubectl_calls(batched_commands, parallel=self.parallel) or {}).items():
+                if output:
+                    self._set_kubectl_cache(cmd, output)
+        except Exception as e:
+            self._add_error("collect_cluster_statistics", f"Batch prefetch failed: {e}")
+
         try:
             # === Infrastructure Statistics ===
             # Namespaces
-            ns_output = self.safe_kubectl_call("kubectl get namespaces -o json")
+            ns_output = self._get_cached_kubectl("kubectl get namespaces -o json")
             if ns_output:
                 try:
                     ns_data = json.loads(ns_output)
@@ -9967,7 +10139,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             # Nodes
-            nodes_output = self.safe_kubectl_call("kubectl get nodes -o json")
+            nodes_output = self._get_cached_kubectl("kubectl get nodes -o json")
             if nodes_output:
                 try:
                     nodes_data = json.loads(nodes_output)
@@ -10014,6 +10186,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                         kube_versions.add(kv)
                     statistics["infrastructure"]["kubelet_versions"] = list(kube_versions)
 
+                    # Control plane version, so the report shows the skew rather than
+                    # only the kubelet versions
+                    cp_version = self._shared_data.get("control_plane_version")
+                    if not cp_version:
+                        success, cluster_resp = self.safe_api_call(
+                            self.eks_client.describe_cluster, name=self.cluster_name
+                        )
+                        if success and isinstance(cluster_resp, dict):
+                            cp_version = (cluster_resp.get("cluster") or {}).get("version")
+                    statistics["infrastructure"]["control_plane_version"] = cp_version or "unknown"
+
                 except json.JSONDecodeError:
                     pass
 
@@ -10023,7 +10206,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get deployments -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get deployments --all-namespaces -o json"
-            dep_output = self.safe_kubectl_call(cmd)
+            dep_output = self._get_cached_kubectl(cmd)
             if dep_output:
                 try:
                     dep_data = json.loads(dep_output)
@@ -10057,7 +10240,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get statefulsets -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get statefulsets --all-namespaces -o json"
-            sts_output = self.safe_kubectl_call(cmd)
+            sts_output = self._get_cached_kubectl(cmd)
             if sts_output:
                 try:
                     sts_data = json.loads(sts_output)
@@ -10079,7 +10262,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get daemonsets -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get daemonsets --all-namespaces -o json"
-            ds_output = self.safe_kubectl_call(cmd)
+            ds_output = self._get_cached_kubectl(cmd)
             if ds_output:
                 try:
                     ds_data = json.loads(ds_output)
@@ -10093,7 +10276,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get jobs -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get jobs --all-namespaces -o json"
-            jobs_output = self.safe_kubectl_call(cmd)
+            jobs_output = self._get_cached_kubectl(cmd)
             if jobs_output:
                 try:
                     jobs_data = json.loads(jobs_output)
@@ -10115,7 +10298,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get cronjobs -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get cronjobs --all-namespaces -o json"
-            cj_output = self.safe_kubectl_call(cmd)
+            cj_output = self._get_cached_kubectl(cmd)
             if cj_output:
                 try:
                     cj_data = json.loads(cj_output)
@@ -10129,7 +10312,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get replicasets -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get replicasets --all-namespaces -o json"
-            rs_output = self.safe_kubectl_call(cmd)
+            rs_output = self._get_cached_kubectl(cmd)
             if rs_output:
                 try:
                     rs_data = json.loads(rs_output)
@@ -10143,7 +10326,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get pods -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get pods --all-namespaces -o json"
-            pods_output = self.safe_kubectl_call(cmd)
+            pods_output = self._get_cached_kubectl(cmd)
             if pods_output:
                 try:
                     pods_data = json.loads(pods_output)
@@ -10178,7 +10361,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get services -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get services --all-namespaces -o json"
-            svc_output = self.safe_kubectl_call(cmd)
+            svc_output = self._get_cached_kubectl(cmd)
             if svc_output:
                 try:
                     svc_data = json.loads(svc_output)
@@ -10203,7 +10386,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get ingresses -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get ingresses --all-namespaces -o json"
-            ing_output = self.safe_kubectl_call(cmd)
+            ing_output = self._get_cached_kubectl(cmd)
             if ing_output:
                 try:
                     ing_data = json.loads(ing_output)
@@ -10217,7 +10400,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get networkpolicies -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get networkpolicies --all-namespaces -o json"
-            np_output = self.safe_kubectl_call(cmd)
+            np_output = self._get_cached_kubectl(cmd)
             if np_output:
                 try:
                     np_data = json.loads(np_output)
@@ -10231,7 +10414,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get endpoints -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get endpoints --all-namespaces -o json"
-            ep_output = self.safe_kubectl_call(cmd)
+            ep_output = self._get_cached_kubectl(cmd)
             if ep_output:
                 try:
                     ep_data = json.loads(ep_output)
@@ -10260,7 +10443,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get pvc -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get pvc --all-namespaces -o json"
-            pvc_output = self.safe_kubectl_call(cmd)
+            pvc_output = self._get_cached_kubectl(cmd)
             if pvc_output:
                 try:
                     pvc_data = json.loads(pvc_output)
@@ -10281,7 +10464,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             # PVs
-            pv_output = self.safe_kubectl_call("kubectl get pv -o json")
+            pv_output = self._get_cached_kubectl("kubectl get pv -o json")
             if pv_output:
                 try:
                     pv_data = json.loads(pv_output)
@@ -10291,7 +10474,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             # StorageClasses
-            sc_output = self.safe_kubectl_call("kubectl get storageclasses -o json")
+            sc_output = self._get_cached_kubectl("kubectl get storageclasses -o json")
             if sc_output:
                 try:
                     sc_data = json.loads(sc_output)
@@ -10315,7 +10498,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get configmaps -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get configmaps --all-namespaces -o json"
-            cm_output = self.safe_kubectl_call(cmd)
+            cm_output = self._get_cached_kubectl(cmd)
             if cm_output:
                 try:
                     cm_data = json.loads(cm_output)
@@ -10329,7 +10512,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get secrets -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get secrets --all-namespaces -o json"
-            sec_output = self.safe_kubectl_call(cmd)
+            sec_output = self._get_cached_kubectl(cmd)
             if sec_output:
                 try:
                     sec_data = json.loads(sec_output)
@@ -10351,7 +10534,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get serviceaccounts -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get serviceaccounts --all-namespaces -o json"
-            sa_output = self.safe_kubectl_call(cmd)
+            sa_output = self._get_cached_kubectl(cmd)
             if sa_output:
                 try:
                     sa_data = json.loads(sa_output)
@@ -10365,7 +10548,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get roles -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get roles --all-namespaces -o json"
-            roles_output = self.safe_kubectl_call(cmd)
+            roles_output = self._get_cached_kubectl(cmd)
             if roles_output:
                 try:
                     roles_data = json.loads(roles_output)
@@ -10379,7 +10562,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get rolebindings -n {self.namespace} -o json"
             else:
                 cmd = "kubectl get rolebindings --all-namespaces -o json"
-            rb_output = self.safe_kubectl_call(cmd)
+            rb_output = self._get_cached_kubectl(cmd)
             if rb_output:
                 try:
                     rb_data = json.loads(rb_output)
@@ -10389,7 +10572,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             # ClusterRoles
-            cr_output = self.safe_kubectl_call("kubectl get clusterroles -o json")
+            cr_output = self._get_cached_kubectl("kubectl get clusterroles -o json")
             if cr_output:
                 try:
                     cr_data = json.loads(cr_output)
@@ -10399,7 +10582,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     pass
 
             # ClusterRoleBindings
-            crb_output = self.safe_kubectl_call("kubectl get clusterrolebindings -o json")
+            crb_output = self._get_cached_kubectl("kubectl get clusterrolebindings -o json")
             if crb_output:
                 try:
                     crb_data = json.loads(crb_output)
@@ -10865,9 +11048,15 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self.findings[category] = []
             if len(self.findings[category]) >= self.max_findings:
                 return False
+            # The same pod can be reached by more than one analyzer. Counting it
+            # twice inflates the totals and the report's severity banner.
+            if any(f.get("summary") == summary for f in self.findings[category]):
+                return False
             if details is None:
                 details = {}
-            details["finding_type"] = finding_type
+            # An explicit finding_type in details wins: callers that classify a
+            # finding as historical must not have it silently reset to current.
+            details.setdefault("finding_type", finding_type)
             self.findings[category].append({"summary": summary, "details": details})
             return True
 
@@ -11207,12 +11396,42 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_node_conditions", str(e))
             self.progress.warning(f"Node condition analysis failed: {e}")
 
+    def _oom_from_container_statuses(self, pods: list[dict]) -> list[dict]:
+        """Return containers whose last termination was an OOM kill.
+
+        Kubelet no longer emits a durable OOMKilling event on modern clusters,
+        so the container status is the only reliable signal for a running pod
+        that is being killed repeatedly.
+        """
+        results = []
+        for pod in pods:
+            meta = pod.get("metadata", {})
+            limits_by_name = {
+                c.get("name"): ((c.get("resources") or {}).get("limits") or {}).get("memory")
+                for c in pod.get("spec", {}).get("containers", [])
+            }
+            for cs in pod.get("status", {}).get("containerStatuses", []) or []:
+                term = (cs.get("lastState") or {}).get("terminated") or {}
+                if term.get("reason") == "OOMKilled" or term.get("exitCode") == 137:
+                    results.append(
+                        {
+                            "pod": meta.get("name", ""),
+                            "namespace": meta.get("namespace", ""),
+                            "container": cs.get("name", ""),
+                            "restart_count": cs.get("restartCount", 0),
+                            "finished_at": term.get("finishedAt", ""),
+                            "memory_limit": limits_by_name.get(cs.get("name")) or "none",
+                        }
+                    )
+        return results
+
     def check_oom_events(self):
         """
-        Check for OOMKilled (Out of Memory) events within the date range.
+        Check for OOMKilled (Out of Memory) containers and events.
 
-        Queries kubectl events for OOMKilling reason to identify pods
-        that were terminated due to exceeding memory limits.
+        Two sources are used because they cover different situations:
+        - kubectl events with reason=OOMKilling (historical, short lived)
+        - container status lastState.terminated (current, survives event expiry)
 
         Populates:
             self.findings['oom_killed']: Pods killed by OOM killer.
@@ -11225,36 +11444,71 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 cmd = f"kubectl get events -n {self.namespace} --field-selector reason=OOMKilling -o json"
 
             output = self.safe_kubectl_call(cmd)
-            if not output:
-                self.progress.info("No OOMKilled events found")
-                return
+            event_count = 0
+            if output:
+                events = json.loads(output)
 
-            events = json.loads(output)
+                # Apply date filtering
+                events = self.filter_kubectl_events_by_date(events, self.start_date, self.end_date)
 
-            # Apply date filtering
-            events = self.filter_kubectl_events_by_date(events, self.start_date, self.end_date)
+                for event in events.get("items", []):
+                    pod = event["involvedObject"].get("name", "Unknown")
+                    namespace = event["metadata"]["namespace"]
+                    message = event.get("message", "N/A")
+                    timestamp = event.get("lastTimestamp", "Unknown")
 
-            for event in events.get("items", []):
-                pod = event["involvedObject"].get("name", "Unknown")
-                namespace = event["metadata"]["namespace"]
-                message = event.get("message", "N/A")
-                timestamp = event.get("lastTimestamp", "Unknown")
-
-                self._add_finding_dict(
-                    "oom_killed",
-                    {
-                        "summary": f"Pod {namespace}/{pod} was OOM killed",
-                        "details": {
-                            "pod": pod,
-                            "namespace": namespace,
-                            "timestamp": timestamp,
-                            "message": message,
-                            "finding_type": FindingType.HISTORICAL_EVENT,
+                    self._add_finding_dict(
+                        "oom_killed",
+                        {
+                            "summary": f"Pod {namespace}/{pod} was OOM killed",
+                            "details": {
+                                "pod": pod,
+                                "namespace": namespace,
+                                "timestamp": timestamp,
+                                "message": message,
+                                "finding_type": FindingType.HISTORICAL_EVENT,
+                            },
                         },
+                    )
+                event_count = len(events.get("items", []))
+
+            # Container status is authoritative for pods being killed right now
+            pods_cmd = "kubectl get pods --all-namespaces -o json"
+            if self.namespace:
+                pods_cmd = f"kubectl get pods -n {self.namespace} -o json"
+            pods_json = self._get_cached_kubectl(pods_cmd)
+            pods = json.loads(pods_json).get("items", []) if pods_json else []
+
+            status_hits = self._oom_from_container_statuses(pods)
+            for hit in status_hits:
+                # A container killed once is worth knowing. One killed repeatedly
+                # is an outage in progress, and the two should not read alike.
+                looping = hit["restart_count"] >= Thresholds.RESTART_CRITICAL
+                self._add_finding(
+                    "oom_killed",
+                    f"Pod {hit['namespace']}/{hit['pod']} container {hit['container']} was OOMKilled "
+                    f"(memory limit {hit['memory_limit']}, {hit['restart_count']} restarts)",
+                    {
+                        **hit,
+                        "severity": "critical" if looping else "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": (
+                            "Container repeatedly exceeds its memory limit and is killed by the kernel"
+                            if looping
+                            else "Container exceeded its memory limit and was killed by the kernel"
+                        ),
+                        "recommendation": (
+                            f"Raise the memory limit for container {hit['container']} above its observed "
+                            "working set, or fix the leak that drives memory growth"
+                        ),
+                        "diagnostic_steps": [
+                            f"kubectl top pod {hit['pod']} -n {hit['namespace']} --containers",
+                            f"kubectl describe pod {hit['pod']} -n {hit['namespace']} | grep -A5 'Last State'",
+                        ],
                     },
                 )
 
-            self.progress.info(f"Found {len(events.get('items', []))} OOM events in date range")
+            self.progress.info(f"Found {event_count} OOM events and {len(status_hits)} OOMKilled containers")
 
         except Exception as e:
             self._add_error("check_oom_events", str(e))
@@ -11583,21 +11837,132 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     # === NEW: Comprehensive Analysis Methods ===
 
+    @staticmethod
+    def _control_plane_query() -> str:
+        """Build the Logs Insights query used to aggregate control plane errors."""
+        patterns = list(CONTROL_PLANE_ERROR_PATTERNS) + [
+            "Evict",
+            "NotReady",
+            "FailedScheduling",
+            "OOM",
+        ]
+        alternation = "|".join(patterns)
+        return (
+            "fields @timestamp, @logStream, @message\n"
+            "| filter @logStream not like /audit|authenticator/\n"
+            f"| filter @message like /(?i)({alternation})/\n"
+            f"| parse @message /(?i)(?<pattern>{alternation})/\n"
+            "| parse @logStream /^(?<comp>[a-z-]+?)-[0-9a-f]{8}/\n"
+            "| stats count(*) as n, min(@timestamp) as first, max(@timestamp) as last by comp, pattern\n"
+            "| sort n desc"
+        )
+
+    def _run_logs_insights(self, query: str, limit: int = 100) -> list[dict] | None:
+        """Run a CloudWatch Logs Insights query over the analysis window.
+
+        Returns a list of row dicts, or None when Insights cannot be used so the
+        caller can fall back to stream sampling.
+        """
+        log_group = f"/aws/eks/{self.cluster_name}/cluster"
+        try:
+            success, response = self.safe_api_call(
+                self.logs_client.start_query,
+                logGroupName=log_group,
+                startTime=int(self.start_date.timestamp()),
+                endTime=int(self.end_date.timestamp()),
+                queryString=query,
+                limit=limit,
+                use_cache=False,
+            )
+            if not success or not isinstance(response, dict):
+                return None
+            query_id = response.get("queryId")
+            if not query_id:
+                return None
+
+            for _ in range(CONTROL_PLANE_QUERY_POLLS):
+                time.sleep(CONTROL_PLANE_QUERY_POLL_SECONDS)
+                success, result = self.safe_api_call(
+                    self.logs_client.get_query_results, queryId=query_id, use_cache=False
+                )
+                if not success or not isinstance(result, dict):
+                    return None
+                status = result.get("status")
+                if status == "Complete":
+                    return [{field["field"]: field["value"] for field in row} for row in result.get("results", [])]
+                if status in ("Failed", "Cancelled", "Timeout"):
+                    self._add_error("analyze_control_plane_logs", f"Logs Insights query {status.lower()}")
+                    return None
+
+            self._add_error("analyze_control_plane_logs", "Logs Insights query did not complete in time")
+            return None
+        except Exception as e:
+            self._add_error("analyze_control_plane_logs", f"Logs Insights unavailable: {e}")
+            return None
+
     def analyze_control_plane_logs(self):
         """
         Analyze EKS control plane CloudWatch logs for errors.
 
-        Scans API server, scheduler, controller manager, and authenticator
-        logs for error patterns while filtering out benign messages.
+        Uses Logs Insights so the whole analysis window is covered and matching
+        lines are aggregated per component and pattern. Sampling a fixed number
+        of events from a handful of streams misses almost everything on a busy
+        cluster, which is why a 2 million line window used to report nothing.
 
         Populates:
-            self.findings['control_plane_issues']: Errors from control plane logs.
+            self.findings['control_plane_issues']: Aggregated control plane errors.
 
         Reference:
             https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html
         """
         self.progress.step("Analyzing control plane logs...")
 
+        rows = self._run_logs_insights(self._control_plane_query())
+        if rows is None:
+            self.progress.info("Logs Insights unavailable, sampling recent control plane streams")
+            self._sample_control_plane_streams()
+            return
+
+        for row in rows:
+            component = row.get("comp") or "control-plane"
+            pattern = row.get("pattern", "")
+            try:
+                count = int(float(row.get("n", 0) or 0))
+            except (TypeError, ValueError):
+                count = 0
+            if not count:
+                continue
+
+            first_seen = row.get("first", "")
+            last_seen = row.get("last", "")
+            timestamp = first_seen.replace(" ", "T")[:19] + "Z" if first_seen else ""
+            is_critical = any(p.lower() in pattern.lower() for p in CONTROL_PLANE_ERROR_PATTERNS)
+
+            self._add_finding(
+                "control_plane_issues",
+                f"{component}: {count} log lines matching '{pattern}' between "
+                f"{first_seen[:16] or 'unknown'} and {last_seen[:16] or 'unknown'}",
+                {
+                    "component": component,
+                    "pattern": pattern,
+                    "count": count,
+                    "timestamp": timestamp,
+                    "first_seen": first_seen,
+                    "last_seen": last_seen,
+                    "severity": "critical" if is_critical else "warning",
+                    "finding_type": FindingType.HISTORICAL_EVENT,
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
+                },
+            )
+
+        self.progress.info(f"Control plane analysis found {len(rows)} error patterns in the window")
+
+    def _sample_control_plane_streams(self):
+        """Fallback: sample the most recent control plane log streams.
+
+        Used only when Logs Insights is unavailable. Reads a bounded number of
+        events per stream, so it sees a small slice of a busy cluster's logs.
+        """
         log_group = f"/aws/eks/{self.cluster_name}/cluster"
 
         try:
@@ -12355,17 +12720,26 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self.progress.info(f"Cluster Insights not available: {response}")
                 return
 
-            insight_summaries = response.get("insightSummaries", [])
+            # The ListInsights response key is "insights". Reading "insightSummaries"
+            # made this check a silent no-op on every cluster.
+            insight_summaries = response.get("insights", [])
 
             if not insight_summaries:
                 self.progress.info("No cluster insights found")
                 return
 
+            reported = 0
             for summary in insight_summaries:
                 insight_id = summary.get("id", "")
                 category = summary.get("category", "Unknown")
-                status = summary.get("status", "Unknown")
+                status_block = summary.get("insightStatus") or {}
+                status = status_block.get("status", "UNKNOWN")
                 description = summary.get("description", "N/A")
+                name = summary.get("name", "EKS insight")
+
+                # PASSING and UNKNOWN insights are not problems; only report real ones.
+                if status not in ("WARNING", "ERROR"):
+                    continue
 
                 # Get detailed insight information
                 success, detail_response = self.safe_api_call(
@@ -12381,32 +12755,30 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 recommendations = insight.get("recommendation", "")
                 resources = insight.get("kubernetesResourceUri", [])
 
-                # Map category to severity
-                severity_map = {
-                    "UPGRADE_READINESS": "critical",
-                    "SECURITY": "critical",
-                    "RELIABILITY": "warning",
-                    "PERFORMANCE": "warning",
-                }
-                severity = severity_map.get(category, "info")
+                # Severity follows the insight status, not its category
+                severity = "critical" if status == "ERROR" else "warning"
 
                 # Map category to finding category
                 category_map = {
                     "UPGRADE_READINESS": "control_plane_issues",
-                    "SECURITY": "rbac_issues",
+                    "SECURITY": "workload_security",
                     "RELIABILITY": "node_issues",
                     "PERFORMANCE": "pod_errors",
                 }
                 finding_category = category_map.get(category, "pod_errors")
+                reported += 1
 
+                detail_text = status_block.get("reason") or description
                 self._add_finding_dict(
                     finding_category,
                     {
-                        "summary": f"EKS Insight [{category}]: {description[:100]}{'...' if len(description) > 100 else ''}",
+                        "summary": f"EKS Insight {name} [{category}] is {status}: {detail_text[:100]}{'...' if len(detail_text) > 100 else ''}",
                         "details": {
                             "insight_id": insight_id,
+                            "insight_name": name,
                             "category": category,
                             "status": status,
+                            "status_reason": status_block.get("reason", ""),
                             "description": description,
                             "recommendation": recommendations,
                             "resources": resources[:5] if resources else [],
@@ -12417,7 +12789,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     },
                 )
 
-            self.progress.info(f"Checked {len(insight_summaries)} cluster insights")
+            self.progress.info(
+                f"Checked {len(insight_summaries)} cluster insights, {reported} in WARNING or ERROR state"
+            )
 
         except Exception as e:
             self._add_error("check_eks_cluster_insights", str(e))
@@ -12590,32 +12964,39 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                                 },
                             )
 
-                    # Check for high restart count
-                    if restart_count >= Thresholds.RESTART_CRITICAL:
+                    # Check for high restart count. An OOM-killed container is
+                    # reported by check_oom_events, which also names the memory
+                    # limit, so reporting it here as well is pure duplication.
+                    last_reason = ((container_status.get("lastState") or {}).get("terminated") or {}).get("reason", "")
+                    reason_suffix = f" (last exit: {last_reason})" if last_reason else ""
+                    oom_owned = last_reason == "OOMKilled"
+                    if not oom_owned and restart_count >= Thresholds.RESTART_CRITICAL:
                         self._add_finding_dict(
                             "pod_errors",
                             {
-                                "summary": f"Pod {namespace}/{pod_name} container {container_name} has high restart count: {restart_count}",
+                                "summary": f"Pod {namespace}/{pod_name} container {container_name} has high restart count: {restart_count}{reason_suffix}",
                                 "details": {
                                     "pod": pod_name,
                                     "namespace": namespace,
                                     "container": container_name,
                                     "restart_count": restart_count,
+                                    "last_termination_reason": last_reason,
                                     "severity": "critical",
                                     "finding_type": FindingType.CURRENT_STATE,
                                 },
                             },
                         )
-                    elif restart_count >= Thresholds.RESTART_WARNING:
+                    elif not oom_owned and restart_count >= Thresholds.RESTART_WARNING:
                         self._add_finding_dict(
                             "pod_errors",
                             {
-                                "summary": f"Pod {namespace}/{pod_name} container {container_name} restarted {restart_count} times",
+                                "summary": f"Pod {namespace}/{pod_name} container {container_name} restarted {restart_count} times{reason_suffix}",
                                 "details": {
                                     "pod": pod_name,
                                     "namespace": namespace,
                                     "container": container_name,
                                     "restart_count": restart_count,
+                                    "last_termination_reason": last_reason,
                                     "severity": "warning",
                                     "finding_type": FindingType.CURRENT_STATE,
                                 },
@@ -13381,6 +13762,81 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_init_container_failures", str(e))
 
+    def analyze_missing_pdbs(self):
+        """
+        Flag Deployments and StatefulSets that have no PodDisruptionBudget.
+
+        Gap addressed: analyze_pdb_violations only inspects PDBs that exist. A
+        workload with many replicas and no PDB at all can lose every replica at
+        once during a node drain or a managed node group upgrade.
+
+        Detection:
+        - Deployment or StatefulSet with more than one replica outside system
+          namespaces and no PDB whose selector matches its pod labels
+        """
+        self.progress.step("Analyzing workloads without PodDisruptionBudgets...")
+        try:
+
+            def _items(cmd: str) -> list:
+                raw = self._get_cached_kubectl(cmd)
+                try:
+                    return json.loads(raw).get("items", []) if raw else []
+                except (ValueError, AttributeError):
+                    return []
+
+            scope = f"-n {self.namespace}" if self.namespace else "--all-namespaces"
+            pdbs = _items(f"kubectl get pdb {scope} -o json")
+            workloads = [("Deployment", d) for d in _items(f"kubectl get deploy {scope} -o json")]
+            workloads += [("StatefulSet", w) for w in _items(f"kubectl get statefulset {scope} -o json")]
+
+            for kind, workload in workloads:
+                namespace = workload["metadata"]["namespace"]
+                name = workload["metadata"]["name"]
+                replicas = workload.get("spec", {}).get("replicas") or 0
+
+                if namespace in SYSTEM_NAMESPACES or replicas < 2:
+                    continue
+
+                labels = workload.get("spec", {}).get("template", {}).get("metadata", {}).get("labels") or {}
+                covered = False
+                for pdb in pdbs:
+                    if pdb["metadata"]["namespace"] != namespace:
+                        continue
+                    match_labels = (pdb.get("spec", {}).get("selector") or {}).get("matchLabels") or {}
+                    if match_labels and match_labels.items() <= labels.items():
+                        covered = True
+                        break
+
+                if covered:
+                    continue
+
+                self._add_finding(
+                    "scheduling_failures",
+                    f"{kind} {namespace}/{name} ({replicas} replicas) has no PodDisruptionBudget",
+                    {
+                        "workload": name,
+                        "kind": kind,
+                        "namespace": namespace,
+                        "replicas": replicas,
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "A node drain or managed node group upgrade can remove all replicas at once",
+                        "recommendation": (
+                            f"Create a PodDisruptionBudget for {kind.lower()}/{name} with minAvailable set to "
+                            f"at least half of {replicas}"
+                        ),
+                        "diagnostic_steps": [
+                            f"kubectl get pdb -n {namespace}",
+                            f"kubectl get {kind.lower()} {name} -n {namespace} "
+                            "-o jsonpath='{.spec.template.metadata.labels}'",
+                        ],
+                        "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managed-node-update-behavior.html",
+                    },
+                )
+
+        except Exception as e:
+            self._add_error("analyze_missing_pdbs", f"Unexpected error: {e}")
+
     def analyze_pdb_violations(self):
         """
         Analyze Pod Disruption Budget violations.
@@ -13662,14 +14118,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     def analyze_version_skew(self):
         """
-        Analyze kubelet version skew between control plane and nodes.
+        Analyze Kubernetes version skew between control plane, nodes and node groups.
 
-        Gap addressed: Kubernetes supports N-2 minor versions between control plane
-        and nodes. Version skew beyond this is unsupported and risky.
+        Kubernetes supports N-2 minor versions between control plane and kubelet.
+        A one minor gap is supported but is the signal that a node upgrade is due,
+        so it is reported as information rather than hidden.
 
         Detection:
         - Nodes with kubelet >2 minor versions behind control plane (critical)
-        - Nodes at maximum allowed skew (warning - will break on next upgrade)
+        - Nodes at maximum allowed skew (warning)
+        - Nodes one minor behind, aggregated into a single finding (info)
+        - Node groups behind the control plane, including scaled-to-zero groups
         """
         self.progress.step("Analyzing Kubernetes version skew...")
         try:
@@ -13677,11 +14136,13 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             cluster_info = self.eks_client.describe_cluster(name=self.cluster_name)
             cp_version = cluster_info["cluster"]["version"]  # e.g., "1.29"
             cp_minor = int(cp_version.split(".")[1])
+            with self._shared_data_lock:
+                self._shared_data["control_plane_version"] = cp_version
 
             nodes_json = self._get_cached_kubectl("kubectl get nodes -o json")
-            if not nodes_json:
-                return
-            nodes = json.loads(nodes_json).get("items", [])
+            nodes = json.loads(nodes_json).get("items", []) if nodes_json else []
+
+            one_minor_behind = []
 
             for node in nodes:
                 node_name = node.get("metadata", {}).get("name", "")
@@ -13689,45 +14150,116 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 # Parse kubelet version (e.g., "v1.27.9-eks-...")
                 version_match = re.search(r"v1\.(\d+)", kubelet_version)
-                if version_match:
-                    node_minor = int(version_match.group(1))
-                    skew = cp_minor - node_minor
+                if not version_match:
+                    continue
 
-                    if skew > 2:
-                        self._add_finding(
-                            "node_issues",
-                            f"Node {node_name} kubelet {kubelet_version} is {skew} minor versions "
-                            f"behind control plane {cp_version} (unsupported skew)",
-                            {
-                                "node": node_name,
-                                "kubelet_version": kubelet_version,
-                                "control_plane_version": cp_version,
-                                "version_skew": skew,
-                                "severity": "critical",
-                                "finding_type": FindingType.CURRENT_STATE,
-                                "impact": "Node may lose API compatibility at any time. "
-                                "Kubernetes only supports N-2 version skew.",
-                                "diagnostic_steps": [
-                                    "Update node group to use a supported Kubernetes version",
-                                    "Consider creating a new node group with updated AMI",
-                                ],
-                            },
-                        )
-                    elif skew == 2:
-                        self._add_finding(
-                            "node_issues",
-                            f"Node {node_name} kubelet {kubelet_version} at maximum allowed skew "
-                            f"from control plane {cp_version}",
-                            {
-                                "node": node_name,
-                                "kubelet_version": kubelet_version,
-                                "control_plane_version": cp_version,
-                                "version_skew": skew,
-                                "severity": "warning",
-                                "finding_type": FindingType.CURRENT_STATE,
-                                "impact": "Next control plane upgrade will make this node incompatible",
-                            },
-                        )
+                node_minor = int(version_match.group(1))
+                skew = cp_minor - node_minor
+
+                if skew > 2:
+                    self._add_finding(
+                        "node_issues",
+                        f"Node {node_name} kubelet {kubelet_version} is {skew} minor versions "
+                        f"behind control plane {cp_version} (unsupported skew)",
+                        {
+                            "node": node_name,
+                            "kubelet_version": kubelet_version,
+                            "control_plane_version": cp_version,
+                            "version_skew": skew,
+                            "severity": "critical",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "impact": "Node may lose API compatibility at any time. "
+                            "Kubernetes only supports N-2 version skew.",
+                            "diagnostic_steps": [
+                                "Update node group to use a supported Kubernetes version",
+                                "Consider creating a new node group with updated AMI",
+                            ],
+                        },
+                    )
+                elif skew == 2:
+                    self._add_finding(
+                        "node_issues",
+                        f"Node {node_name} kubelet {kubelet_version} at maximum allowed skew "
+                        f"from control plane {cp_version}",
+                        {
+                            "node": node_name,
+                            "kubelet_version": kubelet_version,
+                            "control_plane_version": cp_version,
+                            "version_skew": skew,
+                            "severity": "warning",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "impact": "Next control plane upgrade will make this node incompatible",
+                        },
+                    )
+                elif skew == 1:
+                    one_minor_behind.append({"node": node_name, "kubelet_version": kubelet_version})
+
+            if one_minor_behind:
+                self._add_finding(
+                    "node_issues",
+                    f"{len(one_minor_behind)} nodes run kubelet 1.{cp_minor - 1} while the control plane "
+                    f"is {cp_version}; the node upgrade is one minor behind",
+                    {
+                        "nodes": [n["node"] for n in one_minor_behind][:20],
+                        "node_count": len(one_minor_behind),
+                        "control_plane_version": cp_version,
+                        "version_skew": 1,
+                        "severity": "info",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Supported today; becomes maximum skew after the next control plane upgrade",
+                        "diagnostic_steps": [
+                            f"aws eks update-nodegroup-version --cluster-name {self.cluster_name} "
+                            "--nodegroup-name <nodegroup> --kubernetes-version " + cp_version,
+                        ],
+                    },
+                )
+
+            # Node groups carry their own version, including groups scaled to zero
+            # that have no nodes to inspect.
+            success, response = self.safe_api_call(self.eks_client.list_nodegroups, clusterName=self.cluster_name)
+            nodegroup_names = response.get("nodegroups", []) if success and isinstance(response, dict) else []
+
+            for nodegroup_name in nodegroup_names:
+                success, detail = self.safe_api_call(
+                    self.eks_client.describe_nodegroup,
+                    clusterName=self.cluster_name,
+                    nodegroupName=nodegroup_name,
+                )
+                if not success or not isinstance(detail, dict):
+                    continue
+
+                nodegroup = detail.get("nodegroup", {})
+                ng_version = nodegroup.get("version", "")
+                match = re.search(r"1\.(\d+)", ng_version)
+                if not match:
+                    continue
+
+                ng_skew = cp_minor - int(match.group(1))
+                if ng_skew < 1:
+                    continue
+
+                severity = "critical" if ng_skew > 2 else ("warning" if ng_skew == 2 else "info")
+                desired = (nodegroup.get("scalingConfig") or {}).get("desiredSize")
+                self._add_finding(
+                    "node_issues",
+                    f"Node group {nodegroup_name} is at Kubernetes {ng_version}, {ng_skew} minor version(s) "
+                    f"behind control plane {cp_version} (desired size {desired})",
+                    {
+                        "nodegroup": nodegroup_name,
+                        "nodegroup_version": ng_version,
+                        "control_plane_version": cp_version,
+                        "version_skew": ng_skew,
+                        "desired_size": desired,
+                        "severity": severity,
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Scaling this node group up would add nodes at an outdated version",
+                        "diagnostic_steps": [
+                            f"aws eks update-nodegroup-version --cluster-name {self.cluster_name} "
+                            f"--nodegroup-name {nodegroup_name} --kubernetes-version {cp_version}",
+                            "Delete the node group if it is no longer used",
+                        ],
+                    },
+                )
 
         except Exception as e:
             self._add_error("analyze_version_skew", str(e))
@@ -14042,71 +14574,136 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_topology_spread", str(e))
 
+    _AMI_SSM_PATHS = {
+        "AL2023_x86_64_STANDARD": "amazon-linux-2023/x86_64/standard",
+        "AL2023_ARM_64_STANDARD": "amazon-linux-2023/arm64/standard",
+        "AL2023_x86_64_NVIDIA": "amazon-linux-2023/x86_64/nvidia",
+        "AL2023_x86_64_NEURON": "amazon-linux-2023/x86_64/neuron",
+        "AL2_x86_64": "amazon-linux-2",
+        "AL2_ARM_64": "amazon-linux-2-arm64",
+        "AL2_x86_64_GPU": "amazon-linux-2-gpu",
+        "BOTTLEROCKET_x86_64": "bottlerocket/x86_64",
+        "BOTTLEROCKET_ARM_64": "bottlerocket/arm64",
+    }
+
+    def _recommended_ami_release(self, k8s_version: str, ami_type: str) -> str | None:
+        """Return the AMI release version AWS currently recommends for this node group."""
+        path = self._AMI_SSM_PATHS.get(ami_type)
+        if not path or not k8s_version:
+            return None
+        name = f"/aws/service/eks/optimized-ami/{k8s_version}/{path}/recommended/release_version"
+        success, response = self.safe_api_call(self.ssm_client.get_parameter, Name=name)
+        if not success or not isinstance(response, dict):
+            return None
+        return (response.get("Parameter") or {}).get("Value")
+
+    @staticmethod
+    def _ami_release_date(release: str) -> datetime | None:
+        """Parse the trailing -YYYYMMDD build stamp of an EKS AMI release version."""
+        match = re.search(r"-(\d{8})$", release or "")
+        if not match:
+            return None
+        try:
+            return datetime.strptime(match.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
     def analyze_node_ami_age(self):
         """
-        Analyze node AMI age for security patch status.
+        Analyze node group AMI patch level.
 
-        Gap addressed: Old AMIs miss kernel patches and containerd fixes.
+        Gap addressed: old AMIs miss kernel patches and containerd fixes.
+
+        Node uptime says nothing about patch level: a node booted yesterday from
+        a six month old AMI is just as unpatched as one booted six months ago.
+        This compares each node group's releaseVersion against the release AWS
+        currently recommends for that Kubernetes version and AMI type.
 
         Detection:
-        - Nodes older than 90 days (warning)
-        - Nodes older than 180 days (critical)
+        - Node group AMI more than 180 days behind the recommended release (critical)
+        - Node group AMI behind the recommended release (warning)
+        - Custom AMIs, which cannot be assessed (info)
         """
-        self.progress.step("Analyzing node AMI age...")
+        self.progress.step("Analyzing node AMI patch level...")
         try:
-            nodes_json = self._get_cached_kubectl("kubectl get nodes -o json")
-            if not nodes_json:
+            success, response = self.safe_api_call(self.eks_client.list_nodegroups, clusterName=self.cluster_name)
+            if not success or not isinstance(response, dict):
                 return
-            nodes = json.loads(nodes_json).get("items", [])
+            nodegroup_names = response.get("nodegroups", [])
 
-            for node in nodes:
-                node_name = node.get("metadata", {}).get("name", "")
-                creation_ts = node.get("metadata", {}).get("creationTimestamp", "")
-                os_image = node.get("status", {}).get("nodeInfo", {}).get("osImage", "")
-                kubelet_version = node.get("status", {}).get("nodeInfo", {}).get("kubeletVersion", "")
+            recommended_cache: dict[tuple[str, str], str | None] = {}
 
-                if creation_ts:
-                    from dateutil import parser as date_parser
+            for nodegroup_name in nodegroup_names:
+                success, detail = self.safe_api_call(
+                    self.eks_client.describe_nodegroup,
+                    clusterName=self.cluster_name,
+                    nodegroupName=nodegroup_name,
+                )
+                if not success or not isinstance(detail, dict):
+                    continue
 
-                    created = date_parser.parse(creation_ts)
-                    if created.tzinfo is None:
-                        created = created.replace(tzinfo=timezone.utc)
-                    age_days = (TimezoneManager.now_utc() - created).days
+                nodegroup = detail.get("nodegroup", {})
+                release = nodegroup.get("releaseVersion", "")
+                k8s_version = nodegroup.get("version", "")
+                ami_type = nodegroup.get("amiType", "")
+                desired = (nodegroup.get("scalingConfig") or {}).get("desiredSize")
 
-                    if age_days > 180:
-                        self._add_finding(
-                            "node_issues",
-                            f"Node {node_name} is {age_days} days old — AMI likely missing critical security patches",
-                            {
-                                "node": node_name,
-                                "age_days": age_days,
-                                "os_image": os_image,
-                                "kubelet_version": kubelet_version,
-                                "created_at": creation_ts,
-                                "severity": "critical",
-                                "finding_type": FindingType.CURRENT_STATE,
-                                "impact": "Node may be vulnerable to known security issues",
-                                "diagnostic_steps": [
-                                    "Check node group AMI release version",
-                                    "Consider rolling replacement with updated AMI",
-                                    "Review AWS security bulletins for EKS AMI updates",
-                                ],
-                            },
-                        )
-                    elif age_days > 90:
-                        self._add_finding(
-                            "node_issues",
-                            f"Node {node_name} is {age_days} days old — AMI may be missing security patches",
-                            {
-                                "node": node_name,
-                                "age_days": age_days,
-                                "os_image": os_image,
-                                "kubelet_version": kubelet_version,
-                                "created_at": creation_ts,
-                                "severity": "warning",
-                                "finding_type": FindingType.CURRENT_STATE,
-                            },
-                        )
+                current_date = self._ami_release_date(release)
+                if current_date is None:
+                    self._add_finding(
+                        "node_issues",
+                        f"Node group {nodegroup_name} uses a custom AMI ({release or 'unknown'}); "
+                        "patch level cannot be assessed automatically",
+                        {
+                            "nodegroup": nodegroup_name,
+                            "ami_type": ami_type,
+                            "current_release": release,
+                            "desired_size": desired,
+                            "severity": "info",
+                            "finding_type": FindingType.CURRENT_STATE,
+                            "impact": "Patch status of custom AMIs must be tracked outside this tool",
+                        },
+                    )
+                    continue
+
+                cache_key = (k8s_version, ami_type)
+                if cache_key not in recommended_cache:
+                    recommended_cache[cache_key] = self._recommended_ami_release(k8s_version, ami_type)
+                recommended = recommended_cache[cache_key]
+
+                if not recommended or recommended == release:
+                    continue
+
+                recommended_date = self._ami_release_date(recommended)
+                if recommended_date is None or recommended_date <= current_date:
+                    continue
+
+                days_behind = (recommended_date - current_date).days
+                severity = "critical" if days_behind > 180 else "warning"
+
+                self._add_finding(
+                    "node_issues",
+                    f"Node group {nodegroup_name} runs AMI release {release}; the recommended release for "
+                    f"Kubernetes {k8s_version} is {recommended} ({days_behind} days newer)",
+                    {
+                        "nodegroup": nodegroup_name,
+                        "ami_type": ami_type,
+                        "kubernetes_version": k8s_version,
+                        "current_release": release,
+                        "recommended_release": recommended,
+                        "days_behind": days_behind,
+                        "desired_size": desired,
+                        "severity": severity,
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Nodes are missing kernel, containerd, and kubelet patches from newer AMI builds",
+                        "diagnostic_steps": [
+                            f"aws eks describe-nodegroup --cluster-name {self.cluster_name} "
+                            f"--nodegroup-name {nodegroup_name} --query 'nodegroup.releaseVersion'",
+                            f"aws eks update-nodegroup-version --cluster-name {self.cluster_name} "
+                            f"--nodegroup-name {nodegroup_name}",
+                        ],
+                    },
+                )
 
         except Exception as e:
             self._add_error("analyze_node_ami_age", str(e))
@@ -14306,6 +14903,25 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_karpenter_drift", str(e))
 
+    def _workload_owner(self, pod: dict) -> tuple[str, str, str]:
+        """Return (owner_kind, owner_name, namespace) for a pod.
+
+        ReplicaSet and Job owners are rolled up to their Deployment or CronJob so
+        that a finding is reported once per workload rather than once per pod.
+        """
+        meta = pod.get("metadata", {})
+        ns = meta.get("namespace", "")
+        owners = meta.get("ownerReferences") or []
+        if not owners:
+            return ("Pod", meta.get("name", ""), ns)
+        kind = owners[0].get("kind", "Pod")
+        name = owners[0].get("name", meta.get("name", ""))
+        if kind == "ReplicaSet":
+            kind, name = "Deployment", re.sub(r"-[a-f0-9]{5,10}$", "", name)
+        elif kind == "Job" and re.search(r"-\d{6,}$", name):
+            kind, name = "CronJob", re.sub(r"-\d{6,}$", "", name)
+        return (kind, name, ns)
+
     def analyze_workload_security_posture(self):
         """
         Analyze workload security posture.
@@ -14313,7 +14929,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         Gap addressed: analyze_psa_violations() checks PSA labels but doesn't
         scan actual pod specs for dangerous security configurations.
 
-        Detection:
+        Detection (reported once per owning workload, not once per pod):
         - Privileged containers
         - Containers with dangerous capabilities (SYS_ADMIN)
         - Pods mounting sensitive host paths
@@ -14325,81 +14941,105 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 return
             pods = json.loads(pods_json).get("items", [])
 
-            # Exact match for root paths, prefix match for subdirectories
-            SENSITIVE_HOST_PATHS_EXACT = {"/", "/etc", "/var/run/docker.sock", "/var/run/containerd", "/var/lib/docker"}
-            SENSITIVE_HOST_PREFIXES = ["/etc/", "/var/run/", "/var/lib/docker", "/proc", "/sys"]
+            privileged: dict[tuple, dict] = {}
+            sys_admin: dict[tuple, dict] = {}
+            host_mounts: dict[tuple, dict] = {}
 
             for pod in pods:
-                pod_name = pod.get("metadata", {}).get("name", "")
                 namespace = pod.get("metadata", {}).get("namespace", "")
+                pod_name = pod.get("metadata", {}).get("name", "")
 
-                # Skip system namespaces
-                if namespace in ("kube-system", "amazon-cloudwatch", "calico-system", "kube-node-lease", "eks-system"):
+                # Node agents and CSI drivers legitimately need host access
+                if namespace in SYSTEM_NAMESPACES:
                     continue
 
-                # Check container security contexts
+                owner = self._workload_owner(pod)
+
                 for container in pod.get("spec", {}).get("containers", []):
                     container_name = container.get("name", "")
-                    sc = container.get("securityContext", {})
+                    sc = container.get("securityContext") or {}
 
                     if sc.get("privileged"):
-                        self._add_finding(
-                            "rbac_issues",
-                            f"Privileged container {container_name} in {namespace}/{pod_name}",
-                            {
-                                "container": container_name,
-                                "pod": pod_name,
-                                "namespace": namespace,
-                                "severity": "critical",
-                                "finding_type": FindingType.CURRENT_STATE,
-                                "impact": "Container has full host access, can escape to node",
-                                "diagnostic_steps": [
-                                    f"kubectl get pod {pod_name} -n {namespace} -o yaml | grep -A 10 securityContext",
-                                    "Review if privileged mode is actually required",
-                                ],
-                            },
-                        )
+                        entry = privileged.setdefault(owner, {"containers": set(), "pods": set()})
+                        entry["containers"].add(container_name)
+                        entry["pods"].add(pod_name)
 
-                    added_caps = sc.get("capabilities", {}).get("add", [])
-                    if added_caps and "SYS_ADMIN" in added_caps:
-                        self._add_finding(
-                            "rbac_issues",
-                            f"Container {container_name} in {namespace}/{pod_name} has SYS_ADMIN capability",
-                            {
-                                "container": container_name,
-                                "pod": pod_name,
-                                "namespace": namespace,
-                                "added_capabilities": added_caps,
-                                "severity": "critical",
-                                "finding_type": FindingType.CURRENT_STATE,
-                                "impact": "Container can perform system administration tasks",
-                            },
-                        )
+                    added_caps = (sc.get("capabilities") or {}).get("add") or []
+                    if "SYS_ADMIN" in added_caps:
+                        entry = sys_admin.setdefault(owner, {"containers": set(), "pods": set()})
+                        entry["containers"].add(container_name)
+                        entry["pods"].add(pod_name)
 
-                # Check host path mounts
-                for volume in pod.get("spec", {}).get("volumes", []):
-                    if volume.get("hostPath"):
-                        path = volume["hostPath"].get("path", "")
-                        volume_name = volume.get("name", "")
+                for volume in pod.get("spec", {}).get("volumes", []) or []:
+                    path = (volume.get("hostPath") or {}).get("path", "")
+                    if not path:
+                        continue
+                    is_sensitive = path in SENSITIVE_HOST_PATHS_EXACT or any(
+                        path.startswith(prefix) for prefix in SENSITIVE_HOST_PREFIXES
+                    )
+                    if is_sensitive:
+                        entry = host_mounts.setdefault(owner, {"paths": set(), "pods": set()})
+                        entry["paths"].add(path)
+                        entry["pods"].add(pod_name)
 
-                        # Use exact match for root paths, prefix match for subdirectories
-                        is_sensitive = path in SENSITIVE_HOST_PATHS_EXACT or any(
-                            path.startswith(prefix) for prefix in SENSITIVE_HOST_PREFIXES
-                        )
-                        if is_sensitive:
-                            self._add_finding(
-                                "rbac_issues",
-                                f"Pod {namespace}/{pod_name} mounts sensitive host path: {path}",
-                                {
-                                    "pod": pod_name,
-                                    "namespace": namespace,
-                                    "volume_name": volume_name,
-                                    "host_path": path,
-                                    "severity": "critical",
-                                    "finding_type": FindingType.CURRENT_STATE,
-                                    "impact": "Pod has access to sensitive host filesystem",
-                                },
-                            )
+            for (kind, name, ns), entry in privileged.items():
+                containers = ", ".join(sorted(entry["containers"]))
+                self._add_finding(
+                    "workload_security",
+                    f"{kind} {ns}/{name} runs privileged container(s) {containers} ({len(entry['pods'])} pods)",
+                    {
+                        "owner_kind": kind,
+                        "owner": name,
+                        "namespace": ns,
+                        "containers": sorted(entry["containers"]),
+                        "pod_count": len(entry["pods"]),
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": (
+                            "Privileged containers can escape to the node. This is expected for node "
+                            "agents and CSI drivers, and a real risk for application workloads."
+                        ),
+                        "diagnostic_steps": [
+                            f"kubectl get {kind.lower()} {name} -n {ns} -o yaml | grep -B2 -A6 securityContext",
+                            "Confirm privileged mode is required, otherwise drop it and add only the needed capabilities",
+                        ],
+                    },
+                )
+
+            for (kind, name, ns), entry in sys_admin.items():
+                containers = ", ".join(sorted(entry["containers"]))
+                self._add_finding(
+                    "workload_security",
+                    f"{kind} {ns}/{name} adds SYS_ADMIN capability to container(s) {containers} ({len(entry['pods'])} pods)",
+                    {
+                        "owner_kind": kind,
+                        "owner": name,
+                        "namespace": ns,
+                        "containers": sorted(entry["containers"]),
+                        "added_capabilities": ["SYS_ADMIN"],
+                        "pod_count": len(entry["pods"]),
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "SYS_ADMIN grants most of what privileged mode grants",
+                    },
+                )
+
+            for (kind, name, ns), entry in host_mounts.items():
+                paths = ", ".join(sorted(entry["paths"]))
+                self._add_finding(
+                    "workload_security",
+                    f"{kind} {ns}/{name} mounts sensitive host path(s): {paths} ({len(entry['pods'])} pods)",
+                    {
+                        "owner_kind": kind,
+                        "owner": name,
+                        "namespace": ns,
+                        "host_paths": sorted(entry["paths"]),
+                        "pod_count": len(entry["pods"]),
+                        "severity": "warning",
+                        "finding_type": FindingType.CURRENT_STATE,
+                        "impact": "Workload can read or write sensitive parts of the host filesystem",
+                    },
+                )
 
         except Exception as e:
             self._add_error("analyze_workload_security_posture", str(e))
@@ -14507,6 +15147,18 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         except Exception as e:
             self._add_error("analyze_volume_snapshots", str(e))
 
+    def _actionable(self, category: str) -> list:
+        """Return only findings in a category that are warning level or worse.
+
+        Correlations assert a root cause. An informational observation, such as a
+        count of pods using the default ndots setting, is not evidence of one.
+        """
+        return [
+            f
+            for f in self.findings.get(category, [])
+            if f.get("details", {}).get("severity", "info") in ("critical", "warning")
+        ]
+
     def correlate_findings(self):
         """
         Smart correlation of findings across data sources.
@@ -14548,7 +15200,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         timeline_events.sort(key=lambda x: x["timestamp"])
 
         # Correlation Rule 1: Node Pressure → Pod Evictions
-        if self.findings["memory_pressure"] or self.findings["disk_pressure"]:
+        if self._actionable("memory_pressure") or self._actionable("disk_pressure"):
             pressure_type = "memory" if self.findings["memory_pressure"] else "disk"
             affected_nodes = set()
 
@@ -14593,7 +15245,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 )
 
         # Correlation Rule 2: CNI Issues → Network Failures
-        if self.findings["network_issues"]:
+        if self._actionable("network_issues"):
             cni_issues = [
                 f
                 for f in self.findings["network_issues"]
@@ -14632,7 +15284,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 )
 
         # Correlation Rule 3: OOMKilled → Memory pressure or low limits
-        if self.findings["oom_killed"]:
+        if self._actionable("oom_killed"):
             oom_pods = self.findings["oom_killed"]
             oom_times = []
 
@@ -14667,7 +15319,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         # Correlation Rule 4: Control Plane Errors → API issues
-        if self.findings["control_plane_issues"]:
+        if self._actionable("control_plane_issues"):
             critical_cp = [
                 f for f in self.findings["control_plane_issues"] if f.get("details", {}).get("severity") == "critical"
             ]
@@ -14701,7 +15353,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 )
 
         # Correlation Rule 5: Image Pull Failures → Registry/Auth issues
-        if self.findings["image_pull_failures"]:
+        if self._actionable("image_pull_failures"):
             image_failures = self.findings["image_pull_failures"]
             ecr_failures = [
                 f
@@ -14746,7 +15398,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         # Correlation Rule 6: Scheduling Failures → Resource constraints
-        if self.findings["scheduling_failures"]:
+        if self._actionable("scheduling_failures"):
             sched_failures = self.findings["scheduling_failures"]
             resource_failures = [f for f in sched_failures if "insufficient" in f.get("summary", "").lower()]
             affinity_failures = [f for f in sched_failures if "affinity" in f.get("summary", "").lower()]
@@ -14783,12 +15435,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             )
 
         # Correlation Rule 7: DNS Issues → CoreDNS health
-        if self.findings["dns_issues"]:
-            dns_failures = self.findings["dns_issues"]
+        dns_failures = self._actionable("dns_issues")
+        coredns_issues = [f for f in dns_failures if "coredns" in f.get("summary", "").lower()]
 
-            # Check if CoreDNS is also unhealthy
-            coredns_issues = [f for f in dns_failures if "coredns" in f.get("summary", "").lower()]
-
+        # Naming CoreDNS as the root cause requires evidence about CoreDNS itself
+        if dns_failures and coredns_issues:
             dns_times = []
             for f in dns_failures:
                 ts = self._extract_timestamp(f.get("details", {}))
@@ -15667,12 +16318,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             # Add impact events from correlation
             impact = primary_correlation.get("impact", "")
-            if impact:
+            # Only attach the impact to a real event time. Falling back to the
+            # analysis time produced an "08:18 to 08:18" incident window.
+            if impact and timeline_events:
                 timeline_events.append(
                     {
-                        "timestamp": timeline_events[0]["timestamp"]
-                        if timeline_events
-                        else datetime.now(tz=timezone.utc),
+                        "timestamp": timeline_events[0]["timestamp"],
                         "category": "impact",
                         "summary": impact[:150],
                         "severity": primary_correlation.get("severity", "warning"),
@@ -16005,7 +16656,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
     def _generate_story_summary(self, narrative_events: list, primary_correlation: dict | None) -> str:
         """Generate a summary paragraph of the incident."""
-        if not narrative_events:
+        has_findings = any(
+            items for category, items in self.findings.items() if category != "healthy_components" and items
+        )
+        # Findings without timestamps produce no narrative events. That is not the
+        # same as a clean cluster, and must not be reported as one.
+        if not narrative_events and not has_findings:
             return "No significant issues detected during the analysis period."
 
         # Count issues by severity from all findings (not just narrative events)
@@ -16031,9 +16687,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         if narrative_events:
             start_time = narrative_events[0]["time"]
             end_time = narrative_events[-1]["time"]
-            time_range = f"{start_time} to {end_time}"
+            time_range = f"{start_time} to {end_time}" if start_time != end_time else start_time
         else:
-            time_range = "N/A"
+            time_range = ""
 
         # Get primary root cause
         if primary_correlation:
@@ -16045,7 +16701,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         # Build summary
         summary_parts = [
-            f"**Incident Summary** ({time_range})",
+            f"**Incident Summary** ({time_range})" if time_range else "**Incident Summary**",
             "",
             f"**Root Cause**: {root_cause}",
             "",
@@ -16058,9 +16714,12 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             summary_parts.append("")
 
         # Add key affected areas
-        categories = list(set(e["category"] for e in narrative_events[:10]))
-        if categories:
-            summary_parts.append(f"**Affected Areas**: {', '.join(categories[:5])}")
+        # "impact" is an internal bucket, not a cluster area, and raw category
+        # keys are not names a reader recognises
+        categories = sorted({e["category"] for e in narrative_events[:10] if e["category"] != "impact"})
+        display = [CATEGORY_DISPLAY_NAMES.get(c, c.replace("_", " ").title()) for c in categories]
+        if display:
+            summary_parts.append(f"**Affected Areas**: {', '.join(display[:5])}")
 
         return "\n".join(summary_parts)
 
@@ -16880,6 +17539,21 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
             endpoints = json.loads(output)
 
+            # An empty endpoint list has three very different causes. Resolve the
+            # backing service and workload so the finding names the real one.
+            def _load_items(command: str) -> list:
+                raw = self._get_cached_kubectl(command)
+                try:
+                    return json.loads(raw).get("items", []) if raw else []
+                except (ValueError, AttributeError):
+                    return []
+
+            ns_scope = f"-n {self.namespace}" if self.namespace else "--all-namespaces"
+            all_services = _load_items(f"kubectl get svc {ns_scope} -o json")
+            all_pods = _load_items(f"kubectl get pods {ns_scope} -o json")
+            all_deployments = _load_items(f"kubectl get deploy {ns_scope} -o json")
+            svc_by_key = {(s["metadata"]["namespace"], s["metadata"]["name"]): s for s in all_services}
+
             for ep in endpoints.get("items", []):
                 ep_name = ep["metadata"]["name"]
                 ep_namespace = ep["metadata"]["namespace"]
@@ -16887,25 +17561,67 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                 # Check if service has no endpoints
                 if not subsets:
+                    svc = svc_by_key.get((ep_namespace, ep_name))
+                    selector = (svc or {}).get("spec", {}).get("selector") or {}
+
+                    # No selector: headless, ExternalName, or the default kubernetes endpoint
+                    if svc is None or not selector:
+                        continue
+
+                    matching_pods = [
+                        p
+                        for p in all_pods
+                        if p["metadata"]["namespace"] == ep_namespace
+                        and selector.items() <= (p["metadata"].get("labels") or {}).items()
+                    ]
+                    scaled_to_zero = [
+                        d
+                        for d in all_deployments
+                        if d["metadata"]["namespace"] == ep_namespace
+                        and (d.get("spec", {}).get("replicas") or 0) == 0
+                        and selector.items()
+                        <= ((d.get("spec", {}).get("template", {}).get("metadata", {}).get("labels")) or {}).items()
+                    ]
+
+                    if scaled_to_zero:
+                        deploy_name = scaled_to_zero[0]["metadata"]["name"]
+                        summary = (
+                            f"Service {ep_namespace}/{ep_name} has no endpoints: "
+                            f"backing Deployment {deploy_name} is scaled to zero"
+                        )
+                        severity = "info"
+                        root_causes = [f"Deployment {deploy_name} is intentionally scaled to 0 replicas"]
+                    elif not matching_pods:
+                        summary = f"Service {ep_namespace}/{ep_name} selector matches no pods (orphaned service)"
+                        severity = "info"
+                        root_causes = ["Selector matches no pod; the workload may have been removed"]
+                    else:
+                        summary = (
+                            f"Service {ep_namespace}/{ep_name} has no ready endpoints "
+                            f"({len(matching_pods)} pods not ready)"
+                        )
+                        severity = "warning"
+                        root_causes = [
+                            "Pods exist but are not passing readiness probes",
+                            "Pods are in CrashLoopBackOff",
+                        ]
+
                     self._add_finding_dict(
                         "network_issues",
                         {
-                            "summary": f"Service {ep_namespace}/{ep_name} has no endpoints (pods not ready)",
+                            "summary": summary,
                             "details": {
                                 "service": ep_name,
                                 "namespace": ep_namespace,
-                                "severity": "warning",
+                                "selector": selector,
+                                "matching_pods": len(matching_pods),
+                                "severity": severity,
                                 "finding_type": FindingType.CURRENT_STATE,
-                                "root_causes": [
-                                    "Pod selector does not match any pods",
-                                    "Pods exist but not passing readiness probes",
-                                    "Pods are in CrashLoopBackOff",
-                                ],
+                                "root_causes": root_causes,
                                 "diagnostic_steps": [
-                                    f"kubectl get pods -n {ep_namespace} -l <selector>",
+                                    f"kubectl get pods -n {ep_namespace} -l {','.join(f'{k}={v}' for k, v in selector.items())}",
                                     f"kubectl describe endpoints {ep_name} -n {ep_namespace}",
-                                    f"kubectl get svc {ep_name} -n {ep_namespace} -o yaml | grep selector",
-                                    "Check if pods are running and passing readiness probes",
+                                    f"kubectl get svc {ep_name} -n {ep_namespace} -o yaml | grep -A5 selector",
                                 ],
                                 "aws_doc": "https://kubernetes.io/docs/tasks/debug/debug-application/debug-service/",
                             },
@@ -17481,6 +18197,29 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_cluster_autoscaler", str(e))
             self.progress.warning(f"Cluster Autoscaler analysis failed: {e}")
 
+    @staticmethod
+    def _hpa_metrics_over_target(hpa: dict) -> list[dict]:
+        """Return resource metrics whose current utilisation exceeds the HPA target.
+
+        An HPA sitting at maxReplicas while a metric is far above target usually
+        means the resource request is too small, not that maxReplicas is too low.
+        """
+        targets = {}
+        for metric in hpa.get("spec", {}).get("metrics", []) or []:
+            resource = metric.get("resource") or {}
+            target = resource.get("target") or {}
+            if target.get("type") == "Utilization" and target.get("averageUtilization") is not None:
+                targets[resource.get("name")] = target["averageUtilization"]
+
+        over = []
+        for metric in hpa.get("status", {}).get("currentMetrics", []) or []:
+            resource = metric.get("resource") or {}
+            current = (resource.get("current") or {}).get("averageUtilization")
+            name = resource.get("name")
+            if name in targets and current is not None and current > targets[name]:
+                over.append({"name": name, "current": current, "target": targets[name]})
+        return over
+
     def analyze_hpa_vpa(self):
         """
         Analyze Horizontal/Vertical Pod Autoscaler health
@@ -17525,22 +18264,32 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             )
 
                         if condition.get("type") == "ScalingActive" and condition.get("status") != "True":
+                            reason = condition.get("reason", "Unknown")
+                            # A target deliberately scaled to zero is not a fault
+                            if reason == "ScalingDisabled" and status.get("currentReplicas", 0) == 0:
+                                summary = f"HPA {namespace}/{hpa_name} is inactive because its target is scaled to zero"
+                                severity = "info"
+                                root_causes = ["Target workload is intentionally scaled to 0 replicas"]
+                            else:
+                                summary = f"HPA {namespace}/{hpa_name} scaling not active"
+                                severity = "warning"
+                                root_causes = [
+                                    "Missing metrics",
+                                    "Target resource not found",
+                                    "Invalid metric configuration",
+                                ]
                             self._add_finding_dict(
                                 "pod_errors",
                                 {
-                                    "summary": f"HPA {namespace}/{hpa_name} scaling not active",
+                                    "summary": summary,
                                     "details": {
                                         "hpa": hpa_name,
                                         "namespace": namespace,
-                                        "reason": condition.get("reason", "Unknown"),
+                                        "reason": reason,
                                         "message": condition.get("message", "N/A")[:200],
-                                        "severity": "warning",
+                                        "severity": severity,
                                         "finding_type": FindingType.CURRENT_STATE,
-                                        "root_causes": [
-                                            "Missing metrics",
-                                            "Target resource not found",
-                                            "Invalid metric configuration",
-                                        ],
+                                        "root_causes": root_causes,
                                     },
                                 },
                             )
@@ -17549,19 +18298,41 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     desired_replicas = status.get("desiredReplicas", 0)
                     max_replicas = hpa.get("spec", {}).get("maxReplicas", 0)
 
-                    if current_replicas >= max_replicas and current_replicas > 0:
+                    min_replicas = hpa.get("spec", {}).get("minReplicas", 1) or 1
+
+                    # min == max means the HPA cannot scale by design, so "at max" says nothing
+                    if current_replicas >= max_replicas and current_replicas > 0 and max_replicas > min_replicas:
+                        over_target = self._hpa_metrics_over_target(hpa)
+                        if over_target:
+                            metric_text = ", ".join(
+                                f"{m['name']} {m['current']}% (target {m['target']}%)" for m in over_target
+                            )
+                            names = " and ".join(m["name"] for m in over_target)
+                            summary = (
+                                f"HPA {namespace}/{hpa_name} pinned at max replicas ({max_replicas}) "
+                                f"with {metric_text}"
+                            )
+                            recommendation = (
+                                f"Utilisation is measured against resource requests, so raise the {names} request "
+                                f"to the observed usage or drop {names} from the HPA metrics, then reassess maxReplicas"
+                            )
+                        else:
+                            summary = f"HPA {namespace}/{hpa_name} at max replicas ({max_replicas})"
+                            recommendation = "Consider increasing maxReplicas if workload needs more scaling"
                         self._add_finding_dict(
                             "pod_errors",
                             {
-                                "summary": f"HPA {namespace}/{hpa_name} at max replicas ({max_replicas})",
+                                "summary": summary,
                                 "details": {
                                     "hpa": hpa_name,
                                     "namespace": namespace,
                                     "current_replicas": current_replicas,
                                     "max_replicas": max_replicas,
+                                    "min_replicas": min_replicas,
+                                    "metrics_over_target": over_target,
                                     "severity": "warning",
                                     "finding_type": FindingType.CURRENT_STATE,
-                                    "recommendation": "Consider increasing maxReplicas if workload needs more scaling",
+                                    "recommendation": recommendation,
                                 },
                             },
                         )
@@ -19706,6 +20477,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             self._add_error("analyze_deployment_rollouts", str(e))
             self.progress.warning(f"Deployment rollout analysis failed: {e}")
 
+    @staticmethod
+    def _cron_period_seconds(schedule: str) -> float | None:
+        """Return the interval between two consecutive runs of a cron schedule."""
+        if croniter is None or not schedule:
+            return None
+        try:
+            iterator = croniter(schedule, datetime.now(timezone.utc))
+            first = iterator.get_next(datetime)
+            second = iterator.get_next(datetime)
+            return (second - first).total_seconds()
+        except (ValueError, KeyError, AttributeError):
+            return None
+
     def analyze_jobs_cronjobs(self):
         """
         Analyze Job and CronJob failures
@@ -19791,6 +20575,24 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             if output and "not found" not in output.lower():
                 cronjobs = json.loads(output)
 
+                # Index active jobs by the CronJob that owns them so schedule
+                # analysis can see how long the current run has been going
+                cronjob_owned_jobs: dict[tuple[str, str], list] = {}
+                jobs_output = self.safe_kubectl_call(
+                    f"kubectl get jobs -n {self.namespace} -o json"
+                    if self.namespace
+                    else "kubectl get jobs --all-namespaces -o json"
+                )
+                if jobs_output:
+                    try:
+                        for job in json.loads(jobs_output).get("items", []):
+                            for owner in job["metadata"].get("ownerReferences") or []:
+                                if owner.get("kind") == "CronJob":
+                                    key = (job["metadata"]["namespace"], owner.get("name", ""))
+                                    cronjob_owned_jobs.setdefault(key, []).append(job)
+                    except (ValueError, KeyError):
+                        pass
+
                 for cj in cronjobs.get("items", []):
                     cj_name = cj["metadata"]["name"]
                     namespace = cj["metadata"]["namespace"]
@@ -19805,34 +20607,73 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
                     if not suspended and last_schedule:
                         try:
-                            from dateutil import parser as date_parser
-
                             last_schedule_dt = date_parser.parse(last_schedule)
-                            time_since_schedule = datetime.now(timezone.utc) - last_schedule_dt
+                            if last_schedule_dt.tzinfo is None:
+                                last_schedule_dt = last_schedule_dt.replace(tzinfo=timezone.utc)
+                            now = datetime.now(timezone.utc)
+                            time_since_schedule = now - last_schedule_dt
+                            period = self._cron_period_seconds(schedule)
+                            concurrency = spec.get("concurrencyPolicy", "Allow")
 
-                            # If last schedule was more than 2x the expected interval, flag it
-                            # This is a heuristic - could be improved with cron parsing
-                            if time_since_schedule.total_seconds() > 3600:  # > 1 hour
+                            # Longest running job owned by this CronJob
+                            running_hours = None
+                            for job in cronjob_owned_jobs.get((namespace, cj_name), []):
+                                start = job.get("status", {}).get("startTime")
+                                if not start or job.get("status", {}).get("completionTime"):
+                                    continue
+                                start_dt = date_parser.parse(start)
+                                if start_dt.tzinfo is None:
+                                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+                                hours = (now - start_dt).total_seconds() / 3600
+                                running_hours = hours if running_hours is None else max(running_hours, hours)
+
+                            details = {
+                                "cronjob": cj_name,
+                                "namespace": namespace,
+                                "schedule": schedule,
+                                "last_schedule": last_schedule,
+                                "last_successful": last_successful,
+                                "suspended": suspended,
+                                "concurrency_policy": concurrency,
+                                "period_hours": round(period / 3600, 2) if period else None,
+                                "running_hours": round(running_hours, 1) if running_hours else None,
+                                "severity": "warning",
+                                "finding_type": FindingType.CURRENT_STATE,
+                            }
+
+                            if period and running_hours is not None and running_hours * 3600 > period:
+                                details["root_causes"] = [
+                                    "Job runtime exceeds the schedule period, so later runs cannot start on time",
+                                ]
+                                if concurrency == "Forbid":
+                                    details["root_causes"].append(
+                                        "concurrencyPolicy Forbid skips every run while the previous job is active"
+                                    )
+                                self._add_finding_dict(
+                                    "pod_errors",
+                                    {
+                                        "summary": (
+                                            f"CronJob {namespace}/{cj_name} has a job running for "
+                                            f"{running_hours:.0f}h, longer than its {period / 3600:.0f}h schedule "
+                                            f"period (concurrencyPolicy {concurrency})"
+                                        ),
+                                        "details": details,
+                                    },
+                                )
+                            elif (period and time_since_schedule.total_seconds() > 2 * period) or (
+                                period is None and time_since_schedule.total_seconds() > 3600
+                            ):
+                                details["root_causes"] = [
+                                    "CronJob controller issues",
+                                    "Previous job still running",
+                                    "Concurrency policy blocking",
+                                    "startingDeadlineSeconds exceeded",
+                                ]
                                 self._add_finding_dict(
                                     "pod_errors",
                                     {
                                         "summary": f"CronJob {namespace}/{cj_name} may have missed schedules",
-                                        "details": {
-                                            "cronjob": cj_name,
-                                            "namespace": namespace,
-                                            "schedule": schedule,
-                                            "last_schedule": last_schedule,
-                                            "last_successful": last_successful,
-                                            "suspended": suspended,
-                                            "severity": "warning",
-                                            "finding_type": FindingType.CURRENT_STATE,
-                                            "root_causes": [
-                                                "CronJob controller issues",
-                                                "Previous job still running",
-                                                "Concurrency policy blocking",
-                                                "startingDeadlineSeconds exceeded",
-                                            ],
-                                        },
+                                        "details": details,
                                     },
                                 )
                         except Exception:
@@ -20320,10 +21161,14 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
         try:
             # Look for common operator patterns
+            # Explicit component selectors only. A bare "app.kubernetes.io/name"
+            # existence selector matches nearly every pod in a cluster, which made
+            # ordinary workloads show up as failing controllers.
             operator_labels = [
                 "control-plane=controller-manager",
                 "app.kubernetes.io/component=controller",
-                "app.kubernetes.io/name",
+                "app.kubernetes.io/component=operator",
+                "app.kubernetes.io/component=manager",
             ]
 
             for label in operator_labels:
@@ -21188,30 +22033,40 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             pods_without_limits = []
             pods_without_requests = []
             qos_breakdown = {"Guaranteed": 0, "Burstable": 0, "BestEffort": 0}
+            system_pods_excluded = 0
 
             for pod in pods.get("items", []):
                 pod_name = pod["metadata"]["name"]
                 namespace = pod["metadata"]["namespace"]
                 spec = pod.get("spec", {})
 
+                # System pods are managed by AWS and their sizing is not the
+                # operator's to change, so counting them makes the number useless
+                if namespace in SYSTEM_NAMESPACES:
+                    system_pods_excluded += 1
+                    continue
+
                 has_limits = False
                 has_requests = False
                 all_containers_have_limits = True
                 all_containers_have_requests = True
 
-                containers = spec.get("containers", []) + spec.get("initContainers", [])
+                # initContainers run to completion and do not hold capacity for
+                # the life of the pod, so they are not part of this count
+                containers = spec.get("containers", [])
 
                 for container in containers:
                     resources = container.get("resources", {})
                     limits = resources.get("limits", {})
                     requests = resources.get("requests", {})
 
-                    if limits:
+                    # A cpu-only limit still leaves memory unbounded
+                    if limits.get("cpu") and limits.get("memory"):
                         has_limits = True
                     else:
                         all_containers_have_limits = False
 
-                    if requests:
+                    if requests.get("cpu") and requests.get("memory"):
                         has_requests = True
                     else:
                         all_containers_have_requests = False
@@ -21255,9 +22110,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self._add_finding_dict(
                     "resource_quota_exceeded",
                     {
-                        "summary": f"{len(pods_without_limits)} pods without resource limits",
+                        "summary": f"{len(pods_without_limits)} pods without memory or CPU limits",
                         "details": {
                             "count": len(pods_without_limits),
+                            "pod_count": len(pods_without_limits),
+                            "system_namespace_pods_excluded": system_pods_excluded,
                             "examples": pods_without_limits[:10],
                             "severity": "warning",
                             "finding_type": FindingType.CURRENT_STATE,
@@ -21272,9 +22129,11 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 self._add_finding_dict(
                     "resource_quota_exceeded",
                     {
-                        "summary": f"{len(pods_without_requests)} pods without resource requests",
+                        "summary": f"{len(pods_without_requests)} pods without memory or CPU requests",
                         "details": {
                             "count": len(pods_without_requests),
+                            "pod_count": len(pods_without_requests),
+                            "system_namespace_pods_excluded": system_pods_excluded,
                             "examples": pods_without_requests[:10],
                             "severity": "info",
                             "finding_type": FindingType.CURRENT_STATE,
@@ -21335,7 +22194,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             ClusterNotFoundError: If the cluster doesn't exist.
             KubectlNotAvailableError: If kubectl is not in PATH.
         """
-        self.progress.set_total_steps(76)
+        self.progress.set_total_steps(77)
 
         # Step 1-3: Basic setup
         try:
@@ -21446,6 +22305,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             # HIGH PRIORITY
             self.analyze_init_container_failures,
             self.analyze_pdb_violations,
+            self.analyze_missing_pdbs,
             self.analyze_sidecar_health,
             self.analyze_node_resource_saturation,
             self.analyze_version_skew,
@@ -21593,6 +22453,22 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
             slowest_str = ", ".join(f"{m}: {t:.1f}s" for m, t in slowest)
             self.progress.info(f"Slowest methods: {slowest_str}")
 
+    def _node_os_add_finding(self, sink):
+        """Wrap a finding sink with the analysis window filter.
+
+        Node OS parsers read whatever the host still has on disk, so dmesg can
+        return kernel events from months before the requested window. Findings
+        that carry a timestamp are checked against it; current-state findings,
+        which have none, always pass.
+        """
+
+        def add(category, finding):
+            if not self._is_finding_in_time_window(finding):
+                return False
+            return sink(category, finding)
+
+        return add
+
     def _run_node_os_diagnostics(self) -> None:
         """Execute SSM-based node OS-level diagnostics.
 
@@ -21690,7 +22566,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                             stdout,
                             node_name,
                             instance_id,
-                            self._add_finding_dict,
+                            self._node_os_add_finding(self._add_finding_dict),
                         )
                         after_count = sum(len(v) for v in self.findings.values())
                         total_findings += after_count - before_count
@@ -21780,6 +22656,19 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         """
         recommendations = []
 
+        def priority_for(findings_list):
+            """Priority follows the strongest evidence in the category.
+
+            A static per-category literal made "Resolve Node Health Issues"
+            critical even when every node finding was informational.
+            """
+            severities = {f.get("details", {}).get("severity", "info") for f in findings_list}
+            if "critical" in severities:
+                return "critical"
+            if "warning" in severities:
+                return "high"
+            return "low"
+
         # Helper function to extract evidence from findings
         def extract_evidence(findings_list, max_examples=3):
             """Extract evidence summary from findings list"""
@@ -21806,7 +22695,9 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                     info_count += 1
 
                 # Extract affected resources
-                for key in ["node", "pod", "namespace", "pvc", "service", "subnet_id"]:
+                # Namespaces are not resources; listing one among pod names made
+                # the affected-resource list unreadable
+                for key in ["node", "pod", "owner", "workload", "nodegroup", "pvc", "service", "subnet_id"]:
                     if details.get(key):
                         affected_resources.add(str(details[key]))
 
@@ -21839,7 +22730,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Memory Pressure Issues",
                     "category": "memory_pressure",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("memory_pressure", [])),
                     "action": "Increase pod memory limits, scale up node instance types, or enable cluster autoscaler",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-memory-pressure",
                     "evidence": evidence,
@@ -21859,7 +22750,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Disk Pressure Issues",
                     "category": "disk_pressure",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("disk_pressure", [])),
                     "action": "Increase EBS volume size, configure kubelet garbage collection, or add ephemeral storage limits",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-resolve-disk-pressure",
                     "evidence": evidence,
@@ -21879,7 +22770,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Fix Out of Memory Kills",
                     "category": "oom_killed",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("oom_killed", [])),
                     "action": "Set appropriate memory requests/limits and review application memory usage",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/best-practices/windows-oom.html",
                     "evidence": evidence,
@@ -21899,7 +22790,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Pod Scheduling Failures",
                     "category": "scheduling_failures",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("scheduling_failures", [])),
                     "action": "Review resource requests, node capacity, node selectors, and taints/tolerations",
                     "aws_doc": "https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/",
                     "evidence": evidence,
@@ -21919,7 +22810,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Fix Network Issues",
                     "category": "network_issues",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("network_issues", [])),
                     "action": "Check VPC-CNI health, security groups, and network policies",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html#troubleshoot-network",
                     "evidence": evidence,
@@ -21939,7 +22830,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Image Pull Failures",
                     "category": "image_pull_failures",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("image_pull_failures", [])),
                     "action": "Verify image exists, check registry authentication, and review pull secrets",
                     "aws_doc": "https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/",
                     "evidence": evidence,
@@ -21959,7 +22850,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Fix PVC and Storage Issues",
                     "category": "pvc_issues",
-                    "priority": "medium",
+                    "priority": priority_for(self.findings.get("pvc_issues", [])),
                     "action": "Check storage class, EBS CSI driver, and volume availability zones",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html",
                     "evidence": evidence,
@@ -21979,7 +22870,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Update or Fix EKS Addons",
                     "category": "addon_issues",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("addon_issues", [])),
                     "action": "Update addons to latest compatible version or troubleshoot specific addon issues",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html",
                     "evidence": evidence,
@@ -21999,7 +22890,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Investigate Control Plane Errors",
                     "category": "control_plane_issues",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("control_plane_issues", [])),
                     "action": "Review CloudWatch control plane logs, check API server latency, and verify IAM authenticator configuration",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html",
                     "evidence": evidence,
@@ -22019,7 +22910,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Fix RBAC Authorization Issues",
                     "category": "rbac_issues",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("rbac_issues", [])),
                     "action": "Review RoleBindings, ClusterRoleBindings, and service account permissions",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/access-entries.html",
                     "evidence": evidence,
@@ -22032,6 +22923,28 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 }
             )
 
+        # Workload security posture recommendations
+        if self.findings["workload_security"]:
+            evidence = extract_evidence(self.findings["workload_security"])
+            recommendations.append(
+                {
+                    "title": "Review privileged and host-mounted workloads",
+                    "category": "workload_security",
+                    "priority": priority_for(self.findings.get("workload_security", [])),
+                    "action": (
+                        "Confirm each privileged container and hostPath mount is required. Keep node agents in a "
+                        "dedicated namespace and enforce Pod Security Admission 'restricted' elsewhere"
+                    ),
+                    "aws_doc": "https://docs.aws.amazon.com/eks/latest/best-practices/pod-security.html",
+                    "evidence": evidence,
+                    "diagnostic_steps": [
+                        "Run: kubectl get pods -A -o json | jq -r '.items[] | select(any(.spec.containers[]; .securityContext.privileged==true)) | .metadata.namespace + \"/\" + .metadata.name'",
+                        "Check: kubectl get ns -L pod-security.kubernetes.io/enforce",
+                        "Review: whether each workload needs host access or only a specific capability",
+                    ],
+                }
+            )
+
         # Node issue recommendations
         if self.findings["node_issues"]:
             evidence = extract_evidence(self.findings["node_issues"])
@@ -22039,7 +22952,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Node Health Issues",
                     "category": "node_issues",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_issues", [])),
                     "action": "Check EC2 instance health, kubelet logs, and node capacity",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managed-node-groups.html",
                     "evidence": evidence,
@@ -22059,7 +22972,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Fix CoreDNS Issues",
                     "category": "dns_issues",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("dns_issues", [])),
                     "action": "Check CoreDNS pod health, verify ConfigMap settings, and review DNS throttling",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/coredns.html",
                     "evidence": evidence,
@@ -22079,7 +22992,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Review Resource Quotas",
                     "category": "resource_quota_exceeded",
-                    "priority": "medium",
+                    "priority": priority_for(self.findings.get("resource_quota_exceeded", [])),
                     "action": "Increase quota limits, optimize resource requests, or implement namespace isolation",
                     "aws_doc": "https://kubernetes.io/docs/concepts/policy/resource-quotas/",
                     "evidence": evidence,
@@ -22099,7 +23012,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Investigate Pod Errors",
                     "category": "pod_errors",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("pod_errors", [])),
                     "action": "Review pod events, container logs, and resource constraints",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                     "evidence": evidence,
@@ -22119,7 +23032,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve iptables Firewall Issues on Nodes",
                     "category": "node_os_iptables",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_iptables", [])),
                     "action": "Remove iptables DROP rules blocking DNS (port 53), restart kube-proxy if KUBE-SERVICES chain is missing",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-dns-failures",
                     "evidence": evidence,
@@ -22138,7 +23051,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Conntrack Table Saturation on Nodes",
                     "category": "node_os_conntrack",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_conntrack", [])),
                     "action": "Increase nf_conntrack_max or upgrade to larger instance type with higher conntrack allowance",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-conntrack-exhaustion",
                     "evidence": evidence,
@@ -22157,7 +23070,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Investigate Kernel-Level Errors Detected via dmesg",
                     "category": "node_os_dmesg",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_dmesg", [])),
                     "action": "Address kernel OOM kills, hardware errors, or disk I/O issues. May require node replacement for hardware failures.",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-oomkilled-pods",
                     "evidence": evidence,
@@ -22176,7 +23089,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Kubelet Journal Errors on Nodes",
                     "category": "node_os_kubelet",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("node_os_kubelet", [])),
                     "action": "Address PLEG failures, certificate expiry, or API server connectivity issues. Restart kubelet or drain node if persistent.",
                     "aws_doc": "https://repost.aws/knowledge-center/eks-node-status-ready",
                     "evidence": evidence,
@@ -22195,7 +23108,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve containerd Runtime Issues on Nodes",
                     "category": "node_os_containerd",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("node_os_containerd", [])),
                     "action": "Address image pull failures, disk space, or runtime unavailability. Clean unused images or increase disk size.",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/eks-optimized-ami.html",
                     "evidence": evidence,
@@ -22214,7 +23127,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve VPC CNI IP Allocation Failures",
                     "category": "node_os_ipamd",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_ipamd", [])),
                     "action": "Check subnet IP availability, enable prefix delegation, or add secondary CIDR ranges",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/prefix-delegation.html",
                     "evidence": evidence,
@@ -22233,7 +23146,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Kernel Route Table Issues on Nodes",
                     "category": "node_os_routes",
-                    "priority": "high",
+                    "priority": priority_for(self.findings.get("node_os_routes", [])),
                     "action": "Remove blackhole routes, ensure default route exists, restart VPC CNI for stale pod routes",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html",
                     "evidence": evidence,
@@ -22252,7 +23165,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve CNI Configuration Issues on Nodes",
                     "category": "node_os_cni_config",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_cni_config", [])),
                     "action": "Reinstall VPC CNI, fix MTU settings, resolve conflicting CNI configurations",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html",
                     "evidence": evidence,
@@ -22271,7 +23184,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Optimize Kernel Parameters on Nodes",
                     "category": "node_os_sysctl",
-                    "priority": "warning",
+                    "priority": priority_for(self.findings.get("node_os_sysctl", [])),
                     "action": "Adjust nf_conntrack_max, rp_filter, ip_local_port_range, and other kernel parameters to EKS best practices",
                     "aws_doc": "https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html",
                     "evidence": evidence,
@@ -22290,7 +23203,7 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
                 {
                     "title": "Resolve Network Interface Issues on Nodes",
                     "category": "node_os_eni",
-                    "priority": "critical",
+                    "priority": priority_for(self.findings.get("node_os_eni", [])),
                     "action": "Address AWS-level conntrack/bandwidth allowance exceeded or DOWN interfaces. May require instance type upgrade or node replacement.",
                     "aws_doc": "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-network-interface-traffic.html",
                     "evidence": evidence,
@@ -22305,11 +23218,20 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         # Correlation-based recommendations (v2.0.0)
         if self.correlations:
             for corr in self.correlations:
+                tier = corr.get("confidence_tier", "low")
+                # Low-confidence correlations do not earn a recommendation slot
+                if tier == "low":
+                    continue
+                if tier == "high":
+                    corr_priority = "critical" if corr.get("severity") == "critical" else "high"
+                else:
+                    corr_priority = "medium"
                 recommendations.append(
                     {
                         "title": f"Root Cause: {corr['root_cause']}",
                         "category": corr["correlation_type"],
-                        "priority": "critical" if corr.get("severity") == "critical" else "high",
+                        "priority": corr_priority,
+                        "confidence_tier": tier,
                         "action": corr["recommendation"],
                         "aws_doc": corr.get("aws_doc", ""),
                         "evidence": {
@@ -22326,7 +23248,8 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
         def sort_key(rec):
-            is_corr = 0 if rec.get("is_correlation") else 1  # Correlations first
+            # Only a high-confidence correlation earns the top slot
+            is_corr = 0 if rec.get("is_correlation") and rec.get("confidence_tier") == "high" else 1
             priority = priority_order.get(rec.get("priority", "info"), 4)
             critical_count = (
                 rec.get("evidence", {}).get("critical_count", 0) if isinstance(rec.get("evidence"), dict) else 0
@@ -22339,6 +23262,17 @@ class ComprehensiveEKSDebugger(DateFilterMixin):
 
 
 # === SECTION 6: CLI HANDLING ===
+
+
+def positive_int(value: str) -> int:
+    """argparse type for values that are meaningless at zero or below."""
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from e
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or greater, got {parsed}")
+    return parsed
 
 
 def create_argument_parser():
@@ -22379,6 +23313,12 @@ Output:
     - {cluster}-eks-report-{timestamp}.html      - Interactive HTML dashboard
     - {cluster}-eks-findings-{timestamp}.json    - LLM-ready JSON for AI analysis
 
+Exit codes:
+  0  Analysis completed, no issues found
+  1  Analysis completed, issues found
+  2  Fatal error, no usable results
+  3  Analysis completed with issues, but some analyzers failed (partial results)
+
 Environment Variables:
   EKS_DEBUGGER_PROFILE       - AWS profile
   EKS_DEBUGGER_REGION        - AWS region
@@ -22412,8 +23352,8 @@ Environment Variables:
         "--start-date",
         help='Start date (ISO 8601: "2026-02-15T00:00:00Z" or "2026-02-15")',
     )
-    date_group.add_argument("--hours", type=int, help="Look back N hours from now")
-    date_group.add_argument("--days", type=int, help="Look back N days from now")
+    date_group.add_argument("--hours", type=positive_int, help="Look back N hours from now")
+    date_group.add_argument("--days", type=positive_int, help="Look back N days from now")
 
     parser.add_argument(
         "--end-date",
@@ -22443,7 +23383,7 @@ Environment Variables:
     )
     parser.add_argument(
         "--max-findings",
-        type=int,
+        type=positive_int,
         default=MAX_FINDINGS_PER_CATEGORY,
         help=f"Maximum findings per category (default: {MAX_FINDINGS_PER_CATEGORY})",
     )
@@ -22477,7 +23417,7 @@ Environment Variables:
     )
     parser.add_argument(
         "--ssm-timeout",
-        type=int,
+        type=positive_int,
         default=NodeDiagnosticConfig.DEFAULT_SSM_TIMEOUT,
         help=f"Timeout in seconds for each SSM Run Command execution (default: {NodeDiagnosticConfig.DEFAULT_SSM_TIMEOUT})",
     )
@@ -22522,7 +23462,10 @@ def parse_flexible_date(date_str: str, tz_name: str = "UTC") -> datetime:
     if not date_str:
         raise DateValidationError("Date string cannot be empty")
 
-    tz = ZoneInfo(tz_name)
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        raise DateValidationError(f"Unknown timezone {tz_name!r}: {e}") from e
 
     # Handle relative dates
     if date_str.lower() == "now":
@@ -22616,6 +23559,9 @@ def validate_and_parse_dates(args) -> tuple[datetime, datetime]:
         end_date = parse_flexible_date(args.end_date, args.timezone)
 
     # Parse start date based on different options
+    if args.hours and args.days:
+        raise DateValidationError("Use either --hours or --days, not both")
+
     if args.start_date:
         start_date = parse_flexible_date(args.start_date, args.timezone)
     elif args.hours:
@@ -22644,7 +23590,9 @@ def validate_and_parse_dates(args) -> tuple[datetime, datetime]:
 # === SECTION 7: OUTPUT HANDLING ===
 
 
-def output_results(results, cluster_name: str, timezone_name: str = "UTC", output_dir: str | None = None):
+def output_results(
+    results, cluster_name: str | None, timezone_name: str = "UTC", output_dir: str | None = None
+):
     """
     Output results as both HTML and LLM-JSON files.
 
@@ -22663,7 +23611,7 @@ def output_results(results, cluster_name: str, timezone_name: str = "UTC", outpu
     llm_formatter = LLMJSONOutputFormatter()
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe_cluster_name = cluster_name.replace("_", "-").replace(".", "-").lower()
+    safe_cluster_name = (cluster_name or DEFAULT_REPORT_CLUSTER_NAME).replace("_", "-").replace(".", "-").lower()
 
     html_filename = f"{safe_cluster_name}-eks-report-{timestamp}.html"
     json_filename = f"{safe_cluster_name}-eks-findings-{timestamp}.json"
@@ -22723,16 +23671,20 @@ def get_exit_code(results):
     Determine exit code based on results
 
     0 = success, no issues
-    1 = success, but issues found
-    2 = error during analysis
+    1 = success, issues found
+    2 = fatal error, no usable results
+    3 = partial results: analysis completed but some analyzers failed
+
+    A failed analyzer used to share exit code 2 with an authentication
+    failure, so CI could not tell partial results from no results.
     """
-    if results.get("errors"):
-        # Check if errors are critical
+    errors = results.get("errors") or []
+    summary = results.get("summary")
+    if not isinstance(summary, dict):
         return 2
-    elif results["summary"]["total_issues"] > 0:
-        return 1
-    else:
-        return 0
+    if errors:
+        return 3
+    return 1 if summary.get("total_issues", 0) > 0 else 0
 
 
 # === SECTION 8: MAIN ENTRY POINT ===
@@ -22742,6 +23694,15 @@ def main():
     """Main entry point"""
     parser = create_argument_parser()
     args = parser.parse_args()
+
+    # A --config file supplies defaults; anything given on the command line wins
+    if args.config:
+        file_config = ConfigLoader.load(args.config)
+        known = vars(args)
+        overrides = {k: v for k, v in file_config.items() if k in known}
+        if overrides:
+            parser.set_defaults(**overrides)
+            args = parser.parse_args()
 
     # Create progress tracker
     progress = ProgressTracker(verbose=args.verbose, quiet=args.quiet)
@@ -22780,6 +23741,10 @@ def main():
             namespace=args.namespace,
             progress=progress,
             kube_context=args.kube_context,
+            parallel=not args.no_parallel,
+            max_findings=args.max_findings,
+            enable_cache=not args.no_cache,
+            enable_incremental=not args.no_incremental,
             enable_node_diagnostics=args.enable_node_diagnostics,
             ssm_timeout=args.ssm_timeout,
             ssm_mode=args.ssm_mode,
@@ -22791,7 +23756,9 @@ def main():
         results = debugger.run_comprehensive_analysis()
 
         # Output results (always generates HTML + LLM-JSON)
-        output_results(results, args.cluster_name, args.timezone, args.output_dir)
+        # Use the resolved cluster name: args.cluster_name is None when the
+        # cluster was auto-detected or selected interactively.
+        output_results(results, debugger.cluster_name, args.timezone, args.output_dir)
 
         # Exit with appropriate code
         sys.exit(get_exit_code(results))

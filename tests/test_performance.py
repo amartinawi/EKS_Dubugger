@@ -1,11 +1,27 @@
 """Tests for performance optimization features."""
 
-import pytest
-import time
 import json
-from unittest.mock import Mock, patch, MagicMock
+import time
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
 from eks_comprehensive_debugger import ComprehensiveEKSDebugger, PerformanceTracker
+
+
+@pytest.fixture(autouse=True)
+def _no_real_commands(monkeypatch):
+    """These tests must never execute a real kubectl against a live cluster."""
+    import subprocess
+
+    def boom(*args, **kwargs):
+        raise AssertionError("test attempted to run a real command")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    monkeypatch.setattr(subprocess, "check_output", boom)
+
 
 
 class TestBatchKubectlCalls:
@@ -84,33 +100,7 @@ class TestBatchKubectlCalls:
 
     def test_collect_cluster_statistics_uses_batching(self, debugger):
         """collect_cluster_statistics should use batch kubectl calls."""
-        debugger._batch_kubectl_calls = Mock(
-            return_value={
-                "namespaces": '{"items": []}',
-                "nodes": '{"items": []}',
-                "deployments": '{"items": []}',
-                "statefulsets": '{"items": []}',
-                "daemonsets": '{"items": []}',
-                "jobs": '{"items": []}',
-                "cronjobs": '{"items": []}',
-                "replicasets": '{"items": []}',
-                "pods": '{"items": []}',
-                "services": '{"items": []}',
-                "ingresses": '{"items": []}',
-                "networkpolicies": '{"items": []}',
-                "endpoints": '{"items": []}',
-                "pvc": '{"items": []}',
-                "pv": '{"items": []}',
-                "storageclasses": '{"items": []}',
-                "configmaps": '{"items": []}',
-                "secrets": '{"items": []}',
-                "serviceaccounts": '{"items": []}',
-                "roles": '{"items": []}',
-                "rolebindings": '{"items": []}',
-                "clusterroles": '{"items": []}',
-                "clusterrolebindings": '{"items": []}',
-            }
-        )
+        debugger._batch_kubectl_calls = Mock(side_effect=lambda commands, parallel=True: dict.fromkeys(commands, '{"items": []}'))
 
         statistics = debugger.collect_cluster_statistics()
 
@@ -237,6 +227,7 @@ class TestStatisticsCollectionPerformance:
                 region="us-east-1",
                 cluster_name="test-cluster",
             )
+            debugger.safe_kubectl_call = Mock(return_value='{"items": []}')
             return debugger
 
     def test_statistics_collection_with_large_cluster(self, debugger):
@@ -253,36 +244,7 @@ class TestStatisticsCollectionPerformance:
             }
         )
 
-        debugger._batch_kubectl_calls = Mock(
-            return_value={
-                key: large_response
-                for key in [
-                    "namespaces",
-                    "nodes",
-                    "deployments",
-                    "statefulsets",
-                    "daemonsets",
-                    "jobs",
-                    "cronjobs",
-                    "replicasets",
-                    "pods",
-                    "services",
-                    "ingresses",
-                    "networkpolicies",
-                    "endpoints",
-                    "pvc",
-                    "pv",
-                    "storageclasses",
-                    "configmaps",
-                    "secrets",
-                    "serviceaccounts",
-                    "roles",
-                    "rolebindings",
-                    "clusterroles",
-                    "clusterrolebindings",
-                ]
-            }
-        )
+        debugger._batch_kubectl_calls = Mock(side_effect=lambda commands, parallel=True: dict.fromkeys(commands, large_response))
 
         start = time.time()
         statistics = debugger.collect_cluster_statistics()

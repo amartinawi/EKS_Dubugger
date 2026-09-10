@@ -1,8 +1,7 @@
 """Tests for performance tracking functionality."""
 
-import pytest
-import time
 import threading
+
 from eks_comprehensive_debugger import PerformanceTracker
 
 

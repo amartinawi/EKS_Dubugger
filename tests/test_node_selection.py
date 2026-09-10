@@ -7,15 +7,15 @@ Tests cover:
 - Edge cases (empty clusters, Fargate-only, all-unhealthy)
 """
 
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from eks_comprehensive_debugger import (
     ComprehensiveEKSDebugger,
-    SSMNodeDiagnosticsManager,
     NodeDiagnosticConfig,
+    SSMNodeDiagnosticsManager,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────
 

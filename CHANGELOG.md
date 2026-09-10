@@ -6,6 +6,112 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [5.1.0] - 2026-09-09
+
+Remediation of a full audit of the tool's output against a live production
+cluster. The audit found the reported facts largely correct but the
+conclusions largely wrong: 80 of 82 "critical" findings were one security
+posture pattern counted three times per pod and filed under RBAC, the named
+root cause came from a single informational finding, and the one genuine
+critical problem (a container OOM-killed 992 times) was reported without its
+cause while the dashboard showed "OOM: healthy".
+
+### Added
+
+- `workload_security` finding category. Privileged containers, SYS_ADMIN
+  capabilities and sensitive hostPath mounts are grouped by owning workload
+  and reported at warning severity, instead of one critical RBAC finding per
+  pod per violation.
+- `analyze_missing_pdbs`: Deployments and StatefulSets with more than one
+  replica and no covering PodDisruptionBudget.
+- OOM detection from `containerStatuses[].lastState.terminated`, with the
+  memory limit and restart count in the finding.
+- Node group AMI patch assessment against the SSM recommended release.
+- One-minor version skew reporting and node group version checks, including
+  groups scaled to zero.
+- Control plane analysis via CloudWatch Logs Insights across the whole
+  analysis window, aggregated per component and pattern.
+- CronJob schedule parsing with `croniter`, comparing active job runtime
+  against the schedule period.
+- Exit code 3 for a run that completed with issues but had analyzer failures.
+- "Changes Since Last Run" panel in the HTML report.
+- Control plane version shown in cluster statistics.
+
+### Fixed
+
+- `check_eks_cluster_insights` read `insightSummaries`; the API returns
+  `insights`, so the check was a silent no-op on every cluster. It now also
+  gates on status, so PASSING insights no longer become critical findings.
+- `analyze_custom_controllers` selected pods by bare label existence
+  (`app.kubernetes.io/name`), matching nearly every pod in a cluster.
+- HPA findings skip no-op HPAs where min equals max, treat a target scaled to
+  zero as informational, and when pinned at max with a metric above target
+  point at the resource request rather than suggesting a higher maxReplicas.
+- Services with no endpoints are classified as scaled-to-zero, orphaned
+  selector, or genuinely unready, instead of all being reported as unready.
+- Node AMI age measured node uptime, so a node booted yesterday from a six
+  month old AMI passed while a long-lived node on a current AMI was flagged.
+- Correlations require warning-level evidence, and the DNS rule requires
+  evidence about CoreDNS itself. Low-confidence correlations no longer
+  become root causes or take the top recommendation slot.
+- Recommendation priority is derived from the severity of the findings behind
+  it, replacing 25 static per-category literals including an invalid
+  `warning` priority that sorted last.
+- Identical findings are deduplicated per category; baseline bookkeeping
+  moved off `details`, where the report rendered it as evidence.
+- The incident story no longer falls back to wall-clock time (which produced
+  a zero-width incident window), prints display names rather than the literal
+  word "impact", and does not claim a clean cluster when findings exist
+  without timestamps.
+- Quick Wins scan worst-first and match "high restart count".
+- Resource limit counts exclude system namespaces and initContainers and
+  require both cpu and memory.
+- `--no-parallel`, `--no-cache`, `--no-incremental` and `--max-findings` were
+  parsed and then overwritten by hard-coded defaults; `--config` was never
+  applied. All now work.
+- JSON output carries `errors` and `delta` and validates against the shipped
+  schema.
+- Incremental delta normalises counter values, so a growing restart count no
+  longer reports one issue resolved and one new every run.
+- Unknown timezones raise a date validation error; `--hours`, `--days`,
+  `--max-findings` and `--ssm-timeout` reject zero and negative values;
+  `--hours` with `--days` is rejected; SSM timeout has a floor.
+- `_set_kubectl_cache` wrote a tuple that `_get_cached_kubectl` returned raw.
+- `_add_finding` silently reset an explicit `finding_type` to current state.
+- Node OS findings honour the analysis window, so dmesg events from months
+  earlier no longer appear in a 24 hour report.
+- Report filenames use the resolved cluster name, fixing a crash when the
+  cluster was selected interactively.
+
+### Changed
+
+- `collect_cluster_statistics` fetches its 23 resources in one parallel batch.
+- Performance tests mocked a batching interface that did not exist and never
+  stubbed kubectl, so they ran 23 real commands against the active cluster
+  context. They now mock the real interface and an autouse guard fails any
+  test that reaches subprocess. That module went from 28s to under 1s.
+- The MCP timeline test used a hardcoded date and expired in June 2026.
+- Test suite: 485 tests, all passing, no cluster access.
+
+### Verified
+
+Rerun against the production cluster the audit was performed on:
+
+| Measure | 5.0.0 | 5.1.0 |
+|---|---|---|
+| Total findings | 112 | 57 |
+| Critical | 82 | 7 |
+| Critical from security posture | 80 | 0 |
+| OOM findings | 0 | 14 |
+| Node group AMI findings | 0 | 5 |
+| Named root cause | CoreDNS (low confidence) | Pod memory limits (medium) |
+| Exit code | crash | 1 (issues found) |
+
+All seven remaining criticals are real: five node groups on an AMI release
+183 to 315 days behind the recommended one, and two containers being
+OOM-killed against a 128Mi limit.
+
+
 ## [5.0.0] - 2026-06-18
 
 ### Added — Phase 2: MCP Server for AI Agent Interoperability

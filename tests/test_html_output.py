@@ -1,7 +1,8 @@
 """Tests for HTML output XSS prevention."""
 
+
 import pytest
-import json
+
 from eks_comprehensive_debugger import HTMLOutputFormatter
 
 

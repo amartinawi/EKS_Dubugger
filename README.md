@@ -4,11 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![AWS EKS](https://img.shields.io/badge/AWS-EKS-orange.svg)](https://aws.amazon.com/eks/)
 [![Catalog Coverage](https://img.shields.io/badge/catalog%20coverage-100%25-green.svg)](#catalog-coverage)
-[![Tests](https://img.shields.io/badge/tests-384-brightgreen.svg)](#unit-tests)
+[![Tests](https://img.shields.io/badge/tests-478-brightgreen.svg)](#unit-tests)
 
 A production-grade Python diagnostic tool for Amazon EKS cluster troubleshooting. Analyzes pod evictions, node conditions, OOM kills, CloudWatch metrics, control plane logs, and generates interactive HTML reports with LLM-ready JSON for AI analysis.
 
-**Version:** 5.0.0 | **Analysis Methods:** 84 | **Catalog Coverage:** 100% | **Tests:** 384
+**Version:** 5.1.0 | **Analysis Methods:** 85 | **Catalog Coverage:** 100% | **Tests:** 478
 
 ---
 
@@ -402,8 +402,13 @@ python eks_comprehensive_debugger.py --profile prod --region eu-west-1 \
 |------|---------|
 | 0 | Success, no issues found |
 | 1 | Success, issues found in cluster |
-| 2 | Error during analysis |
+| 2 | Fatal error, no usable results |
+| 3 | Issues found, but some analyzers failed (partial results) |
 | 130 | Interrupted by user (Ctrl+C) |
+
+Exit code 3 lets CI distinguish a partially failed run from one that produced
+nothing. The failed analyzers are listed in the `errors` array of the JSON
+report.
 
 ---
 
@@ -432,7 +437,7 @@ For private endpoints, connect via:
 
 ## MCP Server (v5.0.0 — AI Agent Interoperability)
 
-The EKS Debugger ships with a built-in [Model Context Protocol](https://modelcontextprotocol.io/) server (`eks_mcp_server.py`) that exposes all 84 analysis methods, the 5D correlation engine, and the remediation library as **18 discoverable tools** for AI agents.
+The EKS Debugger ships with a built-in [Model Context Protocol](https://modelcontextprotocol.io/) server (`eks_mcp_server.py`) that exposes all 85 analysis methods, the 5D correlation engine, and the remediation library as **18 discoverable tools** for AI agents.
 
 Supported AI agent runtimes:
 - **Claude Desktop** (Anthropic) — via stdio transport

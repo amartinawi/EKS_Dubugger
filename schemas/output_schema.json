@@ -4,11 +4,20 @@
   "title": "EKS Debugger Output Schema",
   "description": "JSON schema for EKS Comprehensive Debugger output",
   "type": "object",
-  "required": ["metadata", "summary", "findings", "errors"],
+  "required": [
+    "metadata",
+    "summary",
+    "findings",
+    "errors"
+  ],
   "properties": {
     "metadata": {
       "type": "object",
-      "required": ["cluster", "region", "analysis_date"],
+      "required": [
+        "cluster",
+        "region",
+        "analysis_date"
+      ],
       "properties": {
         "cluster": {
           "type": "string",
@@ -38,7 +47,10 @@
           }
         },
         "namespace": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
           "description": "Kubernetes namespace filter"
         }
@@ -46,7 +58,12 @@
     },
     "summary": {
       "type": "object",
-      "required": ["total_issues", "critical", "warning", "info"],
+      "required": [
+        "total_issues",
+        "critical",
+        "warning",
+        "info"
+      ],
       "properties": {
         "total_issues": {
           "type": "integer",
@@ -73,34 +90,55 @@
       }
     },
     "findings": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "array",
-        "items": {
-          "type": "object",
-          "required": ["summary", "details"],
-          "properties": {
-            "summary": {
-              "type": "string"
-            },
-            "details": {
-              "type": "object"
-            },
-            "severity": {
-              "type": "string",
-              "enum": ["critical", "warning", "info"]
-            },
-            "finding_type": {
-              "type": "string",
-              "enum": ["current_state", "historical"]
-            },
-            "timestamp": {
-              "type": "string",
-              "format": "date-time"
-            },
-            "aws_doc": {
-              "type": "string",
-              "format": "uri"
+      "type": "array",
+      "description": "Flat list of findings, each carrying its category and severity",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "category",
+          "severity",
+          "finding_type",
+          "summary",
+          "details"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "warning",
+              "info"
+            ]
+          },
+          "finding_type": {
+            "type": "string",
+            "enum": [
+              "current_state",
+              "historical_event"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "details": {
+            "type": "object"
+          },
+          "baseline": {
+            "type": "object",
+            "properties": {
+              "count": {
+                "type": "integer"
+              },
+              "is_baseline": {
+                "type": "boolean"
+              }
             }
           }
         }
@@ -110,14 +148,22 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["correlation_type", "severity", "root_cause"],
+        "required": [
+          "correlation_type",
+          "severity",
+          "root_cause"
+        ],
         "properties": {
           "correlation_type": {
             "type": "string"
           },
           "severity": {
             "type": "string",
-            "enum": ["critical", "warning", "info"]
+            "enum": [
+              "critical",
+              "warning",
+              "info"
+            ]
           },
           "root_cause": {
             "type": "string"
@@ -128,7 +174,11 @@
           },
           "confidence_tier": {
             "type": "string",
-            "enum": ["high", "medium", "low"]
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
           },
           "composite_confidence": {
             "type": "number",
@@ -152,7 +202,10 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["time_bucket", "event_count"],
+        "required": [
+          "time_bucket",
+          "event_count"
+        ],
         "properties": {
           "time_bucket": {
             "type": "string"
@@ -169,13 +222,20 @@
           },
           "severity": {
             "type": "string",
-            "enum": ["critical", "warning", "info"]
+            "enum": [
+              "critical",
+              "warning",
+              "info"
+            ]
           }
         }
       }
     },
     "first_issue": {
-      "type": ["object", "null"],
+      "type": [
+        "object",
+        "null"
+      ],
       "properties": {
         "timestamp": {
           "type": "string",
@@ -196,7 +256,12 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["title", "category", "priority", "action"],
+        "required": [
+          "title",
+          "category",
+          "priority",
+          "action"
+        ],
         "properties": {
           "title": {
             "type": "string"
@@ -206,7 +271,12 @@
           },
           "priority": {
             "type": "string",
-            "enum": ["critical", "high", "medium", "low"]
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low"
+            ]
           },
           "action": {
             "type": "string"
@@ -231,7 +301,10 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["step", "message"],
+        "required": [
+          "step",
+          "message"
+        ],
         "properties": {
           "step": {
             "type": "string"
@@ -261,6 +334,44 @@
         },
         "cache_stats": {
           "type": "object"
+        }
+      }
+    },
+    "correlations_by_confidence_tier": {
+      "type": "object",
+      "properties": {
+        "high": {
+          "type": "array"
+        },
+        "medium": {
+          "type": "array"
+        },
+        "low": {
+          "type": "array"
+        }
+      }
+    },
+    "potential_root_causes": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "delta": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Change since the previous run for this cluster",
+      "properties": {
+        "is_first_run": {
+          "type": "boolean"
+        },
+        "new_issues": {
+          "type": "integer"
+        },
+        "resolved_issues": {
+          "type": "integer"
         }
       }
     }

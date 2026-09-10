@@ -7,3 +7,4 @@ mcp>=1.0.0
 # Test dependencies
 pytest>=8.0.0
 pytest-mock>=3.12.0
+croniter>=2.0.0

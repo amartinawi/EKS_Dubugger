@@ -9,8 +9,8 @@ Finding shape verified: severity in details, finding_type correct, node/instance
 """
 
 import pytest
-from eks_comprehensive_debugger import NodeOSOutputParser, FindingType
 
+from eks_comprehensive_debugger import FindingType, NodeOSOutputParser
 
 # ── Fixtures ──────────────────────────────────────────────
 

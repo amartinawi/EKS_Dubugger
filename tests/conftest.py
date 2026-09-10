@@ -1,8 +1,9 @@
 """Shared fixtures for EKS Health Check Dashboard tests."""
 
-import pytest
-import sys
 import os
+import sys
+
+import pytest
 
 # Add parent directory to path to import the main module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
